@@ -1,0 +1,8 @@
+{
+  "code": 0,
+  "data": {
+    "dept": "包装部门",
+    "gateway": "https://api.example.test",
+    "models": [{ "id": "claude-sonnet-4", "name": "Claude Sonnet 4" }]
+  }
+}

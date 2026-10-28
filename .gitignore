@@ -1,0 +1,36 @@
+# 依赖与前端构建产物
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri / Rust 构建产物
+src-tauri/target/
+src-tauri/gen/
+
+# 编辑器与系统文件
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 环境变量（可能含敏感值，禁止提交）
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------
+# 仅本地保留、不随公开仓库分发的材料（原版 CodeMaker Hub 的逆向证据与旧版文档）
+# ---------------------------------------------------------------
+research/
+docs/appendix/
+docs/review/
+docs/design/
+docs/0[0-9]-*.md
+docs/1[0-8]-*.md

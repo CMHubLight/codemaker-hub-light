@@ -1,0 +1,10 @@
+{
+  "loggedIn": true,
+  "user": "test-user",
+  "serverUrl": "https://api.example.test",
+  "access_token": "test-access-token",
+  "auth_key": "test-auth-key",
+  "expire": 1700086400,
+  "offlineGrace": false,
+  "credentials_invalid": false
+}

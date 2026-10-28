@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（Security vulnerability）
+    url: https://github.com/CMHubLight/codemaker-hub-light/security/advisories/new
+    about: 请勿在公开 issue 中披露安全问题，使用私密漏洞报告。
+  - name: 使用文档（Documentation）
+    url: https://github.com/CMHubLight/codemaker-hub-light/tree/main/docs
+    about: 安装、网关配置、本地代理、设置与排障。

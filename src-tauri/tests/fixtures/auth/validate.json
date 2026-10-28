@@ -1,0 +1,9 @@
+{
+  "dept": "测试部门",
+  "gateway": "https://api.example.test",
+  "server_url": "https://api.example.test",
+  "models": [
+    { "id": "claude-sonnet-4", "display_name": "Claude Sonnet 4" },
+    "gpt-4o"
+  ]
+}

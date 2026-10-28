@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口默认能力：核心 IPC、系统浏览器/目录打开、深链事件",
+  "windows": ["main"],
+  "permissions": ["core:default", "opener:default", "deep-link:default"]
+}

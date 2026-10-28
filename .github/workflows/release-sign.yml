@@ -1,0 +1,134 @@
+name: Release signing
+
+# 通过 SignPath Foundation 的免费开源签名对发布安装包做 Authenticode 签名。
+# 前置条件（一次性配置，见 docs/code-signing-policy.md 与 docs/development.md）：
+#   Secrets : SIGNPATH_API_TOKEN、SIGNPATH_ORGANIZATION_ID
+#   Variables: SIGNPATH_PROJECT_SLUG、SIGNPATH_SIGNING_POLICY_SLUG、SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+# 每次运行都需要维护者在 SignPath 控制台人工批准后才会真正签名。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 tag（例如 v0.1.0），签名产物会追加到该 Release'
+        required: true
+        type: string
+
+concurrency:
+  group: release-signing-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 上传/替换 Release 附件
+  actions: read     # SignPath 连接器需要读取 workflow 与 artifact 元数据
+
+jobs:
+  sign-windows-installer:
+    # OSS 签名要求：签名前的全部构建步骤必须跑在 GitHub 托管 runner 上
+    runs-on: windows-latest
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+
+    steps:
+      - name: 检查 SignPath 配置是否就绪
+        shell: bash
+        run: |
+          fail() { echo "::error::缺少配置：$1（见 docs/development.md 的「发布与签名」）"; exit 1; }
+          test -n "$SIGNPATH_API_TOKEN" || fail SIGNPATH_API_TOKEN
+          test -n "$SIGNPATH_ORGANIZATION_ID" || fail SIGNPATH_ORGANIZATION_ID
+          test -n "$SIGNPATH_PROJECT_SLUG" || fail SIGNPATH_PROJECT_SLUG
+          test -n "$SIGNPATH_SIGNING_POLICY_SLUG" || fail SIGNPATH_SIGNING_POLICY_SLUG
+          test -n "$SIGNPATH_ARTIFACT_CONFIGURATION_SLUG" || fail SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+          echo "SignPath 配置检查通过"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建安装包（未签名）
+        run: pnpm tauri build
+
+      - name: 整理待签名产物
+        id: stage
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p unsigned
+          setup="src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_${version}_x64-setup.exe"
+          cp "$setup" "unsigned/CodeMaker-Hub-Light_x64-setup.exe"
+          sha256sum unsigned/CodeMaker-Hub-Light_x64-setup.exe
+          echo "未签名产物的 SHA-256 见上一行，签名后会变化"
+
+      - name: 上传未签名产物（SignPath 要求先成为 workflow artifact）
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: unsigned/CodeMaker-Hub-Light_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: 提交 SignPath 签名请求
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: ${{ github.workspace }}/signed
+          parameters: |
+            version: "${{ steps.stage.outputs.version }}"
+
+      - name: 校验签名并计算 SHA-256
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem signed -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $file) { throw '签名产物缺失：signed/ 下没有 .exe' }
+          $sig = Get-AuthenticodeSignature $file.FullName
+          "签名状态: $($sig.Status)"
+          "签名者:   $($sig.SignerCertificate.Subject)"
+          "时间戳:   $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "签名校验失败：$($sig.Status) / $($sig.StatusMessage)" }
+          $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+          "SHA-256: $hash"
+          Rename-Item $file.FullName "CodeMaker-Hub-Light_${{ steps.stage.outputs.version }}_x64-setup.exe"
+          Out-File -FilePath signed-sha256.txt -InputObject $hash -Encoding utf8
+
+      - name: 上传签名产物到 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $asset = Get-ChildItem signed -Filter *.exe -Recurse | Select-Object -First 1
+          gh release upload "${{ inputs.tag }}" $asset.FullName --clobber
+          gh release view "${{ inputs.tag }}" --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-installer
+          path: |
+            signed/*.exe
+            signed-sha256.txt
+          if-no-files-found: error
+          retention-days: 30

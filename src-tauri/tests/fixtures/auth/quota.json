@@ -1,0 +1,12 @@
+{
+  "monthly_quota": 10000000,
+  "used": 2500000,
+  "remaining": 7500000,
+  "percentage": 25,
+  "reset_day": 1,
+  "period_start": "2026-10-01",
+  "reset_at": "2026-11-01T00:00:00Z",
+  "timezone": "Asia/Shanghai",
+  "is_active": true,
+  "usage_cost": 3.5
+}

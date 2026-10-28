@@ -1,0 +1,14 @@
+{
+  "code": 0,
+  "data": {
+    "monthlyQuota": 500,
+    "used": 125,
+    "remaining": 375,
+    "percentage": 25,
+    "resetDay": 15,
+    "periodStart": "2026-10-15",
+    "resetAt": "2026-11-15T00:00:00Z",
+    "timezone": "Asia/Shanghai",
+    "isActive": true
+  }
+}

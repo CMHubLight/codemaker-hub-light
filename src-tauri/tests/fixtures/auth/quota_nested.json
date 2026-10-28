@@ -1,0 +1,30 @@
+{
+  "costly_quota_config": {
+    "costly_model_exceeded": false,
+    "costly_model_quota": 3500.0,
+    "costly_model_threshold": 30,
+    "costly_model_usage": 0.04,
+    "costly_models": ["claude-opus-5"]
+  },
+  "current_month": {
+    "app_costs": { "_codemaker_cli": 57.77 },
+    "app_tokens": { "_codemaker_cli": 802364696 },
+    "model_costs": { "deepseek-flash": 55.25, "claude-sonnet-5-5": 0.02 },
+    "model_tokens": { "deepseek-flash": 802300000, "claude-sonnet-5-5": 78086 },
+    "month": 10,
+    "year": 2026,
+    "percentage": 1.66,
+    "remaining": 3442.0,
+    "total_tokens": 802378086,
+    "usage_cost": 58.04
+  },
+  "last_month": { "month": 9, "year": 2026, "usage_cost": 12.5 },
+  "last_updated_at": "2026-10-20T15:32:06.738000",
+  "prev_month": { "month": 8, "year": 2026, "usage_cost": 3.2 },
+  "quota_config": {
+    "is_active": true,
+    "monthly_quota": 3500.04,
+    "reset_day": 1
+  },
+  "user": "test_user"
+}

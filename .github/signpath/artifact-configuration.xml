@@ -1,0 +1,23 @@
+<!--
+  SignPath Artifact Configuration — CodeMaker Hub Light 的 NSIS 安装包
+
+  用法：在 SignPath 项目里导入本文件，slug 建议 `nsis-installer`；
+  发布工作流（.github/workflows/release-sign.yml）会把安装包重命名为
+  `CodeMaker-Hub-Light_x64-setup.exe` 后以 ZIP artifact 提交，因此根元素是
+  `<zip-file>`，`pe-file` 的 path 是 ZIP 内的文件名。
+
+  `version` 是签名请求参数（来自 package.json），对应产物的 ProductVersion；
+  metadata 限制要求所有被签名的 PE 文件 ProductName / ProductVersion 与之一致。
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="CodeMaker-Hub-Light_x64-setup.exe"
+             product-name="CodeMaker Hub Light"
+             product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

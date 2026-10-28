@@ -1,0 +1,54 @@
+name: Bug report
+description: 报告可复现的缺陷
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先确认：
+        - 已在「设置 → 应用信息」确认版本与应用标识；
+        - 日志与截图已脱敏：**不要**粘贴 token、`auth.bin` 内容或完整回调链接。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 设置 → 应用信息里的版本号
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: 系统与运行时
+      description: Windows 版本、WebView2 版本（如已知）
+      placeholder: Windows 11 23H2 / WebView2 1xx
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 尽量给出最小步骤与预期结果、实际结果
+      placeholder: |
+        1. 打开 …
+        2. 点击 …
+        3. 期望 …，实际 …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志（已脱敏）
+      description: 设置 → 应用信息 → 打开日志目录，取 `hub-light.log.<日期>` 的相关片段
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我已搜索过现有 issue，未发现相同问题
+          required: true
+        - label: 我提交的日志与截图已脱敏（不含 token / 回调链接 / 凭据文件内容）
+          required: true

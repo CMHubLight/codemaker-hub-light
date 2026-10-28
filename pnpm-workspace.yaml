@@ -1,0 +1,4 @@
+# pnpm 11 设置：显式允许构建脚本。
+# esbuild 是 Vite 的依赖，postinstall 只做本机二进制校验。
+allowBuilds:
+  esbuild: true

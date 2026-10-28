@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "data": {
+    "logged_in": true,
+    "username": "test-user",
+    "token": "test-access-token",
+    "authkey": "test-auth-key",
+    "expires_at": "1700086400",
+    "server_url": "https://api.example.test"
+  }
+}
