@@ -45,15 +45,15 @@ jobs:
           test -n "$SIGNPATH_ARTIFACT_CONFIGURATION_SLUG" || fail SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
           echo "SignPath 配置检查通过"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -78,7 +78,7 @@ jobs:
 
       - name: 上传未签名产物（SignPath 要求先成为 workflow artifact）
         id: upload-unsigned
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unsigned-installer
           path: unsigned/CodeMaker-Hub-Light_x64-setup.exe
@@ -124,7 +124,7 @@ jobs:
           gh release upload "${{ inputs.tag }}" $asset.FullName --clobber
           gh release view "${{ inputs.tag }}" --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: signed-installer
           path: |
