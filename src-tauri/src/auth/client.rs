@@ -163,6 +163,37 @@ impl AuthGateway {
         Ok(parse_poll_response(&value))
     }
 
+    /// `POST /api/v2/tokens`：账号 + AuthKey 直登（不经过浏览器/轮询）。
+    ///
+    /// 请求体为 `{user, auth_key}`，响应为 `AuthV2TokenResponse`（字段见
+    /// `docs/gateway-contract.md`）。401/403 由调用方映射为"账号或 AuthKey 不正确"。
+    pub async fn login_with_auth_key(
+        &self,
+        user: &str,
+        auth_key: &str,
+    ) -> Result<LoginTokens, GatewayError> {
+        let url = format!("{}/api/v2/tokens", self.base);
+        let response = self
+            .http
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json")
+            .json(&serde_json::json!({ "user": user, "auth_key": auth_key }))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            // 不读正文：错误正文可能带服务端细节，且请求本身含凭据。
+            return Err(GatewayError::Status { status });
+        }
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|err| GatewayError::Decode(format!("登录响应无法解析：{err}")))?;
+        parse_auth_v2_token(&value)
+    }
+
     /// `GET /get_auth_key`；401/403/404 容忍（登录可用但无法自动续期），其余失败上抛。
     pub async fn get_auth_key(&self, access_token: &str) -> Result<Option<String>, GatewayError> {
         let url = format!("{}/get_auth_key", self.base);
@@ -568,6 +599,32 @@ pub(crate) fn parse_renew_response(value: &Value) -> Result<RenewedToken, Gatewa
     })
 }
 
+/// 解析 `POST /api/v2/tokens` 响应（`AuthV2TokenResponse`）。
+///
+/// 线上样本只确认了 5 个字段的存在；这里按 `StoredCredentials` 的既有别名表容错，
+/// 缺少 `expire` 时由 service 层按 `DEFAULT_TOKEN_TTL_SECS` 兜底。
+pub(crate) fn parse_auth_v2_token(value: &Value) -> Result<LoginTokens, GatewayError> {
+    let data = unwrap_data(value);
+    let access_token = clean_secret(string_field(
+        data,
+        &["access_token", "accessToken", "token"],
+    ))
+    .ok_or_else(|| GatewayError::Decode("登录响应缺少 access_token".to_string()))?;
+    Ok(LoginTokens {
+        access_token,
+        auth_key: clean_secret(string_field(
+            data,
+            &["auth_key", "authkey", "access_sso_token", "sso_token"],
+        )),
+        user: clean_user(string_field(
+            data,
+            &["access_user", "user", "username", "employee_id"],
+        )),
+        server_url: string_field(data, &["server_url", "serverUrl", "server"]),
+        expires_at: int_field(data, &["expire", "expires_at", "expiresAt", "expire_at"]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,5 +991,161 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// `POST /api/v2/tokens` 只认 JSON body `{user, auth_key}`，且响应字段可解析。
+    #[tokio::test]
+    async fn auth_key_login_posts_user_and_key_json() {
+        use std::sync::{Arc, Mutex};
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("应可绑定");
+        let addr = listener.local_addr().expect("应可读取地址");
+        let captured = Arc::new(Mutex::new(String::new()));
+        let recorder = captured.clone();
+
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_http_request(&mut socket).await;
+            *recorder.lock().expect("锁可用") = request;
+            let body = r#"{"access_token":"new-access-token","access_sso_token":"new-auth-key","access_user":"alice","server_url":"https://api.example.test","login_time":"1700000000"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let gateway = AuthGateway::new(&format!("http://{addr}")).expect("回环网关应可用");
+        let tokens = gateway
+            .login_with_auth_key("alice", "secret-auth-key")
+            .await
+            .expect("200 应解析成功");
+        assert_eq!(tokens.access_token, "new-access-token");
+        assert_eq!(tokens.auth_key.as_deref(), Some("new-auth-key"));
+        assert_eq!(tokens.user.as_deref(), Some("alice"));
+        assert_eq!(
+            tokens.server_url.as_deref(),
+            Some("https://api.example.test")
+        );
+
+        let request = captured.lock().expect("锁可用").clone();
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.starts_with("post /api/v2/tokens"),
+            "必须是 POST /api/v2/tokens：{lower}"
+        );
+        assert!(
+            lower.contains("content-type: application/json"),
+            "必须带 JSON Content-Type：{lower}"
+        );
+        assert!(
+            !lower.contains("x-access-token"),
+            "AuthKey 登录不应带 X-Access-Token：{lower}"
+        );
+        let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: Value = serde_json::from_str(body_text).expect("body 应是 JSON");
+        assert_eq!(body.get("user").and_then(Value::as_str), Some("alice"));
+        assert_eq!(
+            body.get("auth_key").and_then(Value::as_str),
+            Some("secret-auth-key")
+        );
+
+        server.abort();
+    }
+
+    /// 401/403 必须让调用方识别为"账号或 AuthKey 不正确"，不能被当成网络错误。
+    #[tokio::test]
+    async fn auth_key_login_401_is_forbidden() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("应可绑定");
+        let addr = listener.local_addr().expect("应可读取地址");
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 2048];
+            let _ = socket.read(&mut buffer).await;
+            let body = r#"{"msg":"invalid auth key"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let gateway = AuthGateway::new(&format!("http://{addr}")).expect("回环网关应可用");
+        let err = gateway
+            .login_with_auth_key("alice", "wrong-key")
+            .await
+            .expect_err("401 必须失败");
+        assert!(err.is_forbidden(), "401 应被识别为凭据错误：{err}");
+
+        server.abort();
+    }
+
+    /// 200 但缺少 access_token 必须报解码错误，不能把损坏响应当成登录成功。
+    #[tokio::test]
+    async fn auth_key_login_empty_token_is_decode_error() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("应可绑定");
+        let addr = listener.local_addr().expect("应可读取地址");
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 2048];
+            let _ = socket.read(&mut buffer).await;
+            let body = r#"{"access_user":"alice","login_time":"1700000000"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let gateway = AuthGateway::new(&format!("http://{addr}")).expect("回环网关应可用");
+        let err = gateway
+            .login_with_auth_key("alice", "secret-auth-key")
+            .await
+            .expect_err("缺 access_token 必须失败");
+        assert!(matches!(err, GatewayError::Decode(_)));
+
+        server.abort();
+    }
+
+    /// 响应字段别名 / `data` 包裹的纯函数测试（不依赖网络）。
+    #[test]
+    fn parses_auth_v2_token_aliases() {
+        let tokens = parse_auth_v2_token(&parse(
+            r#"{"data":{"accessToken":"SECRET-ACCESS-VALUE","access_sso_token":"SECRET-KEY-VALUE","username":"bob","serverUrl":"https://gw.test","expires_at":1800000000}}"#,
+        ))
+        .expect("别名样本应可解析");
+        assert_eq!(tokens.access_token, "SECRET-ACCESS-VALUE");
+        assert_eq!(tokens.auth_key.as_deref(), Some("SECRET-KEY-VALUE"));
+        assert_eq!(tokens.user.as_deref(), Some("bob"));
+        assert_eq!(tokens.server_url.as_deref(), Some("https://gw.test"));
+        assert_eq!(tokens.expires_at, Some(1_800_000_000));
+        let debug = format!("{tokens:?}");
+        assert!(
+            !debug.contains("SECRET-ACCESS-VALUE") && !debug.contains("SECRET-KEY-VALUE"),
+            "LoginTokens Debug 必须脱敏：{debug}"
+        );
     }
 }

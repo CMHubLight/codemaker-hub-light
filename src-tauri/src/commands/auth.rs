@@ -89,6 +89,29 @@ pub async fn auth_start_login(
     })
 }
 
+/// 账号 + AuthKey 直登（不打开浏览器、不轮询）；成功后保存凭据并切换登录态。
+///
+/// `auth_key` 只在本命令调用栈与 Rust 侧加密文件中出现：不写日志、不返回前端。
+#[tauri::command]
+pub async fn auth_login_with_auth_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user: String,
+    auth_key: String,
+) -> Result<AuthStatus, String> {
+    let gateway_url = state.settings.read().await.gateway_url.clone();
+    let update = state
+        .auth
+        .login_with_auth_key(&gateway_url, &user, &auth_key)
+        .await
+        .map_err(|err| err.to_string())?;
+    emit_update(&app, &update);
+    if update.status.state == "authenticated" {
+        state.auth.ensure_loops(app).await;
+    }
+    Ok(update.status)
+}
+
 /// 轮询 `GET /vs_login_info/{uuid}`；成功后保存凭据、validate、拉额度并切换登录态。
 #[tauri::command]
 pub async fn auth_poll_status(

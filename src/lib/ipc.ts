@@ -25,6 +25,7 @@ import type {
  */
 export type CommandName =
   | 'auth_start_login'
+  | 'auth_login_with_auth_key'
   | 'auth_poll_status'
   | 'auth_status'
   | 'auth_logout'
@@ -140,6 +141,8 @@ export const DEFAULT_COMMAND_TIMEOUT_MS = 10_000
 /** 会打网关或做文件/端口操作的命令放宽到 30 秒。 */
 const COMMAND_TIMEOUT_MS: Partial<Record<CommandName, number>> = {
   auth_start_login: 30_000,
+  /** AuthKey 登录 = tokens + validate + 模型目录/key + 额度，最坏情况比 30s 长。 */
+  auth_login_with_auth_key: 60_000,
   auth_submit_deep_link: 30_000,
   auth_refresh_validate: 30_000,
   auth_retry_renewal: 30_000,
@@ -292,6 +295,8 @@ async function mockInvoke(
   switch (command) {
     case 'auth_start_login':
       return clone(MOCK_LOGIN_SESSION)
+    case 'auth_login_with_auth_key':
+      throw new Error('浏览器预览模式不支持 AuthKey 登录，请使用桌面版。')
     case 'auth_poll_status':
     case 'auth_status':
     case 'auth_logout':

@@ -1,6 +1,6 @@
 # IPC 命令与事件
 
-> 这篇讲前端能调用的 19 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
+> 这篇讲前端能调用的 20 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
 
 ## 约定
 
@@ -17,6 +17,7 @@
 | 命令 | 等待上限 |
 |---|---|
 | 默认（未单独列出） | 10s（`DEFAULT_COMMAND_TIMEOUT_MS`） |
+| `auth_login_with_auth_key` | 60s（登录含 token 交换 + validate + 模型目录 + 额度） |
 | `auth_start_login`、`auth_submit_deep_link`、`auth_retry_renewal`、`quota_get`、`proxy_restart`、`usage_export_csv` | 30s |
 | `app_open_logs` | 15s |
 | `auth_poll_status` | 10s（显式配置，与默认一致） |
@@ -36,6 +37,7 @@ settings_get
 settings_update
 auth_status
 auth_start_login
+auth_login_with_auth_key
 auth_poll_status
 auth_logout
 auth_refresh_validate
@@ -51,7 +53,7 @@ usage_request_detail
 usage_export_csv
 ```
 
-命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前只收录 17 个：`auth_refresh_validate` 与 `usage_request_detail` 已注册但未进入该类型、界面也未调用（`auth_refresh_validate` 的注释写明“预留给设置页检查登录状态”）。
+命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前收录 18 个：`auth_refresh_validate` 与 `usage_request_detail` 已注册但未进入该类型、界面也未调用（`auth_refresh_validate` 的注释写明“预留给设置页检查登录状态”）。
 
 ## 命令明细
 
@@ -73,6 +75,7 @@ usage_export_csv
 |---|---|---|---|---|
 | `auth_status` | 无 | `AuthStatus` | 10s | 一般无错误；懒加载凭据失败会体现在 `message` / `credentials_valid` |
 | `auth_start_login` | 无 | `AuthLoginStart` | 30s | `网关地址无效：…`、`认证网络请求失败：…` |
+| `auth_login_with_auth_key` | `user: string`、`authKey: string` | `AuthStatus` | 60s | `账号名或 AuthKey 不正确。`、`登录请求被服务端拒绝（HTTP n）。`、网络错误 |
 | `auth_poll_status` | 无 | `AuthStatus` | 10s | `认证网络请求失败：…`、`登录会话已结束…` |
 | `auth_logout` | 无 | `AuthStatus` | 10s | 无（本地清理） |
 | `auth_refresh_validate` | 无 | `AuthStatus` | 10s | `尚未登录`、`凭据被服务端拒绝：…`、网络错误 |
@@ -82,6 +85,7 @@ usage_export_csv
 
 - `auth_status` 首次调用会懒加载 `auth.bin`（失败不抛错，只写状态），有凭据时确保后台循环已启动。
 - `auth_start_login` 让 Rust 侧生成待登录会话并用系统浏览器打开登录页；浏览器打开失败不算命令失败，用 `opened_browser: false` 让界面展示可复制的登录链接。返回里的 `poll_interval_secs = 2`、`timeout_secs = 300`。
+- `auth_login_with_auth_key` 是账号 + AuthKey 直登：单次 `POST /api/v2/tokens`，不打开浏览器、不轮询；成功后仍走 `/validate`、模型目录、`/get_auth_key` 与额度，失败不改变现有登录态。`authKey` 只在 IPC 参数与 Rust 侧加密文件中出现，不进日志/数据库/前端状态。
 - `auth_poll_status` 由登录页每 2s 调用；只有状态真的变化或额度更新时才广播事件，避免空转事件触发整页重取。连续失败 3 次才由界面判失败。
 - `auth_submit_deep_link` 是深链 scheme 未注册/浏览器未自动拉起时的兜底：前端只提交用户粘贴的 `codemakerhub-light://auth/callback?...`，解析、校验、保存凭据全在 Rust 侧，token 不回传前端。
 - `auth_retry_renewal` 是手动“重新检测/续期”：强制用 `auth_key` 续期一次（跳过后台 60s 检查节流），成功后补一次 `/validate` 刷新账号档案与模型目录；失败原因写入返回的 `AuthStatus.message`，认证类事件同时广播。
@@ -145,7 +149,7 @@ app://second-instance
 
 | 事件 | payload | 触发时机（Rust 发射点） |
 |---|---|---|
-| `auth://state` | `AuthStatus` | `auth_poll_status` 检测到状态变化或额度更新；`auth_start_login` 发出 pending；`auth_submit_deep_link` / `auth_refresh_validate` / `auth_retry_renewal` / `auth_logout` 完成后；深链处理成功或被拒绝；后台 validate/续期/额度循环；启动期凭据加载失败。前端直接用它覆盖登录态，不触发数据重取 |
+| `auth://state` | `AuthStatus` | `auth_poll_status` 检测到状态变化或额度更新；`auth_start_login` 发出 pending；`auth_login_with_auth_key` / `auth_submit_deep_link` / `auth_refresh_validate` / `auth_retry_renewal` / `auth_logout` 完成后；深链处理成功或被拒绝；后台 validate/续期/额度循环；启动期凭据加载失败。前端直接用它覆盖登录态，不触发数据重取 |
 | `auth://callback` | `AuthCallbackEvent { poll_uuid: string \| null, has_credentials: boolean }` | 深链解析成功后立即发（无论是否带凭据）；事件只含非敏感字段，绝不含 token。登录页用它立刻补一次轮询，应用外壳用它重读登录态 |
 | `quota://updated` | `QuotaInfo` | `quota_get` 带 `force: true` 且拿到快照；登录/深链完成时额度确实更新；后台额度循环发现新快照。前端用它刷新额度卡与 24h 云端曲线 |
 | `proxy://status` | `ProxyStatus` | 启动后台代理成功；`proxy_restart` 成功。前端刷新设置页代理状态与用量数据 |
@@ -159,7 +163,7 @@ app://second-instance
 | 页面 / 功能 | 用到的命令 | 订阅的事件 |
 |---|---|---|
 | 应用外壳（启动、登录态、退出登录、失败屏） | `auth_status`、`auth_logout`、`app_open_logs` | 全部 6 个（合并刷新后再分发） |
-| 登录页 | `auth_start_login`、`auth_poll_status`、`auth_submit_deep_link` | `auth://state`、`auth://callback` |
+| 登录页 | `auth_start_login`、`auth_login_with_auth_key`、`auth_poll_status`、`auth_submit_deep_link` | `auth://state`、`auth://callback` |
 | 概览 | `quota_get`（普通读与手动 `force` 刷新）、`usage_summary`、`cost_trend_get` | `quota://updated` 驱动额度与 24h 曲线；其余事件经合并刷新 |
 | 请求 | `usage_requests`、`usage_export_csv` | 无直接订阅，由外壳的合并刷新触发表格回第一页 |
 | 设置 | `settings_get`、`settings_update`、`proxy_status`、`proxy_restart`、`app_info`、`app_open_logs`、`auth_retry_renewal`（账户面板手动续期） | 无直接订阅，代理状态与应用信息按外壳 revision 刷新 |
@@ -172,7 +176,7 @@ app://second-instance
 mock 的关键行为：
 
 - **地址一律是占位值**：`gateway_url = https://api.example.test`（设置、代理状态、应用信息），代理 `base_url = http://127.0.0.1:15721`、端口 `15721`，不访问任何真实上游；
-- 登录：`auth_start_login` 返回 `login_url: ''`，登录页据此提示“需在桌面端登录”；认证类命令统一返回 `unauthenticated` 状态的 mock 快照（含 `mock-poll-uuid`）；
+- 登录：`auth_start_login` 返回 `login_url: ''`，登录页据此提示“需在桌面端登录”；`auth_login_with_auth_key` 在预览模式直接抛错（不会伪造登录成功）；认证类命令统一返回 `unauthenticated` 状态的 mock 快照（含 `mock-poll-uuid`）；
 - 额度：`quota_get` 返回 `null`，页面按“暂无额度数据”处理；
 - 用量：`usage_summary` 返回全 0 且比率为 `null`；`cost_trend_get` 回显传入的 `range`，`24h` 标为 `cloud/points`、`30d` 标为 `local/cny`，`points` 为空；`usage_requests` 返回 `total: 0`；
 - 写操作：`settings_update` 直接把补丁合并进内存（不做后端校验），`proxy_restart` 把 mock 状态改成运行中并重置 `started_at` / `uptime_secs`，`usage_export_csv` 返回 `saved: false`（“浏览器预览模式没有本地数据库，导出不可用”），`app_open_logs` 返回 `opened: false`；
@@ -182,7 +186,7 @@ mock 的关键行为：
 
 | 路径 | 用到的内容 |
 |---|---|
-| `src-tauri/src/lib.rs` | `generate_handler!` 的 19 个命令、单实例事件发射 |
+| `src-tauri/src/lib.rs` | `generate_handler!` 的 20 个命令、单实例事件发射 |
 | `src-tauri/src/commands/app.rs` | `app_info` / `app_open_logs` 的返回结构与错误 |
 | `src-tauri/src/commands/settings.rs` | `settings_get` / `settings_update` |
 | `src-tauri/src/commands/auth.rs` | 认证命令、`auth://state` 与 `quota://updated` 发射点 |
