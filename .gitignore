@@ -32,5 +32,4 @@ research/
 docs/appendix/
 docs/review/
 docs/design/
-docs/0[0-9]-*.md
-docs/1[0-8]-*.md
+docs/[0-9][0-9]-*.md
