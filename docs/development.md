@@ -76,7 +76,7 @@ Tauri v2 的 release 可执行文件需要 `custom-protocol` feature 才会内�
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.1.0_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 ### 5.2 `panic = "abort"` 的连带影响
@@ -118,16 +118,17 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 1. **首次启动**：数据目录下生成数据库、`logs/`、`proxy.port`；改过设置后才出现 `settings.json`；登录后才出现 `auth.bin`。
 2. **配置网关**：设置 → 代理与记录 → 填入可访问的兼容网关 → 保存 → 重启代理。
 3. **代理存活**：`curl.exe http://127.0.0.1:15721/health` 返回 200；端口被占时界面显示回退后的端口。
-4. **登录**：登录 → 浏览器完成 → 深链自动回跳（或手动粘贴回调链接）→ 概览页额度卡出现数字。
+4. **登录**：登录 → 浏览器完成 → 深链自动回跳（或手动粘贴回调链接）→ 概览页额度卡出现数字；若网关支持 `POST /api/v2/tokens`，再用「账号 + AuthKey」入口验证一次错误/正确凭据。
 5. **模型目录**：登录前 `/v1/models` 返回 503，`/validate` 成功后返回列表。
-6. **转发与记录**：用客户端发一次请求 → 请求页出现该条记录（token 与费用非空）→ 导出 CSV 能打开。
-7. **注销**：退出登录后转发接口返回 401，`auth.bin` 消失。
-8. **托盘**：关闭窗口只隐藏；托盘 tooltip 显示本月积分；托盘"退出"后代理停止。
-9. **重启保持**：退出再启动，仍是已登录状态（凭据恢复 + `/validate`）。
+6. **转发与记录**：用客户端发一次请求 → 请求页出现该条记录（token 与费用非空，首字节列有值）→ 导出 CSV 能打开。
+7. **注销**：点退出登录先出现二次确认；取消后仍登录，确认后转发接口返回 401、`auth.bin` 消失。
+8. **账户操作**：设置 → 账户点「重新检测 / 续期」成功，`last_validated_at` 刷新。
+9. **托盘**：关闭窗口只隐藏；托盘 tooltip 显示本月积分；托盘"退出"后代理停止。
+10. **重启保持**：退出再启动，仍是已登录状态（凭据恢复 + `/validate`）。
 
 ## 9. 发布与签名
 
-发布产物通过 [SignPath Foundation](https://signpath.org) 的免费开源签名做 Authenticode 签名；完整政策（角色、隐私声明、验签方法）见 [代码签名政策](code-signing-policy.md)。
+发布产物计划通过 [SignPath Foundation](https://signpath.org) 的免费开源签名做 Authenticode 签名；完整政策（角色、隐私声明、验签方法）见 [代码签名政策](code-signing-policy.md)。在 SignPath 配置/审批完成前，按 §9.4 发布**未签名**包并在 Release 说明中明确标注。
 
 ### 9.1 一次性配置
 
@@ -159,10 +160,39 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 签名私钥在 SignPath 的 HSM 中，本地只能验签：
 
 ```powershell
-Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.1.0_x64-setup.exe | Format-List Status,SignerCertificate
+Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.0_x64-setup.exe | Format-List Status,SignerCertificate
 ```
 
-不要把任何签名私钥、API Token 或 `.pfx` 提交到仓库。`v0.1.0` 安装包在审批通过前仍是未签名状态，以 Release 说明里的 SHA-256 与 tag 源码为准。
+不要把任何签名私钥、API Token 或 `.pfx` 提交到仓库。`v0.2.0` 安装包在审批通过前仍是未签名状态，以 Release 说明里的 SHA-256 与 tag 源码为准。
+
+### 9.4 未签名版本的构建、烟雾测试与发布
+
+SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.2.0` 起执行）：
+
+1. **干净构建**：确认 `git status` 干净、从合并后的 `main` 构建；先关闭正在运行的旧实例（否则 Windows 会锁住 exe）。
+   ```powershell
+   pnpm install --frozen-lockfile
+   pnpm tauri build
+   ```
+2. **烟雾测试**：按 §8 清单手工走真实窗口 + 真实网关；任何失败先修复并重跑 `cargo fmt/clippy/test` 与 `pnpm verify`，再重建。
+3. **源码包**：用 `git archive` 从 tag 生成，确保内容与 tag 完全一致（不要用工作区压缩）：
+   ```powershell
+   git archive --format=zip --prefix=codemaker-hub-light-<version>/ `
+     -o codemaker-hub-light-<version>-source.zip v<version>
+   ```
+   校验：zip 条目数 = `git ls-tree -r --name-only v<version>` 的文件数 + 目录条目；不得包含 `target/`、`node_modules/`、`research/`、本机数据。
+4. **校验和**：安装包与源码包都要算 SHA-256，写进 Release 说明：
+   ```powershell
+   Get-FileHash .\CodeMaker-Hub-Light_<version>_x64-setup.exe -Algorithm SHA256
+   Get-FileHash .\codemaker-hub-light-<version>-source.zip -Algorithm SHA256
+   ```
+5. **发布**：先创建 annotated tag 并推送，再用 `--verify-tag` 创建 Release：
+   ```powershell
+   gh release create v<version> --verify-tag --title "CodeMaker Hub Light <version>" `
+     --notes-file .\release-notes.md `
+     .\CodeMaker-Hub-Light_<version>_x64-setup.exe .\codemaker-hub-light-<version>-source.zip
+   ```
+6. **回验**：从 Release 下载两个附件重算 SHA-256，必须与说明一致；说明中写明「未签名 + 校验方式 + 从 tag 构建」。
 
 ## 10. 源码索引
 

@@ -1,7 +1,7 @@
 {
   "name": "codemaker-hub-light",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "账号登录 / 本地代理 / 用量统计的 Windows 桌面应用（Tauri + React）",
   "license": "GPL-3.0-only",

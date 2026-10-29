@@ -19,7 +19,7 @@ Codex        ├──→ http://127.0.0.1:15721 ───→ 你配置的兼容
 OpenAI SDK  ─┘     （本地代理：注入账号凭据、转发、记录用量）
 ```
 
-- 版本：0.1.0
+- 版本：0.2.0
 - 平台：Windows 10/11 x64（macOS / Linux 未验证）
 - 前置条件：一个可访问的兼容网关（端点约定见 [网关契约](docs/gateway-contract.md)）
 - 数据目录：`%USERPROFILE%\.codemaker-hub-light\`
@@ -211,6 +211,7 @@ print(resp.choices[0].message.content)
 | 版本 | 安装包 |
 |---|---|
 | `v0.1.0` | **未签名**——请用 Release 说明里的 SHA-256 校验，或从 tag 源码自行构建 |
+| `v0.2.0` | **未签名**——请用 Release 说明里的 SHA-256 校验，或从 tag 源码自行构建 |
 | 后续版本 | 经维护者人工批准后由 SignPath Foundation 签名 |
 
 证书签发给 SignPath Foundation，因此 Windows 上显示的签名者是 `SignPath Foundation`。可用 `Get-AuthenticodeSignature` 或 `signtool verify /pa` 验签，也可比对每次发布附带的 SHA-256。
@@ -261,7 +262,7 @@ pnpm tauri build --no-bundle   # 只产出可执行文件
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.1.0_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 > **不要单独用 `cargo build --release` 生成可运行版本**：Tauri v2 需要 `custom-protocol` feature 才会内嵌前端，否则窗口会显示"无法访问此页面"。详见 [docs/development.md](docs/development.md)。
@@ -281,7 +282,7 @@ node scripts/check-public-repo.mjs             # 脱敏 / 链接 / 文档与代�
 
 ## 当前状态与已知限制
 
-当前版本 0.1.0，仅支持 Windows（NSIS 安装包），无自动更新。
+当前版本 0.2.0，仅支持 Windows（NSIS 安装包），无自动更新。
 
 - 原生 Anthropic 上游不受支持，`/v1/messages` 必须走本地翻译；`thinking`、`cache_control`、`documents` 等字段会被丢弃，模型由网关实际路由。
 - 上游未返回费用字段时费用记为 0（`cost_source=none`），暂无本地价格表兜底。
