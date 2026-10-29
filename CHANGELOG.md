@@ -4,29 +4,31 @@
 
 ## [未发布]
 
-### 新增
-
-- **代码签名准备**：新增 [代码签名政策](docs/code-signing-policy.md)、SignPath 产物配置模板（`.github/signpath/artifact-configuration.xml`）与 Release 签名工作流（`.github/workflows/release-sign.yml`）。
-- 两份 README 增加 Code signing policy 段；`v0.1.0` 安装包仍为未签名，待 SignPath Foundation 审批后由同一工作流重签并替换附件。
-
-## [0.1.0] - 2026-10-27
-
-首个开源版本。
+## [0.2.0] - 2026-10-29
 
 ### 新增
 
-- **账号登录**：系统浏览器登录 + 深链回调；浏览器未回跳时可手动粘贴回调链接；回调票据绑定当前会话、一次性消费。
-- **凭据管理**：AES-256-GCM 加密落盘（`auth.bin`），主密钥存于系统凭据管理器；支持自动续期、`/validate` 轮询、注销清理。
-- **本地代理**：默认 `127.0.0.1:15721`，端口占用时回退 `15722–15800`；支持 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 与流式返回；剥离客户端鉴权头并注入账号凭据；Anthropic 请求在本地翻译为 OpenAI Chat；仅接受回环 `Host`，拒绝带 `Origin` 的请求。
-- **用量统计**：逐请求 token 与费用落库、日聚合、30 天费用、账号额度与模型分布、请求列表筛选与 CSV 导出（UTF-8 BOM、公式前缀中和）。
-- **桌面集成**：托盘常驻、关闭窗口即隐藏、单实例、启动失败弹窗与崩溃日志。
-- **工程**：CI（前端 / Rust / 文档门禁三 job）、`scripts/check-public-repo.mjs` 脱敏与文档一致性检查。
+- **账号 + AuthKey 直登**：登录页新增「账号 + AuthKey」入口，单次 `POST /api/v2/tokens` 完成登录，不打开浏览器、不轮询；成功后仍走 `/validate`、模型目录、`/get_auth_key` 与额度收尾。AuthKey 只在本机 Rust 侧加密保存，不写日志、不回显前端。
+- **请求明细「首字节」列**：请求页展示流式响应的首字节延迟（`first_byte_ms`），便于区分网关排队与本地耗时。
+- **手动「重新检测 / 续期」**：设置 → 账户可强制用 `auth_key` 续期一次并补一次 `/validate`，成功后刷新账号档案与模型目录；失败原因显示在账户面板。
+- **退出登录二次确认**：避免误触清除本地凭据。
 
-### 变更（相对开源前的构建）
+### 变更
 
-- **默认网关地址改为占位值 `https://api.example.com`**：首次使用必须在「设置 → 代理与记录」中填写可访问的兼容网关，否则登录与转发都会失败。已存在 `settings.json` 的安装不受影响。
-- 移除不随仓库分发的外部材料与旧版功能文档，只保留本项目的代码与文档。
-- 文档按当前代码重写：架构、认证、代理、网关契约、用量、设置、数据模型、IPC、开发、排障共十篇。
+- **过期自动续期**：`/validate` 遇到 401/403 时先用 `auth_key` 自动续期并重试一次；续期不可用或仍被拒才进入「需要重新登录」。网络瞬时失败仍回落离线宽限，不误判失效。
+- **首字节口径**：只统计上游响应第一个数据块到达的时间；非流式请求与无响应体的请求不产生该值。
+- IPC 命令 19 → 20（新增 `auth_login_with_auth_key`）。
+
+### 修复
+
+- 同一 tick 内可能重复续期：`renew_if_due` 改为读取最新凭据快照，避免同一过期窗口内发两次 `/renew_token`。
+- 登录成功后并发收尾时，AuthKey 路径会确认新 token 真的写入内存，避免把「被单飞跳过」误报为登录成功。
+
+### 工程
+
+- CI 升级到 Node 24 兼容的 action 版本（checkout / setup-node / upload-artifact v7，pnpm/action-setup v6），消除 Node 20 弃用与 `ubuntu-latest` 迁移告警。
+- **代码签名准备**：新增 [代码签名政策](docs/code-signing-policy.md)、SignPath 产物配置模板（`.github/signpath/artifact-configuration.xml`）与 Release 签名工作流（`.github/workflows/release-sign.yml`）；`v0.2.0` 安装包仍为未签名，待 SignPath Foundation 审批后由同一工作流重签并替换附件。
+- 发布流程补全：`docs/development.md` 增加发布前烟雾测试与源码包/校验和生成步骤。
 
 ### 已知限制
 
@@ -35,5 +37,7 @@
 - 上游未返回费用字段时费用记为 0（`cost_source=none`），无本地价格表兜底。
 - 请求页无详情弹层，「客户端」列固定为 `unknown`。
 - 账号级数字来自上游网关，可能包含其他设备的用量，不能与本机请求明细对账。
+- AuthKey 直登要求兼容网关实现 `POST /api/v2/tokens`；未实现的网关可在登录页改用浏览器登录。
 
+[0.2.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.0
 [0.1.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.0
