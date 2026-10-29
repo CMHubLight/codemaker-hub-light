@@ -29,6 +29,7 @@ function request(id: string, model: string): RecentRequest {
     client: 'unknown',
     status: 'success',
     latency_ms: 120,
+    first_byte_ms: 45,
     input_tokens: 10,
     output_tokens: 5,
     cost_yuan: 0.001

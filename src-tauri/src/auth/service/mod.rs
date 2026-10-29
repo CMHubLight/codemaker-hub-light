@@ -17,8 +17,9 @@
 //!   加密落盘 → 拉额度 → 启动后台循环。
 //! - 后台循环：启动立即 tick 一次，之后每 60s 检查 validate（600s）/quota（300s）/renew；
 //!   登出时通过 oneshot 取消并 abort 任务。
-//! - 网络失败语义：validate 网络错误 → offline grace；403 → reauth_required；
-//!   renew 失败 60s→300s 退避；quota 失败保留上次快照。
+//! - 网络失败语义：validate 网络错误 → offline grace；401/403 → 先用 auth_key 强制续期
+//!   并重新校验，续期不可用或仍被拒才 reauth_required；renew 失败 60s→300s 退避；
+//!   quota 失败保留上次快照。
 //! - 写路径纪律：所有状态写入都经 [`AuthService::commit_if_current`]（锁内校验代次），
 //!   锁外 IO（写盘/DB）由调用方在代次失配时做补偿删除。
 

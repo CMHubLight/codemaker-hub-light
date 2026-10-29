@@ -178,10 +178,13 @@ UPDATE proxy_session_requests
 | 费用曲线 30 天 | 本机 `usage_daily` 汇总 | 元 | `formatYuan`（¥ + 4 位） |
 | 模型分布 | 云端 `model_tokens` / `model_costs` | 积分 | `formatPoints` +「积分」；超过 8 个模型时合并为「其他 N 个模型」 |
 | 请求明细的费用列 | `proxy_request_costs.cost_yuan` | 元 | `formatYuan`（¥ + 4 位） |
+| 请求明细的「首字节」列 | `proxy_session_requests.first_byte_ms` | 毫秒 | `formatDuration`；仅流式请求有值，非流式为 `—` |
 
 ## 10. 已知边界（待验证）
 
 - 请求明细的「客户端」列固定显示 `unknown`：列表查询没有关联 `proxy_sessions.client`，聚合层直接写死。
+- 请求明细的「首字节」列口径是**首个上游响应字节**（收到第一个 SSE chunk 的时间），不是"首 token"；非流式请求不记录、显示 `—`。不要把它与"首 token 耗时（TTFT）"直接对比，两者计时终点不同。
+- CSV 导出仍是 `usage_daily` 的日聚合，不含逐请求首字节/总耗时；需要逐请求延迟请看请求明细页。
 - `cost_source=estimated` 只有枚举与注释，没有写入路径；看到非 `upstream` / `none` 的值应视为数据异常。
 - `QuotaInfo.currency` 后端固定序列化为 `CNY`，但界面按「积分」展示同一批字段；以上游口径为准，字段名是否该改（待验证）。
 - 账号级「本月」与本地「本月」的月界在跨时区场景下必然不同，两个数字不可互相校验。

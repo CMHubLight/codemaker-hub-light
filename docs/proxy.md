@@ -142,6 +142,7 @@
 - **两个 2 MiB 上限语义不同**：观测侧 `SSE_PARSE_LIMIT` 只是停止解析（字节照常透传）；翻译侧 `SSE_FAIL_LIMIT` 会清空缓冲并给客户端发一条 `event: error`。
 - **客户端断开**：靠通道 `send` 失败感知，记为 `error_kind = client_aborted`。
 - **落库**：单事务写 `proxy_sessions`（按会话 upsert）、`proxy_session_requests`、`proxy_request_costs`、`usage_daily`；写失败只记日志，不影响已经发出去的响应。`error_kind` 文本只有一份来源：`timeout`、`upstream_error`、`upstream_redirect`、`client_aborted`、`translation_error`、`unauthorized`、`request_body`。
+- **首字节延迟**：流式响应在收到首个上游 chunk 时记录 `first_byte_ms`（从请求开始计），落库为 `proxy_session_requests.first_byte_ms`；非流式请求保持 `NULL`。口径是"首个上游响应字节"，不是"首个 token"，界面列名与文档都按此口径表述。
 - **早期失败也落库**：401 / 413 / 400 / 504 这些没走到上游响应的请求同样记一行，并计入 `error_count`，否则会出现「有错误数、没有请求数」的矛盾。
 
 ## 上限与超时

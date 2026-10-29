@@ -168,6 +168,11 @@ export interface RecentRequest {
   /** success | error | cancelled */
   status: string
   latency_ms: number | null
+  /**
+   * 首个上游响应字节的耗时（毫秒）；仅流式请求有值。
+   * 语义是"首字节"而非"首 token"：非流式请求与无 SSE 的响应为 null。
+   */
+  first_byte_ms: number | null
   input_tokens: number
   output_tokens: number
   cost_yuan: number
