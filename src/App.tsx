@@ -285,7 +285,12 @@ export default function App() {
               bumpQuota()
             }}
           >
-            <Settings auth={auth} revision={dataRevision} onLogout={handleLogout} />
+            <Settings
+              auth={auth}
+              revision={dataRevision}
+              onLogout={handleLogout}
+              onAuthUpdated={setAuth}
+            />
           </ErrorBoundary>
         ) : null}
       </main>

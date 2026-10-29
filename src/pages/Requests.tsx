@@ -314,7 +314,7 @@ export function Requests({ revision = 0 }: RequestsProps) {
       ) : null}
 
       <Panel>
-        <PanelHeader title="请求明细" meta="逐请求 token 四元组、费用与耗时">
+        <PanelHeader title="请求明细" meta="逐请求 token 四元组、费用、首字节与总耗时">
           <span className="panel-tag">
             {loading ? '查询中…' : refreshing ? '刷新中…' : `共 ${totalCount} 条`}
           </span>
@@ -331,6 +331,7 @@ export function Requests({ revision = 0 }: RequestsProps) {
                 <th className="num">输入</th>
                 <th className="num">输出</th>
                 <th className="num">费用</th>
+                <th className="num">首字节</th>
                 <th className="num">耗时</th>
                 <th>状态</th>
               </tr>
@@ -338,7 +339,7 @@ export function Requests({ revision = 0 }: RequestsProps) {
             <tbody>
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="empty-cell">
+                  <td colSpan={10} className="empty-cell">
                     <p className="empty-state-title">{emptyTitle}</p>
                     <p className="empty-state-text">{emptyText}</p>
                   </td>
@@ -393,6 +394,7 @@ const RequestRow = memo(function RequestRow({ item }: { item: RecentRequest }) {
       <td className="num">{formatCompact(item.input_tokens)}</td>
       <td className="num">{formatCompact(item.output_tokens)}</td>
       <td className="num mono">{formatYuan(item.cost_yuan)}</td>
+      <td className="num">{formatDuration(item.first_byte_ms)}</td>
       <td className="num">{formatDuration(item.latency_ms)}</td>
       <td>
         <StatusPill status={status.tone} label={status.label} />

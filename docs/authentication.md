@@ -152,7 +152,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 | 循环 | 检查周期 | 触发条件 | 备注 |
 | --- | --- | --- | --- |
-| `/validate` | 每 `VALIDATE_INTERVAL_SECS`=600 秒 | `last_validated_at` 为空，或距上次成功 ≥600 秒 | 成功刷新 `last_validated_at`；401/403 转 `ReauthRequired`，网络/5xx 转 `OfflineGrace` 且**不**刷新时间戳 |
+| `/validate` | 每 `VALIDATE_INTERVAL_SECS`=600 秒 | `last_validated_at` 为空，或距上次成功 ≥600 秒 | 成功刷新 `last_validated_at`；401/403 先尝试用 `auth_key` 自动续期并重新校验，续期不可用或续期后仍被拒才转 `ReauthRequired`；网络/5xx 转 `OfflineGrace` 且**不**刷新时间戳 |
 | 续期 | 每 `RENEW_CHECK_INTERVAL_SECS`=60 秒检查一次 | 距过期 ≤ `RENEW_AHEAD_SECS`=3600 秒，或距上次成功续期 ≥ `RENEW_MAX_INTERVAL_SECS`=82800 秒 | 成功后有 `RENEW_MIN_INTERVAL_SECS`=600 秒静默期；token 已过期时静默期不生效 |
 | 额度 | 每 `QUOTA_INTERVAL_SECS`=300 秒 | `last_quota_at` 为空，或距上次成功 ≥300 秒 | 403/404/网络失败都只告警，保留上次快照 |
 
@@ -169,6 +169,20 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 续期每轮都会重新 `GET /get_auth_key`（服务端可能轮换，旧记录里也可能存着不可用的 SSO token）；主 key 被 401/403 拒绝时，若已存 key 与主 key 不同则回退重试一次，仍失败才算失败。
 
+### 7.1 token 过期时的自动续期（先续期，再判失效）
+
+后台续期是按「每 60 秒检查一次 + 到期前 1 小时」触发的；如果 token 在两次检查之间被服务端提前失效（例如多端登录顶号、服务端轮换），下一次 `/validate` 会拿到 401/403。此时不再直接要求重新登录，而是走“先续期、再判失效”的分支：
+
+1. 用 `auth_key` 强制续期一次（`renew_now`：跳过"是否到期/静默期"判定，仍走 60s→300s 退避节流）；
+2. 续期成功 → 用新 token **重新** `/validate` 一次：
+   - 成功 → 回到正常登录态并刷新 `last_validated_at`；
+   - 仍 401/403 → `ReauthRequired`（文案「续期后仍被服务端拒绝，请重新登录」）；
+   - 网络失败 → `OfflineGrace`（相信刚续到的新凭据）；
+3. 续期被拒（401/403）或缺 `auth_key` → `ReauthRequired`；
+4. 续期网络/5xx 瞬时失败 → `OfflineGrace`，保留旧凭据等后台重试。
+
+同一条强制续期路径也用于设置页账户面板的手动「重新检测 / 续期」按钮（命令 `auth_retry_renewal`）：成功后补一次 `/validate`，刷新账号档案与模型目录；失败原因写入 `AuthStatus.message`。
+
 其它相关常量：`HTTP_TIMEOUT_SECS`=20（所有认证请求）、`POLL_INTERVAL_SECS`=2、`POLL_TIMEOUT_SECS`=300、`MAX_CONSECUTIVE_NETWORK_ERRORS`=3、`MAX_TOKEN_LEN`=8192、`MAX_USER_LEN`=256。
 
 `update_is_publishable` 决定是否广播 `auth://state`：额度确实更新，或 `AuthStatus` 有任一字段变化才发。状态没变时发事件会让前端整页重拉（24 小时云端曲线也会跟着多打一次网关）。
@@ -179,10 +193,10 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 | 维度 | 离线宽限（`OfflineGrace`） | 凭据失效（`ReauthRequired`） |
 | --- | --- | --- |
-| 触发 | 网络失败、连接失败、超时、5xx、429、解码失败等非 401/403 错误 | `/validate`、续期返回 401/403；或续期缺 key；或无进展 3 次 |
+| 触发 | 网络失败、连接失败、超时、5xx、429、解码失败等非 401/403 错误；或 `/validate` 401/403 但自动续期瞬时失败 | `/validate` 401/403 且自动续期不可用（缺 key/被拒）、续期后重新校验仍 401/403；或续期缺 key；或无进展 3 次 |
 | 前端 `state` | `authenticated`（`offline_grace=true`） | `reauth_required` |
 | `credentials_valid` | validate 路径不改（沿用原值）；登录时降级则因 `!offline_grace` 写成 `false` | 置 `false` |
-| 提示文案 | 「网络异常，已按离线宽限继续」 | 「登录状态已失效，请重新登录」 |
+| 提示文案 | 「网络异常，已按离线宽限继续」/「自动续期失败（网络异常），已按离线宽限继续」 | 「登录状态已失效，请重新登录」/「续期后仍被服务端拒绝，请重新登录」 |
 | 代理转发 | 继续用内存里的旧 token 转发 | `credentials_snapshot()` 返回 `None`，代理直接 401 |
 | 后台循环 | 下一轮继续重试 | tick 开头发现 `ReauthRequired` 直接返回，不做无意义重试 |
 | 恢复方式 | 任一后续 `/validate` 或续期成功即自动回 `LoggedIn` | 只能重新登录 |
@@ -212,7 +226,9 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 | 上游返回 401/403 | `Error`，「服务端拒绝该登录请求，请重新发起登录」 | 登录页错误 |
 | 上游返回 `credentials_invalid` | `Error`，「服务端返回凭据已失效」 | 登录页错误 |
 | 前端命令连续失败 3 次 | — | 前端自行判定失败（`MAX_POLL_FAILURES`=3），避免单次抖动判死 |
-| `/validate` 返回 401/403 | `ReauthRequired`，「登录状态已失效，请重新登录」 | 回到登录页 |
+| `/validate` 返回 401/403 | 先自动续期并重新校验；续期可用则恢复 `LoggedIn`，不可用才 `ReauthRequired` | 多数情况无感恢复；失败回到登录页 |
+| 续期后被重新校验拒绝 | `ReauthRequired`，「续期后仍被服务端拒绝，请重新登录」 | 回到登录页 |
+| 手动「重新检测 / 续期」 | 强制续期 + 补 validate；成功回 `LoggedIn`，失败写入 `message` | 账户面板内联提示 |
 | 续期被拒 | `ReauthRequired`，「续期被服务端拒绝，请重新登录」 | 回到登录页 |
 | 续期缺 key | `ReauthRequired`，「缺少续期凭据（auth_key），请重新登录」 | 回到登录页 |
 | 续期无进展 3 次 | `ReauthRequired`，文案说明「自动续期无进展」 | 回到登录页 |

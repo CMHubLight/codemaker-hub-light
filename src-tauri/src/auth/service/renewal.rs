@@ -3,6 +3,19 @@
 use super::*;
 use crate::auth::client::RenewedToken;
 
+/// 一次续期尝试的结果（供 `/validate` 401/403 分支与手动"重新检测"复用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RenewOutcome {
+    /// 续期成功，且新凭据已提交到内存/磁盘。
+    Renewed,
+    /// 没有可用的 `auth_key`，无法续期；状态已置为 `reauth_required`。
+    NoKey,
+    /// 服务端拒绝（401/403）；状态已置为 `reauth_required`。
+    Rejected,
+    /// 网络/其它瞬时失败；已记录退避，调用方可回落离线宽限。
+    Transient,
+}
+
 impl AuthService {
     /// 续期检查；真正发起请求时返回 true。
     pub(super) async fn renew_if_due(
@@ -12,40 +25,111 @@ impl AuthService {
         credentials: &Credentials,
         now: DateTime<Utc>,
     ) -> bool {
+        // 本次 tick 内 `/validate` 可能已用 auth_key 强制续期：以内存里的最新凭据
+        // 为准，否则会拿旧的过期时间再续一次（同一 tick 内重复续期）。
+        let current =
+            { self.state.read().await.credentials.clone() }.unwrap_or_else(|| credentials.clone());
         // 1) 到期 / 静默期 / 退避判定（只读状态，不产生副作用）。
-        let Some(renew) = self.renewal_ready(epoch, credentials.expires_at, now).await else {
+        if self
+            .renewal_ready(epoch, current.expires_at, now)
+            .await
+            .is_none()
+        {
             return false;
-        };
+        }
+        // 2) 取 key → 请求 → 提交（与强制续期共用同一路径）。
+        self.perform_renewal(epoch, gateway, current).await;
+        true
+    }
 
-        // 2) 取续期 key（每轮都取：服务端可能轮换，旧版本存的可能是错的那种凭据）。
-        let current = credentials.clone();
+    /// 强制续期（跳过"是否到期/静默期"判定），供 `/validate` 401/403 与手动重试复用。
+    ///
+    /// 返回 `None` 表示当前没有可用的登录凭据；否则返回本次续期结果。
+    pub(super) async fn renew_now(
+        &self,
+        epoch: u64,
+        gateway: &AuthGateway,
+    ) -> Option<RenewOutcome> {
+        let current = { self.state.read().await.credentials.clone() }?;
+        Some(self.perform_renewal(epoch, gateway, current).await)
+    }
+
+    /// 手动"重新检测/续期"：强制续期一次；成功后补一次 `/validate` 刷新账号档案与模型目录。
+    ///
+    /// 续期失败不返回错误：失败原因已写入 `last_error`/退避状态，界面读 `auth_status` 即可。
+    pub async fn retry_renewal(&self, gateway_url: &str) -> Result<AuthUpdate, AuthError> {
+        self.ensure_loaded().await;
+        let epoch = self.epoch().await;
+        if self.state.read().await.credentials.is_none() {
+            return Ok(self.make_update(None, false).await);
+        }
+        let gateway = self.gateway(gateway_url).await?;
+        if self.renew_now(epoch, &gateway).await == Some(RenewOutcome::Renewed) {
+            // 续期成功后旧 access_token 已被替换，补一次校验让 profile/models 跟上新身份。
+            let fresh = { self.state.read().await.credentials.clone() };
+            if let Some(fresh) = fresh {
+                self.validate_with(epoch, &gateway, &fresh).await;
+            }
+        }
+        Ok(self.make_update(None, false).await)
+    }
+
+    /// 执行一次续期尝试：取 key → 请求 → 提交；不在这里做"到期/静默期"判断。
+    ///
+    /// 返回值只描述结果；所有状态写入仍走 `commit_if_current`（代次不变才提交）。
+    async fn perform_renewal(
+        &self,
+        epoch: u64,
+        gateway: &AuthGateway,
+        current: Credentials,
+    ) -> RenewOutcome {
+        // 取续期 key（每轮都取：服务端可能轮换，旧版本存的可能是错的那种凭据）。
         let stored_key = current.auth_key.clone();
         let fresh_key = self.fetch_renew_key(gateway, &current).await;
         let Some(primary_key) = fresh_key.or_else(|| stored_key.clone()) else {
             // 两处都没有 key：只能要求重新登录。
-            let committed = self
-                .commit_if_current(epoch, |state| {
-                    state.phase = AuthPhase::ReauthRequired;
-                    state.credentials_valid = false;
-                    state.last_error = Some("缺少续期凭据（auth_key），请重新登录".to_string());
-                })
-                .await;
-            return committed.is_some();
+            self.commit_missing_renew_key(epoch).await;
+            return RenewOutcome::NoKey;
         };
 
-        // 3) 发起续期（401/403 时用已存 key 重试一次）。
+        // 发起续期（401/403 时用已存 key 重试一次）。
+        let renew = { self.state.read().await.renew.clone() };
         let (used_key, outcome) = self
             .attempt_renew(gateway, &current, &primary_key, stored_key.as_deref())
             .await;
 
-        // 4) 提交结果。
         match outcome {
             Ok(renewed) => {
-                self.commit_renew_success(epoch, current, renewed, used_key, now, &renew)
-                    .await
+                let committed = self
+                    .commit_renew_success(epoch, current, renewed, used_key, Utc::now(), &renew)
+                    .await;
+                if committed {
+                    RenewOutcome::Renewed
+                } else {
+                    // 代次已变（注销/重新登录）：本次结果作废，按瞬时失败处理。
+                    RenewOutcome::Transient
+                }
             }
-            Err(err) => self.commit_renew_failure(epoch, &err, now, &renew).await,
+            Err(err) => {
+                self.commit_renew_failure(epoch, &err, Utc::now(), &renew)
+                    .await;
+                if err.is_forbidden() {
+                    RenewOutcome::Rejected
+                } else {
+                    RenewOutcome::Transient
+                }
+            }
         }
+    }
+
+    /// 没有可用续期 key：只能要求重新登录（与续期失败区分，文案更具体）。
+    async fn commit_missing_renew_key(&self, epoch: u64) {
+        self.commit_if_current(epoch, |state| {
+            state.phase = AuthPhase::ReauthRequired;
+            state.credentials_valid = false;
+            state.last_error = Some("缺少续期凭据（auth_key），请重新登录".to_string());
+        })
+        .await;
     }
 
     /// 续期到期判定：返回当期 [`RenewRuntime`] 快照；不该续期时返回 `None`。

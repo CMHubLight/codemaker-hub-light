@@ -1,19 +1,35 @@
+import { useState } from 'react'
 import { Panel, PanelHeader } from '../../components/Panel'
 import { StatusPill } from '../../components/StatusPill'
 import { formatDateTime } from '../../lib/format'
 import type { AuthStatus } from '../../lib/types'
+import type { SaveState } from './types'
 
 interface AccountPanelProps {
   auth: AuthStatus | null
   loggingOut: boolean
   logoutError: string | null
+  /** 手动“重新检测/续期”进行中。 */
+  retryingRenewal: boolean
+  /** 手动续期的结果提示（成功/失败文案由上层生成）。 */
+  renewalMessage: SaveState | null
+  onRetryRenewal: () => void
   onLogout: () => void
 }
 
-/** 账户面板：登录账号诊断信息 + 退出登录。 */
-export function AccountPanel({ auth, loggingOut, logoutError, onLogout }: AccountPanelProps) {
+/** 账户面板：登录账号诊断信息 + 手动续期 + 退出登录（二次确认）。 */
+export function AccountPanel({
+  auth,
+  loggingOut,
+  logoutError,
+  retryingRenewal,
+  renewalMessage,
+  onRetryRenewal,
+  onLogout
+}: AccountPanelProps) {
   // 只有 authenticated 才有完整的账号字段可展示（pending/error 时 auth 可能是空壳）。
   const account = auth?.state === 'authenticated' ? auth : null
+  const [confirmingLogout, setConfirmingLogout] = useState(false)
 
   return (
     <Panel>
@@ -66,14 +82,64 @@ export function AccountPanel({ auth, loggingOut, logoutError, onLogout }: Accoun
         <p className="hint">当前没有可展示的账号信息，请重新登录。</p>
       )}
 
-      <div className="form-actions">
-        <button type="button" className="btn btn--danger" onClick={onLogout} disabled={loggingOut}>
-          {loggingOut ? '正在退出…' : '退出登录'}
-        </button>
-        <span className="hint">
-          退出后清除本地加密凭据，代理立即返回 401，需要重新登录才能继续使用。
-        </span>
-      </div>
+      {confirmingLogout ? (
+        <div className="inline-message-row">
+          <p className="hint">
+            确认退出登录？退出后清除本地加密凭据，代理立即返回 401，需要重新登录才能继续使用。
+          </p>
+          <button
+            type="button"
+            className="btn btn--danger btn--sm"
+            onClick={onLogout}
+            disabled={loggingOut}
+          >
+            {loggingOut ? '正在退出…' : '确认退出'}
+          </button>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => setConfirmingLogout(false)}
+            disabled={loggingOut}
+          >
+            取消
+          </button>
+        </div>
+      ) : (
+        <div className="form-actions">
+          <button
+            type="button"
+            className="btn btn--ghost"
+            onClick={onRetryRenewal}
+            disabled={retryingRenewal || !account}
+          >
+            {retryingRenewal ? '正在续期…' : '重新检测 / 续期'}
+          </button>
+          <button
+            type="button"
+            className="btn btn--danger"
+            onClick={() => setConfirmingLogout(true)}
+            disabled={loggingOut}
+          >
+            {loggingOut ? '正在退出…' : '退出登录'}
+          </button>
+          <span className="hint">
+            退出后清除本地加密凭据，代理立即返回 401，需要重新登录才能继续使用。
+          </span>
+        </div>
+      )}
+
+      {renewalMessage ? (
+        <p
+          className={
+            renewalMessage.tone === 'error'
+              ? 'inline-message inline-message--error'
+              : 'inline-message'
+          }
+          role={renewalMessage.tone === 'error' ? 'alert' : 'status'}
+        >
+          {renewalMessage.text}
+        </p>
+      ) : null}
 
       {logoutError ? (
         <p className="inline-message inline-message--error" role="alert">

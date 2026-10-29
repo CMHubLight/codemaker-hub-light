@@ -129,6 +129,25 @@ pub async fn auth_refresh_validate(
     Ok(update.status)
 }
 
+/// 手动“重新检测/续期”：强制用 auth_key 续期一次，成功后补一次 `/validate`。
+///
+/// token 即将/已经过期但还没到后台续期窗口时，给用户一个主动恢复入口；
+/// 失败原因通过返回的 `AuthStatus.message` 展示。
+#[tauri::command]
+pub async fn auth_retry_renewal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
+    let gateway_url = state.settings.read().await.gateway_url.clone();
+    let update = state
+        .auth
+        .retry_renewal(&gateway_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    emit_update(&app, &update);
+    Ok(update.status)
+}
+
 /// 手动提交浏览器回调链接（深链 scheme 未注册/浏览器未自动拉起时的兜底）。
 ///
 /// 前端只提交用户从地址栏/回调页复制的 `codemakerhub-light://auth/callback?...`；

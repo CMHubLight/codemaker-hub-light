@@ -25,6 +25,8 @@ interface SettingsProps {
   /** App 在本机数据变化后递增：刷新代理状态与应用信息，不覆盖未保存的设置编辑。 */
   revision?: number
   onLogout: () => Promise<void> | void
+  /** 手动续期成功后的登录态更新（后端同时会发 auth://state，这里用于即时刷新面板）。 */
+  onAuthUpdated?: (status: AuthStatus) => void
 }
 
 /**
@@ -35,7 +37,7 @@ interface SettingsProps {
  * 未保存编辑），代理状态与应用信息按 `revision` 静默刷新。
  * 数字字段用编辑态字符串（`NumberDrafts`），失焦/提交才解析校验，清空不会立刻变 0。
  */
-export function Settings({ auth, revision = 0, onLogout }: SettingsProps) {
+export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: SettingsProps) {
   const previewMode = !isTauri()
   const [form, setForm] = useState<AppSettings | null>(null)
   const [drafts, setDrafts] = useState<NumberDrafts | null>(null)
@@ -45,6 +47,7 @@ export function Settings({ auth, revision = 0, onLogout }: SettingsProps) {
   const [logsMessage, setLogsMessage] = useState<SaveState | null>(null)
   const [loggingOut, setLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState<string | null>(null)
+  const [renewalMessage, setRenewalMessage] = useState<SaveState | null>(null)
 
   // 设置只在首次进入和显式重试时读取：key 不含 revision，避免事件刷新覆盖用户编辑。
   const settingsResource = useAsyncResource('settings', () => invokeCmd<AppSettings>('settings_get'))
@@ -58,6 +61,9 @@ export function Settings({ auth, revision = 0, onLogout }: SettingsProps) {
   const { run: runSave, running: saving } = useCommand<AppSettings>('settings_update')
   const { run: runRestart, running: restarting } = useCommand<ProxyStatus>('proxy_restart')
   const { run: runOpenLogs, running: openingLogs } = useCommand<AppLogResult>('app_open_logs')
+  const { run: runRetryRenewal, running: retryingRenewal } = useCommand<AuthStatus>(
+    'auth_retry_renewal'
+  )
 
   useEffect(() => {
     const next = settingsResource.data
@@ -213,6 +219,32 @@ export function Settings({ auth, revision = 0, onLogout }: SettingsProps) {
     }
   }
 
+  async function handleRetryRenewal() {
+    setRenewalMessage(null)
+    const outcome = await runRetryRenewal()
+    if (outcome.status === 'error') {
+      setRenewalMessage({ tone: 'error', text: `重新检测失败：${outcome.error.raw}` })
+      return
+    }
+    if (outcome.status === 'stale') return
+    const status = outcome.data
+    onAuthUpdated?.(status)
+    if (status.state === 'reauth_required') {
+      setRenewalMessage({
+        tone: 'error',
+        text: status.message ?? '重新检测后仍未恢复登录，请重新登录。'
+      })
+    } else if (status.state === 'authenticated' && !status.message) {
+      setRenewalMessage({ tone: 'ok', text: '已重新检测并完成续期，登录状态已刷新。' })
+    } else {
+      // 续期失败但保留登录态（网络失败/离线宽限）或其它异常：如实展示后端文案。
+      setRenewalMessage({
+        tone: 'error',
+        text: status.message ?? '重新检测未完成，请稍后重试或重新登录。'
+      })
+    }
+  }
+
   return (
     <div className="stack">
       {loadError ? (
@@ -262,6 +294,9 @@ export function Settings({ auth, revision = 0, onLogout }: SettingsProps) {
         auth={auth}
         loggingOut={loggingOut}
         logoutError={logoutError}
+        retryingRenewal={retryingRenewal}
+        renewalMessage={renewalMessage}
+        onRetryRenewal={() => void handleRetryRenewal()}
         onLogout={() => void handleLogout()}
       />
 

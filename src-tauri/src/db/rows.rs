@@ -200,6 +200,8 @@ pub struct RequestRow {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub duration_ms: Option<i64>,
+    /// 首个上游响应字节的耗时（仅流式请求有值；语义是"首字节"而不是"首 token"）。
+    pub first_byte_ms: Option<i64>,
     pub error_kind: Option<String>,
     pub session_id: Option<i64>,
     pub client_request_id: Option<String>,
@@ -223,6 +225,7 @@ impl FromRow for RequestRow {
             cache_read_tokens: row.get("cache_read_tokens")?,
             cache_write_tokens: row.get("cache_write_tokens")?,
             duration_ms: row.get("duration_ms")?,
+            first_byte_ms: row.get("first_byte_ms")?,
             error_kind: row.get("error_kind")?,
             session_id: row.get("session_id")?,
             client_request_id: row.get("client_request_id")?,
@@ -252,12 +255,15 @@ pub struct RequestDetailRow {
 
 impl FromRow for RequestDetailRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        let request = RequestRow::from_row(row)?;
+        // `first_byte_ms` 已并入 `REQUEST_COLUMNS`，详情行从 request 里取，避免重复解码。
+        let first_byte_ms = request.first_byte_ms;
         Ok(Self {
-            request: RequestRow::from_row(row)?,
+            request,
             upstream_url: row.get("upstream_url")?,
             request_bytes: row.get("request_bytes")?,
             response_bytes: row.get("response_bytes")?,
-            first_byte_ms: row.get("first_byte_ms")?,
+            first_byte_ms,
             request_headers: row.get("request_headers")?,
             request_body: row.get("request_body")?,
             response_body: row.get("response_body")?,

@@ -53,14 +53,15 @@ pub const REQUEST_COLUMNS: &str = "r.id AS id, r.started_at AS started_at, \
      r.model AS model, r.status_code AS status_code, r.is_sse AS is_sse, \
      r.input_tokens AS input_tokens, r.output_tokens AS output_tokens, \
      r.cache_read_tokens AS cache_read_tokens, r.cache_write_tokens AS cache_write_tokens, \
-     r.duration_ms AS duration_ms, r.error_kind AS error_kind, r.session_id AS session_id, \
+     r.duration_ms AS duration_ms, r.first_byte_ms AS first_byte_ms, \
+     r.error_kind AS error_kind, r.session_id AS session_id, \
      r.client_request_id AS client_request_id, c.cost_yuan AS cost_yuan, \
      c.cost_source AS cost_source";
 
 /// 单请求详情追加的列（正文与费用明细）。
 pub const REQUEST_DETAIL_COLUMNS: &str = "r.upstream_url AS upstream_url, \
      r.request_bytes AS request_bytes, r.response_bytes AS response_bytes, \
-     r.first_byte_ms AS first_byte_ms, r.request_headers AS request_headers, \
+     r.request_headers AS request_headers, \
      r.request_body AS request_body, r.response_body AS response_body, \
      r.body_truncated AS body_truncated, r.ended_at AS ended_at, \
      c.currency AS cost_currency, c.total_credit AS cost_total_credit, \

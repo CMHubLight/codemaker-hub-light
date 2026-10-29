@@ -97,6 +97,7 @@ pub fn run() {
             commands::auth::auth_poll_status,
             commands::auth::auth_logout,
             commands::auth::auth_refresh_validate,
+            commands::auth::auth_retry_renewal,
             commands::auth::auth_submit_deep_link,
             commands::auth::quota_get,
             commands::proxy::proxy_status,

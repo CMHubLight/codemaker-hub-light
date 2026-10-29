@@ -21,7 +21,7 @@ OpenAI SDK  ─┘     (injects account credentials, records usage)
 
 ## What it does
 
-- **Login** — system browser handles authentication, a deep link brings you back; if the browser cannot reach the app you can paste the callback link manually. Credentials are encrypted at rest (AES-256-GCM, master key in the Windows Credential Manager) and renewed automatically.
+- **Login** — system browser handles authentication, a deep link brings you back; if the browser cannot reach the app you can paste the callback link manually. Credentials are encrypted at rest (AES-256-GCM, master key in the Windows Credential Manager) and renewed automatically. If the access token expires early, the app tries one `auth_key`-based renewal before treating the session as invalid; the settings page also exposes a manual "re-check / renew" action.
 - **Local proxy** — listens on `127.0.0.1:15721` by default, falls back to `15722–15800` when the port is taken. Accepts Anthropic Messages, OpenAI Chat Completions and OpenAI Responses (streaming included). Client-supplied auth headers (`authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, …) are stripped and replaced with the stored account credential. Only loopback `Host` is accepted, and requests carrying an `Origin` header are rejected with 403 — a browser page must not be able to read `/status` or your quota.
 - **Usage** — per-request input/output tokens and cost, a 30-day local cost curve, a filterable request list with CSV export; plus account-level monthly quota, model distribution and a 24-hour curve fetched from the gateway.
 - **Tray** — closing the window only hides it; the proxy keeps running. The tray tooltip shows this month's points.

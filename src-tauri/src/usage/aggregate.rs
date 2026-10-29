@@ -124,6 +124,7 @@ pub fn recent_from_row(row: &RequestRow) -> RecentRequest {
         client: "unknown".to_string(),
         status: request_status(row).to_string(),
         latency_ms: row.duration_ms,
+        first_byte_ms: row.first_byte_ms,
         input_tokens: row.input_tokens,
         output_tokens: row.output_tokens,
         cost_yuan: round4(row.cost_yuan.unwrap_or(0.0)),
@@ -184,6 +185,7 @@ mod tests {
             cache_read_tokens: 3,
             cache_write_tokens: 1,
             duration_ms: Some(1234),
+            first_byte_ms: Some(210),
             error_kind: error_kind.map(str::to_string),
             session_id: None,
             client_request_id: None,
@@ -232,6 +234,11 @@ mod tests {
         assert_eq!(item.status, "success");
         assert_eq!(item.cost_yuan, 0.012_3);
         assert_eq!(item.latency_ms, Some(1234));
+        assert_eq!(
+            item.first_byte_ms,
+            Some(210),
+            "首字节延迟必须透出到前端请求列表"
+        );
     }
 
     /// 写入侧（落库列 status_kind）与读取侧（界面标签）必须同源，

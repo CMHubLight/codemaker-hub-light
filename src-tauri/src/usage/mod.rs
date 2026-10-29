@@ -75,6 +75,8 @@ pub struct RecentRequest {
     /// success | error | cancelled
     pub status: String,
     pub latency_ms: Option<i64>,
+    /// 首个上游响应字节的耗时（仅流式请求有值；口径见 docs/usage.md）。
+    pub first_byte_ms: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_yuan: f64,

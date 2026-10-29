@@ -28,6 +28,8 @@ export type CommandName =
   | 'auth_poll_status'
   | 'auth_status'
   | 'auth_logout'
+  | 'auth_refresh_validate'
+  | 'auth_retry_renewal'
   | 'auth_submit_deep_link'
   | 'quota_get'
   | 'proxy_status'
@@ -139,6 +141,8 @@ export const DEFAULT_COMMAND_TIMEOUT_MS = 10_000
 const COMMAND_TIMEOUT_MS: Partial<Record<CommandName, number>> = {
   auth_start_login: 30_000,
   auth_submit_deep_link: 30_000,
+  auth_refresh_validate: 30_000,
+  auth_retry_renewal: 30_000,
   quota_get: 30_000,
   proxy_restart: 30_000,
   usage_export_csv: 30_000,
@@ -291,6 +295,8 @@ async function mockInvoke(
     case 'auth_poll_status':
     case 'auth_status':
     case 'auth_logout':
+    case 'auth_refresh_validate':
+    case 'auth_retry_renewal':
     case 'auth_submit_deep_link':
       return clone(MOCK_AUTH_STATUS)
     /** 浏览器预览没有真实快照，额度为空；页面按“暂无额度数据”处理。 */
