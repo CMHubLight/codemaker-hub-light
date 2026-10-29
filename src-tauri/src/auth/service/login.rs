@@ -184,6 +184,68 @@ impl AuthService {
         )
     }
 
+    /// 账号 + AuthKey 直登：单次 RPC，不打开浏览器、不轮询。
+    ///
+    /// 成功后复用 [`Self::finish_login`]（validate → 模型目录/续期 key → 加密落盘 → 额度），
+    /// 因此登录后的状态与 OpenID 路径完全一致；失败只返回错误，不改变已有登录态。
+    pub async fn login_with_auth_key(
+        &self,
+        gateway_url: &str,
+        user: &str,
+        auth_key: &str,
+    ) -> Result<AuthUpdate, AuthError> {
+        let user = user.trim();
+        let auth_key = auth_key.trim();
+        if user.is_empty() || auth_key.is_empty() {
+            return Err(AuthError::Rejected("请填写账号名和 AuthKey。".to_string()));
+        }
+        if user.chars().count() > auth::MAX_USER_LEN {
+            return Err(AuthError::Rejected("账号名过长。".to_string()));
+        }
+        if auth_key.chars().count() > auth::MAX_TOKEN_LEN {
+            return Err(AuthError::Rejected("AuthKey 过长。".to_string()));
+        }
+        if user.chars().any(char::is_control) || auth_key.chars().any(char::is_control) {
+            return Err(AuthError::Rejected(
+                "账号名或 AuthKey 含非法字符。".to_string(),
+            ));
+        }
+
+        self.ensure_loaded().await;
+        let epoch = self.epoch().await;
+        let gateway = self.gateway(gateway_url).await?;
+        let mut tokens = gateway
+            .login_with_auth_key(user, auth_key)
+            .await
+            .map_err(map_auth_key_login_error)?;
+        // AuthV2TokenResponse 不含输入 AuthKey；缺省时用本次输入作为续期 key 兜底
+        // （finish_login 里仍会优先用 /get_auth_key 返回的 128 字符 key）。
+        if tokens.auth_key.is_none() {
+            tokens.auth_key = Some(auth_key.to_string());
+        }
+        if tokens.user.is_none() {
+            tokens.user = Some(user.to_string());
+        }
+        let expected = tokens.access_token.clone();
+        let update = self.finish_login(epoch, gateway_url, tokens).await?;
+        // 并发登录（例如另一条 OpenID 收尾）时 finish_login 会静默单飞跳过；
+        // AuthKey 路径必须确认本次 token 真的落到了内存，否则不能向界面报成功。
+        let current = {
+            self.state
+                .read()
+                .await
+                .credentials
+                .as_ref()
+                .map(|credentials| credentials.access_token.clone())
+        };
+        if current.as_deref() != Some(expected.as_str()) {
+            return Err(AuthError::Internal(
+                "登录未完成（已有另一条登录流程在收尾），请稍后重试".to_string(),
+            ));
+        }
+        Ok(update)
+    }
+
     /// 登录成功后的落库与状态切换（validate → get_auth_key → 加密保存 → quota）。
     pub(super) async fn finish_login(
         &self,
@@ -345,6 +407,19 @@ impl AuthService {
     }
 }
 
+/// 把 AuthKey 登录的网关错误映射成用户可见错误；不包含响应正文/凭据。
+fn map_auth_key_login_error(err: GatewayError) -> AuthError {
+    match &err {
+        GatewayError::Status { status: 401 | 403 } => {
+            AuthError::Rejected("账号名或 AuthKey 不正确。".to_string())
+        }
+        GatewayError::Status { status } if (400..500).contains(status) => {
+            AuthError::Rejected(format!("登录请求被服务端拒绝（HTTP {status}）。"))
+        }
+        _ => AuthError::Http(err.to_string()),
+    }
+}
+
 /// 由登录响应组装凭据与账号档案（纯函数，便于测试）。
 ///
 /// `DEFAULT_TOKEN_TTL_SECS` 只在服务端未返回 `expire` 时兜底（契约推断为 1 天）。
@@ -457,4 +532,166 @@ pub(super) fn claim_deep_link(
         pending.credentials_consumed = true;
     }
     DeepLinkVerdict::Accepted
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// 最小脚本网关：按顺序回放响应（每次连接一条）。
+    async fn scripted_gateway(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应可绑定回环端口");
+        let addr = listener.local_addr().expect("应可读取监听地址");
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    404 => "Not Found",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn auth_key_login_rejects_empty_fields_without_network() {
+        let (service, dir) = super::super::test_support::temp_service();
+        let err = service
+            .login_with_auth_key("https://api.example.test", "  ", "key")
+            .await
+            .expect_err("空账号必须失败");
+        assert!(err.to_string().contains("请填写账号名和 AuthKey"));
+        let err = service
+            .login_with_auth_key("https://api.example.test", "alice", "  ")
+            .await
+            .expect_err("空 AuthKey 必须失败");
+        assert!(err.to_string().contains("请填写账号名和 AuthKey"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_key_login_success_persists_credentials() {
+        let (base, server) = scripted_gateway(vec![
+            (
+                200,
+                r#"{"access_token":"new-token","access_sso_token":"sso-key","access_user":"alice","server_url":"https://api.example.test","login_time":"1700000000"}"#,
+            ),
+            (
+                200,
+                r#"{"display_name":"Alice","models":[{"id":"m1"}]}"#,
+            ),
+            (200, r#"{"auth_key":"server-128-key"}"#),
+            (404, "{}"),
+        ])
+        .await;
+        let (service, dir) = super::super::test_support::temp_service();
+
+        let update = service
+            .login_with_auth_key(&base, "alice", "input-auth-key")
+            .await
+            .expect("Mock 网关应登录成功");
+        assert_eq!(update.status.state, "authenticated");
+        assert!(update.status.credentials_valid);
+
+        let snapshot = service
+            .credentials_snapshot()
+            .await
+            .expect("登录后应有凭据");
+        assert_eq!(snapshot.access_token, "new-token");
+        let stored_key = {
+            service
+                .state
+                .read()
+                .await
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.auth_key.clone())
+        };
+        assert_eq!(
+            stored_key.as_deref(),
+            Some("server-128-key"),
+            "/get_auth_key 返回的续期 key 应优先使用"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 服务端明确拒绝：映射为"账号或 AuthKey 不正确"，且不改变已有状态。
+    #[tokio::test]
+    async fn auth_key_login_401_maps_to_invalid_credentials() {
+        let (base, server) = scripted_gateway(vec![(401, r#"{"msg":"invalid"}"#)]).await;
+        let (service, dir) = super::super::test_support::temp_service();
+
+        let err = service
+            .login_with_auth_key(&base, "alice", "wrong-key")
+            .await
+            .expect_err("401 必须失败");
+        assert!(
+            err.to_string().contains("账号名或 AuthKey 不正确"),
+            "错误文案应面向用户：{err}"
+        );
+        assert!(service.status().await.state != "authenticated");
+        assert!(service.credentials_snapshot().await.is_none());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 响应没有 auth_key、/get_auth_key 也不可用时，用本次输入的 AuthKey 兜底。
+    #[tokio::test]
+    async fn auth_key_login_falls_back_to_input_key() {
+        let (base, server) = scripted_gateway(vec![
+            (200, r#"{"access_token":"new-token","access_user":"alice"}"#),
+            (200, r#"{"display_name":"Alice","models":[{"id":"m1"}]}"#),
+            (404, "{}"),
+            (404, "{}"),
+        ])
+        .await;
+        let (service, dir) = super::super::test_support::temp_service();
+
+        service
+            .login_with_auth_key(&base, "alice", "input-auth-key")
+            .await
+            .expect("Mock 网关应登录成功");
+        let snapshot = service
+            .credentials_snapshot()
+            .await
+            .expect("登录后应有凭据");
+        assert_eq!(snapshot.access_token, "new-token");
+        let stored_key = {
+            service
+                .state
+                .read()
+                .await
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.auth_key.clone())
+        };
+        assert_eq!(stored_key.as_deref(), Some("input-auth-key"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

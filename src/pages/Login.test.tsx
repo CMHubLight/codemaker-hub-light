@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Login } from './Login'
 import { invokeCmd } from '../lib/ipc'
-import { AUTH_PENDING, LOGIN_SESSION } from '../test/fixtures'
+import { AUTH_PENDING, AUTH_UNAUTHENTICATED, LOGIN_SESSION } from '../test/fixtures'
 
 // 事件订阅在 jsdom 里没有 Tauri 后端：把 handler 捕获下来，手动模拟深链到达。
 const eventHandlers = vi.hoisted(() => ({
@@ -93,5 +93,84 @@ describe('Login 轮询', () => {
 
     expect(pollCalls).toBe(2)
     expect(maxActive).toBe(1)
+  })
+})
+
+describe('Login AuthKey 直登', () => {
+  const AUTH_OK = {
+    ...AUTH_UNAUTHENTICATED,
+    state: 'authenticated' as const,
+    user: 'alice',
+    credentials_valid: true
+  }
+
+  function renderAuthKeyPage() {
+    const onAuthenticated = vi.fn()
+    render(
+      <Login
+        previewMode={false}
+        onAuthenticated={onAuthenticated}
+        onPreviewSignIn={vi.fn()}
+      />
+    )
+    return { onAuthenticated }
+  }
+
+  it('empty_fields_show_local_error_without_invoking_backend', async () => {
+    const { onAuthenticated } = renderAuthKeyPage()
+    fireEvent.click(screen.getByRole('button', { name: 'AuthKey 登录' }))
+    await flushMicrotasks()
+
+    expect(screen.getByRole('alert').textContent).toContain('请填写账号名和 AuthKey')
+    expect(invokeMock).not.toHaveBeenCalledWith('auth_login_with_auth_key', expect.anything())
+    expect(onAuthenticated).not.toHaveBeenCalled()
+  })
+
+  it('submits_trimmed_user_and_key_and_finishes_login', async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_login_with_auth_key') return AUTH_OK
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    const { onAuthenticated } = renderAuthKeyPage()
+
+    fireEvent.change(screen.getByLabelText('账号名'), { target: { value: ' alice ' } })
+    fireEvent.change(screen.getByLabelText('AuthKey'), { target: { value: ' secret-key ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'AuthKey 登录' }))
+    await flushMicrotasks()
+
+    expect(invokeMock).toHaveBeenCalledWith('auth_login_with_auth_key', {
+      user: 'alice',
+      authKey: 'secret-key'
+    })
+    expect(onAuthenticated).toHaveBeenCalledTimes(1)
+  })
+
+  it('backend_rejection_is_shown_and_login_is_not_finished', async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_login_with_auth_key') {
+        throw new Error('凭据被服务端拒绝：账号名或 AuthKey 不正确。')
+      }
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    const { onAuthenticated } = renderAuthKeyPage()
+
+    fireEvent.change(screen.getByLabelText('账号名'), { target: { value: 'alice' } })
+    fireEvent.change(screen.getByLabelText('AuthKey'), { target: { value: 'wrong' } })
+    fireEvent.click(screen.getByRole('button', { name: 'AuthKey 登录' }))
+    await flushMicrotasks()
+
+    expect(screen.getByRole('alert').textContent).toContain('账号名或 AuthKey 不正确')
+    expect(onAuthenticated).not.toHaveBeenCalled()
+  })
+
+  it('key_visibility_can_be_toggled', () => {
+    renderAuthKeyPage()
+    const keyInput = screen.getByLabelText('AuthKey')
+    expect(keyInput).toHaveAttribute('type', 'password')
+
+    fireEvent.click(screen.getByRole('button', { name: '显示' }))
+    expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'text')
+    fireEvent.click(screen.getByRole('button', { name: '隐藏' }))
+    expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'password')
   })
 })

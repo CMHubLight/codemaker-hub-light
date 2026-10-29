@@ -65,6 +65,18 @@ sequenceDiagram
 
 登录完成（`finish_login`）的顺序固定为：`/validate` → 并发取模型目录与续期 key → 组装并加密写盘 → 提交内存状态 → 写账号档案 → 拉额度。额度失败不影响登录，只保留上次快照。
 
+## 2.1 AuthKey 直登（账号 + AuthKey）
+
+登录页除浏览器登录外，还提供「使用账号 + AuthKey 登录」入口（`auth_login_with_auth_key`）。它不打开浏览器、不生成 `poll_uuid`、不轮询，只做一次 `POST {gateway}/api/v2/tokens`（请求/响应契约见 [网关契约](gateway-contract.md)）：
+
+1. 前端本地校验账号/AuthKey 非空后，把两者作为命令参数提交；AuthKey 不进入 URL、日志或数据库。
+2. Rust 侧 `AuthGateway::login_with_auth_key` 发 JSON `{user, auth_key}`；`401/403` 统一映射为「账号名或 AuthKey 不正确。」，其它 4xx 为「登录请求被服务端拒绝（HTTP n）。」，5xx/429/网络错误按网络失败处理。
+3. 成功响应组装成与浏览器登录相同的 `LoginTokens`（`access_token`、可选续期 key/用户/`server_url`/`expire`），随后复用 `finish_login`：`/validate` → 模型目录与 `/get_auth_key` → 加密写 `auth.bin` → 提交登录态 → 额度。
+4. 续期 key 优先用 `/get_auth_key` 返回的 128 字符 key；取不到时回退响应里的 `auth_key`/`access_sso_token`，再回退本次输入的 AuthKey。
+5. 响应没有 `expire` 时按 `DEFAULT_TOKEN_TTL_SECS`=86400 秒兜底；后台续期仍会在到期前 1 小时尝试刷新。
+
+失败不会清空已有登录态，也不会写入任何凭据；`auth_login_with_auth_key` 命令超时为 60 秒（登录收尾包含 validate、模型目录与额度请求）。
+
 ## 3. 深链格式与解析陷阱
 
 上游网关回跳时不是替换 query，而是把 token 追加在已有 `?` 之后，实际形态是两个问号：

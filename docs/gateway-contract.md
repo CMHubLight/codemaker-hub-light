@@ -51,6 +51,31 @@
 
 客户端节奏：每 2 秒轮询一次，总超时 300 秒；连续 3 次网络错误转失败；`200` 但没拿到 token 时继续轮询、不计错误。
 
+### `POST /api/v2/tokens`（账号 + AuthKey 直登）
+
+不经过浏览器/深链的单次 RPC：用账号名与 AuthKey 直接换 token。
+
+| 项 | 值 |
+| --- | --- |
+| 请求 | `POST {gateway}/api/v2/tokens`，头 `Content-Type: application/json`、`Accept: application/json` |
+| 请求体 | `{"user": "<账号名>", "auth_key": "<AuthKey>"}` |
+| 成功 | `200` + JSON（字段见下表） |
+| 账号/AuthKey 错误 | `401` / `403` → 客户端提示「账号名或 AuthKey 不正确。」 |
+| 其它 4xx | 客户端提示「登录请求被服务端拒绝（HTTP n）。」 |
+| `5xx` / `429` / 网络错误 | 按网络错误处理；不改变已有登录态 |
+
+成功响应字段（客户端容忍别名与 `{"data": {...}}` 包裹，取第一个非空值）：
+
+| 语义 | 字段（按优先级） | 必填 | 说明 |
+| --- | --- | --- | --- |
+| 访问令牌 | `access_token`、`accessToken`、`token` | 是 | 缺失/为空视为失败（不会把畸形响应当成登录成功） |
+| 续期 key | `auth_key`、`authkey`、`access_sso_token`、`sso_token` | 否 | 登录后仍会优先用 `/get_auth_key` 的 128 字符 key；取不到才回退这里或本次输入的 AuthKey |
+| 用户标识 | `access_user`、`user`、`username`、`employee_id` | 否 | 缺失时回退本次输入的账号名 |
+| 网关地址 | `server_url`、`serverUrl`、`server` | 否 | 缺失时回退设置里的 `gateway_url` |
+| 过期时间 | `expire`、`expires_at`、`expiresAt`、`expire_at` | 否 | epoch 秒；缺失时按 86400 秒兜底 |
+
+该命令成功后仍会走与浏览器登录相同的收尾：`/validate` → 模型目录（`/validate` 未带时补 `/validate/models`）→ `/get_auth_key` → 额度；因此网关需要同时实现上面的端点。
+
 ### `GET /validate`
 
 | 项 | 值 |
@@ -213,6 +238,7 @@
 | --- | --- | --- | --- | --- |
 | `GET` | `/vs_login?ide=&redirect_uri=` | 打开登录页 | 无 | `ide`、`redirect_uri` |
 | `GET` | `/vs_login_info/{pollUuid}` | 轮询登录结果 | 无 | `access_token`、`auth_key`、`user`、`serverUrl`、`expire`、`credentials_invalid` |
+| `POST` | `/api/v2/tokens` | 账号 + AuthKey 直登 | JSON body `{user,auth_key}` | `access_token`、`auth_key`、`access_user`、`server_url`、`expire` |
 | `GET` | `/validate` | 校验凭据 + 取账号档案 | `X-Access-Token` | `dept`、`display_name`、`gateway`、`server_url`、`models` |
 | `GET` | `/validate/models` | 模型目录 | `X-Access-Token` | `models` / `model` / `model_list` / `completion_langs` |
 | `GET` | `/get_auth_key` | 取续期 key | `X-Access-Token` | `auth_key` |
@@ -225,10 +251,11 @@
 ## 兼容网关最小实现清单
 
 1. `GET /vs_login` 跳转登录页，完成后通过深链回跳或让 `/vs_login_info/{uuid}` 返回 token。
-2. `GET /validate` 回 `dept` / `display_name` / `server_url`，并尽量在 `models` 里带上模型目录。
-3. `GET /get_auth_key` 回 `auth_key`；`POST /renew_token` 接受 `{key,user}` 并返回新的 `token` 与更晚的 `expire`。
-4. `GET /api/v1/user_quota/usage?quota_type=global` 至少给出 `monthly_quota`、`remaining`、`is_active` 之一。
-5. `POST /openai/v1/chat/completions` 与 `POST /openai/v1/responses` 接受 `X-Access-Token` 凭据，并在 `usage` 或 `aigw` 里回 `total_credit` / `trace_id`（可选但强烈建议）。
+2. 若需要账号 + AuthKey 直登：`POST /api/v2/tokens` 接受 `{user,auth_key}` 并返回 `access_token`（可选 `auth_key`/`access_user`/`server_url`/`expire`）。
+3. `GET /validate` 回 `dept` / `display_name` / `server_url`，并尽量在 `models` 里带上模型目录。
+4. `GET /get_auth_key` 回 `auth_key`；`POST /renew_token` 接受 `{key,user}` 并返回新的 `token` 与更晚的 `expire`。
+5. `GET /api/v1/user_quota/usage?quota_type=global` 至少给出 `monthly_quota`、`remaining`、`is_active` 之一。
+6. `POST /openai/v1/chat/completions` 与 `POST /openai/v1/responses` 接受 `X-Access-Token` 凭据，并在 `usage` 或 `aigw` 里回 `total_credit` / `trace_id`（可选但强烈建议）。
 
 ## 源码索引
 

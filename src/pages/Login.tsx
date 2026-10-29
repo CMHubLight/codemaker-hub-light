@@ -53,6 +53,14 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
   const { run: runPollStatus } = useCommand<AuthStatus>('auth_poll_status')
   const { run: runStartLogin } = useCommand<LoginSession>('auth_start_login')
   const { run: runSubmitDeepLink } = useCommand<AuthStatus>('auth_submit_deep_link')
+  const { run: runAuthKeyLogin } = useCommand<AuthStatus>('auth_login_with_auth_key')
+
+  // AuthKey 直登（账号 + AuthKey，不打开浏览器/不轮询）。
+  const [authKeyUser, setAuthKeyUser] = useState('')
+  const [authKeyValue, setAuthKeyValue] = useState('')
+  const [authKeyVisible, setAuthKeyVisible] = useState(false)
+  const [authKeyBusy, setAuthKeyBusy] = useState(false)
+  const [authKeyError, setAuthKeyError] = useState<string | null>(null)
 
   const finishLogin = useCallback(async () => {
     if (finished.current) return
@@ -62,6 +70,30 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
     setNotice(null)
     await onAuthenticated()
   }, [onAuthenticated])
+
+  /** AuthKey 直登：本地先校验非空，再交给 Rust 侧完成 token 交换与凭据落盘。 */
+  async function submitAuthKeyLogin() {
+    const user = authKeyUser.trim()
+    const key = authKeyValue.trim()
+    if (!user || !key) {
+      setAuthKeyError('请填写账号名和 AuthKey。')
+      return
+    }
+    setAuthKeyBusy(true)
+    setAuthKeyError(null)
+    const outcome = await runAuthKeyLogin({ user, authKey: key })
+    if (outcome.status === 'stale') return
+    if (outcome.status === 'error') {
+      setAuthKeyError(outcome.error.raw)
+      setAuthKeyBusy(false)
+      return
+    }
+    // 成功后不保留任何输入（AuthKey 只应在 Rust 侧加密文件中）。
+    setAuthKeyValue('')
+    setAuthKeyUser('')
+    setAuthKeyBusy(false)
+    await finishLogin()
+  }
 
   // 事件优先：深链/后台轮询完成登录时立即切换，不必等下一次 2s 轮询。
   useTauriEvent('auth://state', (status) => {
@@ -370,6 +402,62 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
             </button>
           ) : null}
         </div>
+
+        {!previewMode ? (
+          <details className="login-manual">
+            <summary>使用账号 + AuthKey 登录（不打开浏览器）</summary>
+            <p>
+              AuthKey 由账号管理员发放；登录后 token 只保存在本机 Rust 侧（加密文件 + 系统凭据库），
+              前端不回显、日志不记录。适合浏览器无法完成深链跳转的环境（WSL、远程桌面等）。
+            </p>
+            <div className="login-url-row">
+              <input
+                className="login-url-input"
+                type="text"
+                value={authKeyUser}
+                onChange={(event) => setAuthKeyUser(event.target.value)}
+                placeholder="账号名"
+                autoComplete="username"
+                spellCheck={false}
+                aria-label="账号名"
+              />
+            </div>
+            <div className="login-url-row">
+              <input
+                className="login-url-input"
+                type={authKeyVisible ? 'text' : 'password'}
+                value={authKeyValue}
+                onChange={(event) => setAuthKeyValue(event.target.value)}
+                placeholder="AuthKey"
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="AuthKey"
+              />
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                onClick={() => setAuthKeyVisible((visible) => !visible)}
+              >
+                {authKeyVisible ? '隐藏' : '显示'}
+              </button>
+            </div>
+            {authKeyError ? (
+              <p className="inline-message inline-message--error" role="alert">
+                {authKeyError}
+              </p>
+            ) : null}
+            <div className="login-actions">
+              <button
+                type="button"
+                className="btn btn--primary btn--block"
+                onClick={() => void submitAuthKeyLogin()}
+                disabled={authKeyBusy}
+              >
+                {authKeyBusy ? '登录中…' : 'AuthKey 登录'}
+              </button>
+            </div>
+          </details>
+        ) : null}
 
         <details className="login-manual">
           <summary>浏览器没有自动跳回应用？手动粘贴回调链接</summary>
