@@ -1,6 +1,6 @@
 [package]
 name = "codemaker-hub-light"
-version = "0.2.0"
+version = "0.1.1"
 description = "账号登录、本地代理与用量统计桌面应用"
 authors = ["codemaker-hub-light contributors"]
 license = "GPL-3.0-only"

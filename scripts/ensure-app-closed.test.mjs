@@ -22,7 +22,7 @@ test('命中本仓库 target/release 下的 exe 与安装包', () => {
   const hits = findLockingProcesses(
     [
       proc(1, join(releaseDir, 'codemaker-hub-light.exe')),
-      proc(2, join(releaseDir, 'bundle', 'nsis', 'CodeMaker Hub Light_0.2.0_x64-setup.exe'))
+      proc(2, join(releaseDir, 'bundle', 'nsis', 'CodeMaker Hub Light_0.1.1_x64-setup.exe'))
     ],
     releaseDir
   )
