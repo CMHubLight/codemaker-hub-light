@@ -76,7 +76,7 @@ pub fn run() {
             if let Some(previous) = shutdown::mark_running(&setup_dir, version) {
                 tracing::warn!(
                     previous = previous.trim(),
-                    "上次运行未正常退出（没有 exit.log 记录），可能是崩溃或被外部终止"
+                    "上次运行未正常退出（marker 未被清除），可能是崩溃或被外部终止"
                 );
             }
 
@@ -139,15 +139,12 @@ pub fn run() {
         }
     };
 
-    // 事件循环退出时补一条正常退出记录；被 TerminateProcess / 任务管理器强杀时
-    // 这里不会执行，下次启动的「上次运行未正常退出」告警即由此而来。
-    app.run(move |_app_handle, event| match event {
-        tauri::RunEvent::ExitRequested { .. } => {
-            shutdown::record_exit(&data_dir, "exit-requested");
+    // 事件循环退出时兜底记录正常退出；托盘「退出」已经先写过记录并删除 marker，
+    // 这里不会重复写。被 TerminateProcess / 任务管理器强杀时不会走到这里，
+    // 下次启动的「上次运行未正常退出」告警即由此而来。
+    app.run(move |_app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            shutdown::record_exit_if_running(&data_dir, "run-event-exit");
         }
-        tauri::RunEvent::Exit => {
-            shutdown::record_exit(&data_dir, "run-event-exit");
-        }
-        _ => {}
     });
 }

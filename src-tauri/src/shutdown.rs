@@ -55,7 +55,8 @@ pub(crate) fn mark_running(data_dir: &Path, version: &str) -> Option<String> {
 
 /// 正常退出：先追加一条 `exit.log` 记录，再删除 marker。
 ///
-/// 可重复调用（托盘退出后事件循环还会再报一次 Exit）；重复只会多一行记录。
+/// 用于"明确知道不会再回到事件循环"的退出路径（托盘退出、启动失败）；事件循环
+/// 收到的 `RunEvent::Exit` 请用 [`record_exit_if_running`]，避免托盘退出后重复记录。
 pub(crate) fn record_exit(data_dir: &Path, reason: &str) {
     let line = format!(
         "{} exit reason={} pid={}\n",
@@ -76,6 +77,17 @@ pub(crate) fn record_exit(data_dir: &Path, reason: &str) {
         let _ = file.sync_all();
     }
     let _ = std::fs::remove_file(marker_path(data_dir));
+}
+
+/// 事件循环兜底退出：仅当 marker 仍在（本次运行尚未写过退出记录）时记录。
+///
+/// 托盘「退出」已经写过 `tray-quit` 并删掉 marker，随后事件循环再报 `Exit` 时
+/// 这里不会重复写；窗口被销毁导致事件循环自行结束（没有走托盘）时 marker 仍在，
+/// 由这里补一条 `run-event-exit`。
+pub(crate) fn record_exit_if_running(data_dir: &Path, reason: &str) {
+    if marker_path(data_dir).exists() {
+        record_exit(data_dir, reason);
+    }
 }
 
 #[cfg(test)]
@@ -123,17 +135,25 @@ mod tests {
     }
 
     #[test]
-    fn record_exit_is_idempotent() {
-        let dir = unique_dir("idempotent");
-        mark_running(&dir, "0.0.0");
-        record_exit(&dir, "exit-requested");
-        record_exit(&dir, "exit");
-        let exit_log = std::fs::read_to_string(exit_log_path(&dir)).expect("应写入 exit.log");
-        assert_eq!(
-            exit_log.lines().count(),
-            2,
-            "两次调用应各留一行：{exit_log}"
+    fn record_exit_if_running_only_records_when_marker_exists() {
+        let dir = unique_dir("if-running");
+
+        // 没有 marker（例如构建期失败/二次实例）时不应写正常退出记录。
+        record_exit_if_running(&dir, "run-event-exit");
+        assert!(
+            !exit_log_path(&dir).exists(),
+            "没有 marker 时不应写 exit.log"
         );
+
+        // 有 marker：写一条并删除 marker；重复调用不会重复写（托盘退出已记录过）。
+        mark_running(&dir, "0.0.0");
+        record_exit_if_running(&dir, "run-event-exit");
+        record_exit_if_running(&dir, "run-event-exit");
+        let exit_log = std::fs::read_to_string(exit_log_path(&dir)).expect("应写入 exit.log");
+        assert_eq!(exit_log.lines().count(), 1, "只应记录一次：{exit_log}");
+        assert!(exit_log.contains("reason=run-event-exit"));
+        assert!(!marker_path(&dir).exists(), "记录后应删除 marker");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

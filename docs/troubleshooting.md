@@ -8,7 +8,7 @@
 |---|---|
 | 设置 → 应用信息 | 版本、数据目录、数据库路径、Schema 版本、日志目录；「打开日志目录」直达 |
 | `logs\hub-light.log.<日期>` | 主日志，按日滚动；启动阶段有 `phase` / `elapsed_ms` 行 |
-| `logs\exit.log` | 正常退出记录（时间、原因、pid）；缺失且下次启动出现告警，说明上次不是正常退出 |
+| `logs\exit.log` | 正常退出的追加记录（时间、原因、pid；只追加不删除）；是否上次正常退出以启动 WARN 为准 |
 | 设置 → 本地代理 | 代理是否运行、实际端口、Base URL、健康检查地址、请求/错误计数 |
 
 > 反馈问题前请脱敏：不要粘贴 token、`auth.bin` 内容或完整回调链接；日志里的账号信息可以替换成 `<user>`。
@@ -116,7 +116,7 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 
 按顺序看三处，先分清"正常退出"还是"被外部终止"：
 
-1. `logs\exit.log`：有本次退出的记录（`reason=tray-quit` 等）就是**正常退出**；没有记录、且 `logs\hub-light.log` 里本次启动后出现 `上次运行未正常退出（没有 exit.log 记录）`，说明上次进程**没有走正常退出路径**——常见是被任务管理器结束、`taskkill` / `Stop-Process` 强杀，或原生崩溃。
+1. `logs\exit.log`：**追加式**记录，文件存在不代表本次正常退出——看**最后一条**记录的时间/pid 是否对应本次会话（`reason` 可能是托盘退出的 `tray-quit`，或事件循环兜底的 `run-event-exit`；启动失败会写 `setup-failed`/`build-failed`）。`logs\hub-light.log` 里本次启动若出现 `上次运行未正常退出（marker 未被清除）`，说明上次进程**没有走正常退出路径**——常见是被任务管理器结束、`taskkill` / `Stop-Process` 强杀，或原生崩溃。
 2. `logs\panic.log`：存在的话里面是 panic 的 `文件:行:列`、消息与回溯（release 无控制台，默认 panic 不写主日志）。Rust panic 走 `panic = "abort"`，会留下这条记录。
 3. 事件查看器 → Windows 日志 → 应用程序里搜 `codemaker-hub-light` 的 `Application Error 1000`；`0xc0000409` 表示 Rust `panic = "abort"` 生效，其它异常码表示原生崩溃。
 
@@ -140,12 +140,12 @@ Windows 的目录元数据延迟，内容其实已写入；退出应用后再看
 
 ### 4.5 想定位「是谁终止了进程」（需要管理员，可选）
 
-应用被 `TerminateProcess` 之类的方式结束（任务管理器、脚本、安全软件）时，进程自身来不及写任何日志；`logs\exit.log` 与启动告警只能回答"**是否**被外部终止"，**终止者**只能在系统层取证。默认不开启进程审计，所以事后无法补查——若要让下一次事故留下证据，请在**复现前**用管理员 PowerShell 开启：
+应用被 `TerminateProcess` 之类的方式结束（任务管理器、脚本、安全软件）时，进程自身来不及写任何日志；`logs\exit.log` 与启动告警只能回答"**是否**被外部终止"，**终止者**只能在系统层取证。默认不开启进程审计，所以事后无法补查——若要让下一次事故留下证据，请在**复现前**用管理员 PowerShell 开启（注意引导里要把 `/subcategory:{GUID}` 整体加引号，否则 PowerShell 会把 `{...}` 当脚本块拆成两个参数）：
 
 ```powershell
 # 进程创建 / 进程终止（GUID 与系统语言无关）
-auditpol /set /subcategory:{0CCE922B-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
-auditpol /set /subcategory:{0CCE922C-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
+auditpol /set "/subcategory:{0CCE922B-69AE-11D9-BED3-505054503030}" /success:enable /failure:enable
+auditpol /set "/subcategory:{0CCE922C-69AE-11D9-BED3-505054503030}" /success:enable /failure:enable
 # 可选：让 4688 带上命令行，便于看到结束进程用的命令
 New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Force | Out-Null
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name ProcessCreationIncludeCmdLine_Enabled -Value 1 -Type DWord
@@ -162,8 +162,8 @@ Get-WinEvent -LogName Security -FilterHashtable @{Id=4688,4689; StartTime=(Get-D
 4688 能看出"谁启动了结束工具/命令、父进程是谁"，4689 确认退出时刻；需要更完整的父子链与命令行时可自行安装 Sysmon（事件 1/5）或用 Procmon 复现（都需要管理员，仓库不内置）。排查结束后恢复原状：
 
 ```powershell
-auditpol /set /subcategory:{0CCE922B-69AE-11D9-BED3-505054503030} /success:disable /failure:disable
-auditpol /set /subcategory:{0CCE922C-69AE-11D9-BED3-505054503030} /success:disable /failure:disable
+auditpol /set "/subcategory:{0CCE922B-69AE-11D9-BED3-505054503030}" /success:disable /failure:disable
+auditpol /set "/subcategory:{0CCE922C-69AE-11D9-BED3-505054503030}" /success:disable /failure:disable
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name ProcessCreationIncludeCmdLine_Enabled -Value 0 -Type DWord
 ```
 

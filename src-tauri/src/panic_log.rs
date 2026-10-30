@@ -2,8 +2,8 @@
 //!
 //! release 是 GUI 子系统（无控制台）且 `panic = "abort"`：默认 panic 不会留下
 //! 任何痕迹，进程直接以 `0xc0000409`（`__fastfail`）退出。这里安装一个全局
-//! panic hook，把位置/消息/回溯**同步追加**写入 `<数据目录>\logs\panic.log`，
-//! 然后再调用默认 hook（保留 stderr 行为），让下一次崩溃可以定位。
+//! panic hook，把位置/消息**同步追加**写入 `<数据目录>\logs\panic.log`（回溯尽力
+//! 追加），然后再调用默认 hook（保留 stderr 行为），让下一次崩溃可以定位。
 //!
 //! 落盘顺序是硬约束：**先写最小现场**（时间/线程/位置/消息 + `sync_all`），之后
 //! 才尝试回溯与 `tracing`。反过来的话，一旦日志订阅者（`tracing_appender` 的

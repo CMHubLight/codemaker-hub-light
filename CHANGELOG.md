@@ -11,7 +11,7 @@
 
 ### 工程
 
-- **构建防呆**：`pnpm tauri build` 在 `beforeBuildCommand` 先检查本仓库 `src-tauri/target/release/` 是否被运行中的实例或安装包占用，命中时立即失败并提示用托盘「退出」正常关闭（**不会自动结束进程**），避免再出现"为解锁 exe 强杀实例"造成的假崩溃现场。
+- **构建防呆**：`pnpm tauri build` 在 `beforeBuildCommand` 先检查本仓库 `src-tauri/target/release/` 是否被运行中的实例或安装包占用，命中时立即失败并提示用托盘「退出」正常关闭（**不会自动结束进程**），避免再出现"为解锁 exe 强杀实例"造成的假崩溃现场。路径判定与提示文案有 `node:test` 单测（`pnpm test:scripts`，CI frontend job 执行）。
 - 排障文档补充进程审计取证 runbook：开启后下一次事故可定位"是谁终止了进程"（默认关闭，需管理员，见 `docs/troubleshooting.md` §4.5）。
 
 ## [0.2.0] - 2026-10-29
