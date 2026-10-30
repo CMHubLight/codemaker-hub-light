@@ -53,6 +53,7 @@ flowchart LR
 | `bootstrap` | 启动装配、阶段计时、后台任务派生 | `bootstrap.rs` |
 | `startup` | 启动期致命错误：写日志 + 原生弹窗 | `startup.rs` |
 | `logging` / `panic_log` | 按日滚动日志；panic 现场落盘 | `logging.rs`、`panic_log.rs` |
+| `shutdown` | 退出埋点：区分正常退出与被外部终止（`session.marker` / `exit.log`） | `shutdown.rs` |
 | `state` | 共享状态（设置、凭据、DB、代理）与唯一写入口 | `state.rs`、`settings_store.rs` |
 | `auth` | 登录、凭据加密、`/validate`、续期、额度 | `auth/*` |
 | `proxy` | HTTP 服务、路由、转发、协议翻译、用量解析 | `proxy/*` |
@@ -118,6 +119,7 @@ scripts/        公开仓库门禁脚本
 - `src-tauri/src/startup.rs`
 - `src-tauri/src/logging.rs`
 - `src-tauri/src/panic_log.rs`
+- `src-tauri/src/shutdown.rs`
 - `src-tauri/src/state.rs`
 - `src-tauri/src/settings_store.rs`
 - `src-tauri/src/window.rs`

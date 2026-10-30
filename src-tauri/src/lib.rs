@@ -24,6 +24,7 @@ mod panic_log;
 pub mod proxy;
 pub(crate) mod settings;
 pub(crate) mod settings_store;
+mod shutdown;
 mod startup;
 pub(crate) mod state;
 pub(crate) mod tray;
@@ -44,13 +45,16 @@ pub fn run() {
     logging::init(&data_dir);
     // release 无控制台且 panic=abort：先把崩溃现场写进 logs\panic.log。
     panic_log::install(&data_dir);
+
+    let version = env!("CARGO_PKG_VERSION");
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = version,
         data_dir = %data_dir.display(),
         "启动 CodeMaker Hub Light"
     );
 
-    let result = tauri::Builder::default()
+    let setup_dir = data_dir.clone();
+    let app = match tauri::Builder::default()
         // 单实例必须最先注册：二次启动聚焦已有窗口。
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let _ = app.emit("app://second-instance", serde_json::json!({}));
@@ -65,7 +69,21 @@ pub fn run() {
         .on_window_event(window::handle_window_event)
         .setup(move |app| {
             let mut timer = bootstrap::PhaseTimer::new();
-            bootstrap::init_state(app, &data_dir, &mut timer)?;
+
+            // 单实例判定已经通过（二次实例在 setup 之前就退出），此时才登记运行中
+            // 标记：否则每次"二次启动"都会写一遍 marker，下一次真正启动就会被误报成
+            // 「上次运行未正常退出」。
+            if let Some(previous) = shutdown::mark_running(&setup_dir, version) {
+                tracing::warn!(
+                    previous = previous.trim(),
+                    "上次运行未正常退出（没有 exit.log 记录），可能是崩溃或被外部终止"
+                );
+            }
+
+            if let Err(err) = bootstrap::init_state(app, &setup_dir, &mut timer) {
+                shutdown::record_exit(&setup_dir, "setup-failed");
+                return Err(err);
+            }
 
             // 托盘：关闭窗口只隐藏；额度事件会刷新 tooltip。
             // 必须在 setup 返回前装好：窗口由 Tauri 在 setup 之前创建，
@@ -74,7 +92,8 @@ pub fn run() {
             timer.lap("tray");
             if let Err(err) = tray_result {
                 tracing::error!(error = %err, "托盘初始化失败，退出以避免窗口无法恢复");
-                startup::report(&data_dir, "初始化托盘", &err.to_string());
+                startup::report(&setup_dir, "初始化托盘", &err.to_string());
+                shutdown::record_exit(&setup_dir, "setup-failed");
                 return Err(err);
             }
 
@@ -109,10 +128,26 @@ pub fn run() {
             commands::usage::usage_request_detail,
             commands::usage::usage_export_csv,
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+    {
+        Ok(app) => app,
+        Err(err) => {
+            tracing::error!(error = %err, "Tauri 应用构建失败");
+            shutdown::record_exit(&data_dir, "build-failed");
+            eprintln!("{APP_NAME} 启动失败：{err}");
+            return;
+        }
+    };
 
-    if let Err(err) = result {
-        tracing::error!(error = %err, "Tauri 应用异常退出");
-        eprintln!("{APP_NAME} 启动失败：{err}");
-    }
+    // 事件循环退出时补一条正常退出记录；被 TerminateProcess / 任务管理器强杀时
+    // 这里不会执行，下次启动的「上次运行未正常退出」告警即由此而来。
+    app.run(move |_app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            shutdown::record_exit(&data_dir, "exit-requested");
+        }
+        tauri::RunEvent::Exit => {
+            shutdown::record_exit(&data_dir, "run-event-exit");
+        }
+        _ => {}
+    });
 }
