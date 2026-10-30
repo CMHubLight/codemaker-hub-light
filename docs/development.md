@@ -25,8 +25,9 @@
 | `pnpm typecheck` | `tsc --noEmit`（含 vite/vitest 配置） |
 | `pnpm lint` | ESLint 9 flat config |
 | `pnpm test` | Vitest（jsdom + Testing Library） |
+| `pnpm test:scripts` | 构建/门禁脚本单测（`node:test`，如构建占用防呆的路径判定） |
 | `pnpm docs:check` | 公开仓库门禁：脱敏扫描、链接检查、文档与代码对账 |
-| `pnpm verify` | typecheck → lint → test → build → docs:check |
+| `pnpm verify` | typecheck → lint → test → test:scripts → build → docs:check |
 | `pnpm tauri build` | 产出 NSIS 安装包（内含内嵌前端的 exe）；构建前检查发布版实例占用（见 §5.4） |
 | `pnpm tauri build --no-bundle` | 只产出可执行文件 |
 
@@ -43,7 +44,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 | 门禁 | 命令 | CI 位置 |
 |---|---|---|
-| 前端类型 / lint / 测试 / 构建 | `pnpm typecheck && pnpm lint && pnpm test && pnpm build` | `frontend` job（ubuntu-latest） |
+| 前端类型 / lint / 测试 / 构建 | `pnpm typecheck && pnpm lint && pnpm test && pnpm test:scripts && pnpm build` | `frontend` job（ubuntu-latest） |
 | Rust 格式 / lint / 测试 | `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test` | `rust` job（windows-latest） |
 | 脱敏 / 链接 / 文档一致性 | `node scripts/check-public-repo.mjs` | `docs` job（ubuntu-latest） |
 
@@ -63,6 +64,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 | Rust 性能采样 | `src-tauri/tests/perf_usage.rs`、`src-tauri/src/proxy/perf_tests.rs` | 默认 `#[ignore]`，手动 `--ignored --nocapture` 才跑 |
 | 前端组件测试 | `src/**/*.test.tsx` | jsdom + Testing Library |
 | 前端纯函数测试 | `src/lib/*.test.ts` | 格式化、IPC 封装、样式约定 |
+| 构建脚本单测 | `scripts/*.test.mjs` | `node:test`，构建占用防呆的路径判定与提示文案 |
 
 > **不要给测试加 `--release`。** release 配置是 `panic = "abort"`，Rust 测试线程依赖 unwind，`cargo test --release` 会被 cargo 直接拒绝。release 产物只能"构建后启动冒烟"。
 
@@ -97,7 +99,7 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 - **动作**：托盘右键 →「退出」正常关闭（点窗口 X 只是隐藏到托盘，不会退出），等 2–3 秒再重试构建。
 - **不要强杀**：任务管理器 / `taskkill /F` / `Stop-Process` 会留下 `logs/session.marker`，下次启动出现"上次运行未正常退出"告警，也会给崩溃排查制造假现场（见[排障手册 §4.1](troubleshooting.md)）。
 - **作用域**：只拦本仓库 `target/release` 下的进程；dev 实例（`target/debug`）、已安装副本、复制到别处的 exe 不会误拦。
-- **失败即放行**：进程枚举本身失败时只告警、不阻断构建（避免构建工具故障卡住发布）。
+- **失败即放行**：进程枚举本身失败时只告警、不阻断构建（避免构建工具故障卡住发布）。若个别进程的可执行路径不可读（极少见），该进程会被跳过，此时构建仍可能在链接阶段失败——按提示关闭实例即可。
 
 ## 6. 文档规范
 
@@ -220,3 +222,4 @@ SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.2.0`
 - `.github/signpath/artifact-configuration.xml`
 - `scripts/check-public-repo.mjs`
 - `scripts/ensure-app-closed.mjs`
+- `scripts/ensure-app-closed.test.mjs`

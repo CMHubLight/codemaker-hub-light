@@ -38,6 +38,9 @@ jobs:
       - name: 单元/组件测试
         run: pnpm test
 
+      - name: 构建脚本单测（node:test）
+        run: pnpm test:scripts
+
       - name: 生产构建
         run: pnpm build
 

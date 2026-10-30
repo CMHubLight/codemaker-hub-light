@@ -14,6 +14,7 @@
  * 进程枚举失败时 fail-open（警告后放行）：构建工具故障不应阻断正常发布。
  */
 import { execFileSync } from 'node:child_process'
+import { realpathSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -112,7 +113,22 @@ function main() {
   process.exitCode = 1
 }
 
+/** 判断两个路径是否指向同一文件（Windows 大小写不敏感；解析符号链接）。 */
+function sameFile(left, right) {
+  let leftPath = left
+  let rightPath = right
+  try {
+    leftPath = realpathSync(left)
+    rightPath = realpathSync(right)
+  } catch {
+    // 任一路径不可解析时退回字符串比较，避免静默跳过检查。
+  }
+  return process.platform === 'win32'
+    ? leftPath.toLowerCase() === rightPath.toLowerCase()
+    : leftPath === rightPath
+}
+
 const invokedDirectly = Boolean(
-  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  process.argv[1] && sameFile(process.argv[1], fileURLToPath(import.meta.url))
 )
 if (invokedDirectly) main()

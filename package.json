@@ -31,9 +31,10 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:scripts": "node --test scripts/ensure-app-closed.test.mjs",
     "test:watch": "vitest",
     "docs:check": "node scripts/check-public-repo.mjs",
-    "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm docs:check",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm test:scripts && pnpm build && pnpm docs:check",
     "preview": "vite preview",
     "tauri": "tauri"
   },
