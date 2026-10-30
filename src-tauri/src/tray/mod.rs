@@ -101,5 +101,10 @@ fn quit(app: &AppHandle) {
             .quitting
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    // 先留正常退出记录再退出：托盘退出是应用内唯一能解释「应用消失」的路径，
+    // 留下 exit.log 后，下一次启动就不会把它误报成"未正常退出"。
+    if let Some(state) = app.try_state::<crate::state::AppState>() {
+        crate::shutdown::record_exit(state.data_dir(), "tray-quit");
+    }
     app.exit(0);
 }
