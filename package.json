@@ -60,7 +60,7 @@
     "jsdom": "^30.1.3",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.72.0",
-    "vite": "^6.4.4",
+    "vite": "^6.4.5",
     "vitest": "^5.0.5"
   }
 }
