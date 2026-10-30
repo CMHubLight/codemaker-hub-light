@@ -8,6 +8,7 @@
 |---|---|
 | 设置 → 应用信息 | 版本、数据目录、数据库路径、Schema 版本、日志目录；「打开日志目录」直达 |
 | `logs\hub-light.log.<日期>` | 主日志，按日滚动；启动阶段有 `phase` / `elapsed_ms` 行 |
+| `logs\exit.log` | 正常退出记录（时间、原因、pid）；缺失且下次启动出现告警，说明上次不是正常退出 |
 | 设置 → 本地代理 | 代理是否运行、实际端口、Base URL、健康检查地址、请求/错误计数 |
 
 > 反馈问题前请脱敏：不要粘贴 token、`auth.bin` 内容或完整回调链接；日志里的账号信息可以替换成 `<user>`。
@@ -113,7 +114,15 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 
 ### 4.1 应用无声退出（托盘图标突然消失，主日志没有报错）
 
-先看 `logs\panic.log`：存在的话里面是 panic 的 `文件:行:列`、消息与回溯（release 无控制台，默认 panic 不写主日志）。同时在事件查看器 → Windows 日志 → 应用程序里搜 `codemaker-hub-light` 的 `Application Error 1000`；`0xc0000409` 表示 Rust `panic = "abort"` 生效。
+按顺序看三处，先分清"正常退出"还是"被外部终止"：
+
+1. `logs\exit.log`：有本次退出的记录（`reason=tray-quit` 等）就是**正常退出**；没有记录、且 `logs\hub-light.log` 里本次启动后出现 `上次运行未正常退出（没有 exit.log 记录）`，说明上次进程**没有走正常退出路径**——常见是被任务管理器结束、`taskkill` / `Stop-Process` 强杀，或原生崩溃。
+2. `logs\panic.log`：存在的话里面是 panic 的 `文件:行:列`、消息与回溯（release 无控制台，默认 panic 不写主日志）。Rust panic 走 `panic = "abort"`，会留下这条记录。
+3. 事件查看器 → Windows 日志 → 应用程序里搜 `codemaker-hub-light` 的 `Application Error 1000`；`0xc0000409` 表示 Rust `panic = "abort"` 生效，其它异常码表示原生崩溃。
+
+三处都没有痕迹时，优先怀疑**外部终止**（尤其构建/发布时为了解锁 exe 而强杀正在运行的实例）：改用托盘「退出」正常关闭，再重新启动即可。`logs\session.marker` 是运行中标记，正常退出时删除；手工排查时不要删它，它决定下次启动是否告警。
+
+如果是**构建时被拦下**（提示"发布版实例正在运行"）：按提示用托盘「退出」正常关闭后重试；构建不会自动结束进程，强杀只会制造假崩溃现场。想定位"是谁终止了进程"，见 §4.5。
 
 ### 4.2 双击后窗口不出现，或提示「启动失败」
 
@@ -128,6 +137,35 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 ### 4.4 运行中日志文件在资源管理器里显示 0 字节
 
 Windows 的目录元数据延迟，内容其实已写入；退出应用后再看就会显示真实大小。要立刻看到最新日志，先退出应用。
+
+### 4.5 想定位「是谁终止了进程」（需要管理员，可选）
+
+应用被 `TerminateProcess` 之类的方式结束（任务管理器、脚本、安全软件）时，进程自身来不及写任何日志；`logs\exit.log` 与启动告警只能回答"**是否**被外部终止"，**终止者**只能在系统层取证。默认不开启进程审计，所以事后无法补查——若要让下一次事故留下证据，请在**复现前**用管理员 PowerShell 开启：
+
+```powershell
+# 进程创建 / 进程终止（GUID 与系统语言无关）
+auditpol /set /subcategory:{0CCE922B-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
+auditpol /set /subcategory:{0CCE922C-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
+# 可选：让 4688 带上命令行，便于看到结束进程用的命令
+New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Force | Out-Null
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name ProcessCreationIncludeCmdLine_Enabled -Value 1 -Type DWord
+```
+
+复现后查 `Security` 日志（4688 = 进程创建，4689 = 进程退出）：
+
+```powershell
+Get-WinEvent -LogName Security -FilterHashtable @{Id=4688,4689; StartTime=(Get-Date).AddHours(-2)} |
+  Where-Object { $_.Message -match 'codemaker-hub-light' } |
+  Select-Object TimeCreated, Id, @{n='detail'; e={ $_.Message }}
+```
+
+4688 能看出"谁启动了结束工具/命令、父进程是谁"，4689 确认退出时刻；需要更完整的父子链与命令行时可自行安装 Sysmon（事件 1/5）或用 Procmon 复现（都需要管理员，仓库不内置）。排查结束后恢复原状：
+
+```powershell
+auditpol /set /subcategory:{0CCE922B-69AE-11D9-BED3-505054503030} /success:disable /failure:disable
+auditpol /set /subcategory:{0CCE922C-69AE-11D9-BED3-505054503030} /success:disable /failure:disable
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name ProcessCreationIncludeCmdLine_Enabled -Value 0 -Type DWord
+```
 
 ## 5. 构建相关
 
