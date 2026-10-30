@@ -27,6 +27,7 @@
   "scripts": {
     "dev": "vite --port 5173 --strictPort",
     "build": "tsc && vite build",
+    "build:guarded": "node scripts/ensure-app-closed.mjs && pnpm build",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",

@@ -245,7 +245,7 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 月度数据来自账号云端、可能包含其他设备；「今日」与「请求」页只统计本机代理。两者口径不同，不是同一份数据。
 
 **应用无声退出 / 双击没反应 / 整窗白屏**
-依次看 `logs\panic.log`、`logs\startup-error.log`、`logs\hub-light.log`；反馈前先脱敏。
+先看 `logs\exit.log`（正常退出记录）与 `logs\panic.log`；主日志里出现「上次运行未正常退出」说明上次被强杀或崩溃。详见 [排障手册 §4.1](docs/troubleshooting.md)。构建时若提示"发布版实例正在运行"，用托盘「退出」正常关闭后再重试，不要强杀。
 
 ## 从源码构建
 
@@ -266,6 +266,8 @@ src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 > **不要单独用 `cargo build --release` 生成可运行版本**：Tauri v2 需要 `custom-protocol` feature 才会内嵌前端，否则窗口会显示"无法访问此页面"。详见 [docs/development.md](docs/development.md)。
+>
+> **发布版实例正在运行时构建会先失败**：直接用托盘右键「退出」正常关闭（点窗口 X 只是隐藏），不要用任务管理器 / `taskkill` 强杀；详见 [docs/development.md](docs/development.md) §5.4。
 >
 > **不要给测试加 `--release`**：release 是 `panic = "abort"`，测试线程无法 unwind，cargo 会直接拒绝。
 

@@ -27,7 +27,7 @@
 | `pnpm test` | Vitest（jsdom + Testing Library） |
 | `pnpm docs:check` | 公开仓库门禁：脱敏扫描、链接检查、文档与代码对账 |
 | `pnpm verify` | typecheck → lint → test → build → docs:check |
-| `pnpm tauri build` | 产出 NSIS 安装包（内含内嵌前端的 exe） |
+| `pnpm tauri build` | 产出 NSIS 安装包（内含内嵌前端的 exe）；构建前检查发布版实例占用（见 §5.4） |
 | `pnpm tauri build --no-bundle` | 只产出可执行文件 |
 
 Rust 侧：
@@ -66,7 +66,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 > **不要给测试加 `--release`。** release 配置是 `panic = "abort"`，Rust 测试线程依赖 unwind，`cargo test --release` 会被 cargo 直接拒绝。release 产物只能"构建后启动冒烟"。
 
-## 5. 构建与打包的三个坑
+## 5. 构建与打包的四个坑
 
 ### 5.1 不要单独 `cargo build --release`
 
@@ -81,11 +81,23 @@ src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 
 ### 5.2 `panic = "abort"` 的连带影响
 
-release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不及 flush。因此崩溃现场由 `panic_log` 直接 `append + sync_all` 写到 `logs/panic.log`，而不是走 `tracing` 的非阻塞通道。
+release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不及 flush。因此崩溃现场由 `panic_log` 直接 `append + sync_all` 写到 `logs/panic.log`，而不是走 `tracing` 的非阻塞通道。落盘顺序是硬约束：**先写最小现场**（时间/线程/位置/消息），之后才尝试回溯与 `tracing`——日志订阅者、回溯符号化（dbghelp）本身也可能在 dying process 里失败或卡住，反过来的顺序会让 panic 什么都不留下。
+
+强杀与原生崩溃不经过 panic hook，现场由启动埋点兜底：启动写 `logs/session.marker`，正常退出写 `logs/exit.log` 并删除 marker；下次启动发现上次未正常退出会在主日志记 WARN。判别方法见 [排障手册 §4.1](troubleshooting.md)。
 
 ### 5.3 `LNK4217: locally defined symbol memmove … groupConcatInverse`
 
 这是 bundled SQLite（`rusqlite` 的 `bundled` feature）与旧 CRT 垫片相遇时的**警告**，不影响链接结果，可忽略。它只在 release 链接阶段出现，`cargo check` / `cargo test` 看不到。
+
+### 5.4 构建时提示「发布版实例正在运行」
+
+`pnpm tauri build` 会在 `beforeBuildCommand` 里先跑 `pnpm build:guarded`（`scripts/ensure-app-closed.mjs`）。只要本仓库 `src-tauri/target/release/` 下的 exe / 安装包进程还在运行，构建就会**立即失败**（不再编译几分钟后才在链接阶段报"拒绝访问"），并打印占用进程的 pid 与路径。
+
+- **原因**：Windows 会锁住正在运行的 exe，cargo 无法覆盖 `target/release/codemaker-hub-light.exe`。
+- **动作**：托盘右键 →「退出」正常关闭（点窗口 X 只是隐藏到托盘，不会退出），等 2–3 秒再重试构建。
+- **不要强杀**：任务管理器 / `taskkill /F` / `Stop-Process` 会留下 `logs/session.marker`，下次启动出现"上次运行未正常退出"告警，也会给崩溃排查制造假现场（见[排障手册 §4.1](troubleshooting.md)）。
+- **作用域**：只拦本仓库 `target/release` 下的进程；dev 实例（`target/debug`）、已安装副本、复制到别处的 exe 不会误拦。
+- **失败即放行**：进程枚举本身失败时只告警、不阻断构建（避免构建工具故障卡住发布）。
 
 ## 6. 文档规范
 
@@ -169,7 +181,7 @@ Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.0_x64-setup.exe | Format-Lis
 
 SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.2.0` 起执行）：
 
-1. **干净构建**：确认 `git status` 干净、从合并后的 `main` 构建；先关闭正在运行的旧实例（否则 Windows 会锁住 exe）。
+1. **干净构建**：确认 `git status` 干净、从合并后的 `main` 构建；先用**托盘「退出」**关闭正在运行的旧实例（否则 Windows 会锁住 exe）。不要用任务管理器 / `taskkill /F` / `Stop-Process` 强杀：强杀会留下 `logs/session.marker`，下次启动会报"上次运行未正常退出"，也给排查制造假崩溃现场。构建入口会先做占用检查并在命中时快速失败（§5.4），无需也不应强杀实例。
    ```powershell
    pnpm install --frozen-lockfile
    pnpm tauri build
@@ -201,8 +213,10 @@ SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.2.0`
 - `src-tauri/tauri.conf.json`
 - `src-tauri/src/compat/msvc_crt.rs`
 - `src-tauri/src/panic_log.rs`
+- `src-tauri/src/shutdown.rs`
 - `src-tauri/tests/perf_usage.rs`
 - `.github/workflows/ci.yml`
 - `.github/workflows/release-sign.yml`
 - `.github/signpath/artifact-configuration.xml`
 - `scripts/check-public-repo.mjs`
+- `scripts/ensure-app-closed.mjs`

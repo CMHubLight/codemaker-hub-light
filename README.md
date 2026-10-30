@@ -51,6 +51,8 @@ src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 > Do **not** run `cargo build --release` on its own: Tauri needs the `custom-protocol` feature to embed the frontend. See [development notes](docs/development.md).
+>
+> `pnpm tauri build` fails fast if a release build is still running: quit it from the tray menu first (closing the window only hides it to the tray). The build never terminates a running instance. See [development notes §5.4](docs/development.md).
 
 ## First run
 
