@@ -53,7 +53,7 @@ describe('describeError', () => {
 
   it('超时表：慢命令放宽到 30 秒，其余走默认值', () => {
     expect(DEFAULT_COMMAND_TIMEOUT_MS).toBe(10_000)
-    expect(commandTimeoutMs('usage_export_csv')).toBe(30_000)
+    expect(commandTimeoutMs('proxy_restart')).toBe(30_000)
     expect(commandTimeoutMs('app_open_logs')).toBe(15_000)
     expect(commandTimeoutMs('auth_status')).toBe(DEFAULT_COMMAND_TIMEOUT_MS)
   })

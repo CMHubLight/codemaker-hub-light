@@ -11,7 +11,7 @@ use crate::db::{rows::FromRow, sql, DbError};
 // 对外暴露的行类型与查询条件：调用方一直通过 `db::repo::*` 使用，保持路径稳定。
 pub use super::rows::{
     AuthProfileRow, ModelPriceRow, QuotaSnapshotRow, RequestDetailRow, RequestRow, UsageDayRow,
-    UsageDimRow, UsageExportRow, UsageTotalsRow,
+    UsageDimRow, UsageTotalsRow,
 };
 pub use super::sql::{Cursor, RequestQuery, UsageDimension};
 
@@ -252,30 +252,6 @@ pub fn usage_by_dimension(
     let mut stmt = conn.prepare(&sql::usage_by_dimension(dimension))?;
     let rows = stmt.query_map(params![from_day, to_day], UsageDimRow::from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// 逐行流式导出（日 / 协议 / 模型 / 客户端）。
-///
-/// 不把结果集收进 `Vec`：导出区间由用户任选，旧实现会把所有行读进内存再拼成
-/// 一个大 `String`（三份拷贝）。`max_rows` 是硬上限，返回 `(写入行数, 是否被截断)`。
-pub fn export_rows_stream(
-    conn: &rusqlite::Connection,
-    from_day: &str,
-    to_day: &str,
-    max_rows: usize,
-    mut sink: impl FnMut(UsageExportRow) -> Result<(), DbError>,
-) -> Result<(usize, bool), DbError> {
-    let mut stmt = conn.prepare(&sql::usage_export())?;
-    let mut rows = stmt.query(params![from_day, to_day])?;
-    let mut written = 0usize;
-    while let Some(row) = rows.next()? {
-        if written == max_rows {
-            return Ok((written, true));
-        }
-        sink(UsageExportRow::from_row(row)?)?;
-        written += 1;
-    }
-    Ok((written, false))
 }
 
 // ---------------------------------------------------------------------------

@@ -64,11 +64,6 @@ impl AppState {
         logs_dir(&self.data_dir)
     }
 
-    /// CSV 导出目录。
-    pub(crate) fn exports_dir(&self) -> PathBuf {
-        exports_dir(&self.data_dir)
-    }
-
     /// `proxy.port` 文件路径。
     pub(crate) fn port_file(&self) -> PathBuf {
         port_file(&self.data_dir)
@@ -85,11 +80,6 @@ pub(crate) fn logs_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("logs")
 }
 
-/// CSV 导出目录。
-pub(crate) fn exports_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("exports")
-}
-
 /// `proxy.port` 文件路径（实际监听端口，供外部 CLI 读取）。
 pub(crate) fn port_file(data_dir: &Path) -> PathBuf {
     settings::proxy_port_path(data_dir)
@@ -104,7 +94,6 @@ mod tests {
         let dir = Path::new("C:/tmp/hub");
         assert!(db_path(dir).starts_with(dir));
         assert_eq!(logs_dir(dir), dir.join("logs"));
-        assert_eq!(exports_dir(dir), dir.join("exports"));
         assert_eq!(port_file(dir), dir.join("proxy.port"));
     }
 }

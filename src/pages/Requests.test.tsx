@@ -131,31 +131,4 @@ describe('Requests 分页（keyset 游标）', () => {
     expect(screen.queryByText('model-4')).toBeNull()
     expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled()
   })
-
-  it('export_truncated_message_is_shown：导出达到 20 万行上限时提示已截断', async () => {
-    const user = userEvent.setup()
-
-    invokeMock.mockImplementation(async (command) => {
-      if (command === 'usage_requests') {
-        return { total: 0, items: [], next_cursor: null, prev_cursor: null }
-      }
-      if (command === 'usage_export_csv') {
-        return {
-          saved: true,
-          path: 'C:\\data\\exports\\usage.csv',
-          message: null,
-          rows: 200_000,
-          bytes: 1024,
-          truncated: true
-        }
-      }
-      throw new Error(`未 mock 的命令：${String(command)}`)
-    })
-
-    render(<Requests revision={0} />)
-    await user.click(screen.getByRole('button', { name: '导出 CSV' }))
-
-    expect(await screen.findByText(/已导出 200000 行/)).toBeInTheDocument()
-    expect(screen.getByText(/已截断：上限 20 万行/)).toBeInTheDocument()
-  })
 })
