@@ -79,7 +79,7 @@ model_prices
 
 ### `usage_daily`
 
-按 `(day, api_format, model, client)` 唯一聚合，字段为请求数、错误数、四类 token、`cost_yuan`、`total_duration_ms`、`updated_at`。每个代理请求结束时与请求行同一事务 upsert，累加各列。它是仪表盘“今日/本月”、日趋势、模型分布与 CSV 导出的数据源；`day` 与请求行的 `day_local` 同源，保证“今日 KPI”与“今天列表”口径一致。
+按 `(day, api_format, model, client)` 唯一聚合，字段为请求数、错误数、四类 token、`cost_yuan`、`total_duration_ms`、`updated_at`。每个代理请求结束时与请求行同一事务 upsert，累加各列。它是仪表盘“今日/本月”、日趋势与模型分布的数据源；`day` 与请求行的 `day_local` 同源，保证“今日 KPI”与“今天列表”口径一致。
 
 ### `quota_snapshots`
 
@@ -162,7 +162,7 @@ model_prices
 
 分批删除是为了不长时间持写锁把代理落库饿死；批间自动提交。任何一张表有删除时最后执行一次 `ANALYZE` 刷新统计，无删除则跳过。结果写进 `MaintenanceReport`（`cutoff_day`、`retention_days`、各表删除行数）并打 info 日志“保留期清理完成”。重复执行必须零变更，测试 `retention_prunes_old_rows_and_keeps_boundary` 覆盖了边界日、NULL 行与幂等性。
 
-不参与清理的数据：`auth_profiles`（退出登录只置 `is_active = 0`，保留历史）、`model_prices`、`schema_migrations`，以及 `exports/` 下已导出的 CSV。
+不参与清理的数据：`auth_profiles`（退出登录只置 `is_active = 0`，保留历史）、`model_prices`、`schema_migrations`。
 
 ## 不变量：任何 token / auth_key 都不入库
 
@@ -191,8 +191,8 @@ model_prices
 | `src-tauri/migrations/0004_usage_perf.sql` | keyset/复合/覆盖索引、去重与唯一索引 |
 | `src-tauri/src/proxy/recorder.rs` | 会话/请求/费用/日聚合的单事务写入 |
 | `src-tauri/src/usage/aggregate.rs` | `status_kind` 唯一定义、`RecentRequest` 映射 |
-| `src-tauri/src/usage/queries.rs` | 汇总/趋势/分页/导出的查询与事务 |
+| `src-tauri/src/usage/queries.rs` | 汇总/趋势/分页的查询与事务 |
 | `src-tauri/src/auth/service/persist.rs` | profile upsert 与额度快照写入时机 |
 | `src-tauri/src/auth/service/logout.rs` | 登出时 `deactivate_profiles` |
 | `src-tauri/src/bootstrap.rs` | 维护任务调度周期 |
-| `src-tauri/src/state.rs` | `db_path` / `exports_dir` 路径拼接 |
+| `src-tauri/src/state.rs` | `db_path` / `logs_dir` 路径拼接 |

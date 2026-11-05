@@ -23,7 +23,7 @@ OpenAI SDK  ─┘     (injects account credentials, records usage)
 
 - **Login** — system browser handles authentication, a deep link brings you back; if the browser cannot reach the app you can paste the callback link manually, or sign in with an account name + AuthKey directly from the login page (no browser). Credentials are encrypted at rest (AES-256-GCM, master key in the Windows Credential Manager) and renewed automatically. If the access token expires early, the app tries one `auth_key`-based renewal before treating the session as invalid; the settings page also exposes a manual "re-check / renew" action.
 - **Local proxy** — listens on `127.0.0.1:15721` by default, falls back to `15722–15800` when the port is taken. Accepts Anthropic Messages, OpenAI Chat Completions and OpenAI Responses (streaming included). Client-supplied auth headers (`authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, …) are stripped and replaced with the stored account credential. Only loopback `Host` is accepted, and requests carrying an `Origin` header are rejected with 403 — a browser page must not be able to read `/status` or your quota.
-- **Usage** — per-request input/output tokens and cost, a 30-day local cost curve, a filterable request list with CSV export; plus account-level monthly quota, model distribution and a 24-hour curve fetched from the gateway.
+- **Usage** — per-request input/output tokens and cost, a 30-day local cost curve, and a filterable, paginated request list; plus account-level monthly quota, model distribution and a 24-hour curve fetched from the gateway.
 - **Tray** — closing the window only hides it; the proxy keeps running. The tray tooltip shows this month's points.
 
 **Not included:** agent orchestration, chat sessions, MCP/skill/plugin marketplaces, hooks, scheduled tasks, notifications, auto-update.
@@ -131,12 +131,11 @@ Everything lives under `%USERPROFILE%\.codemaker-hub-light\`:
 | `logs\hub-light.log.<date>` | Daily rolling logs |
 | `logs\panic.log` | Panic location, message and backtrace (only on crash) |
 | `logs\startup-error.log` | Fatal startup errors |
-| `exports\usage_<from>_<to>.csv` | CSV exports from the Requests page |
 
 - Tokens never reach the frontend, the logs or the database; if encryption is unavailable the app refuses to load credentials instead of falling back to plaintext.
 - Request/response bodies are **not** recorded by default. If you enable recording, they are truncated to 64 KB and may contain source code.
 - The proxy binds to loopback only and rejects requests with an `Origin` header.
-- Request details are purged according to *usage retention days* (startup + every 24 h); exported CSVs are not.
+- Request details are purged according to *usage retention days* (startup + every 24 h).
 
 ## Code signing policy
 
@@ -170,7 +169,7 @@ Roles (solo maintainer), privacy statement, system changes and the exact signing
 | [Authentication](docs/authentication.md) | Login sequence, deep link, credential storage, renewal |
 | [Local proxy](docs/proxy.md) | Routes, header handling, translation, limits, status codes |
 | [Gateway contract](docs/gateway-contract.md) | Endpoints a compatible gateway must implement |
-| [Usage](docs/usage.md) | Token/cost accounting, aggregation, retention, CSV |
+| [Usage](docs/usage.md) | Token/cost accounting, aggregation, retention, pagination |
 | [Settings](docs/settings.md) | Every `settings.json` key and its validation |
 | [Data model](docs/data-model.md) | Tables, indexes, migrations |
 | [IPC API](docs/ipc-api.md) | Tauri commands and events |

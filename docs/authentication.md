@@ -128,9 +128,9 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 `RuntimeState.epoch: u64` 是登录会话的版本号，注销时 `bump_epoch` 自增，让所有在途操作立刻失效。
 
-写路径纪律只有一种写法：`commit_if_current(epoch, closure)` 在**同一把 `state.write()` 锁内**比较代次并执行闭包，代次不符返回 `None`，闭包不执行。闭包内不允许 `.await`。锁外副作用（写盘、删盘、写库）在执行前用 `still_current(epoch)` 预检，并在代次失配时由调用方补偿：
+写路径纪律只有一种写法：`commit_if_current(epoch, closure)` 在**同一把 `state.write()` 锁内**比较代次并执行闭包，代次不符返回 `None`，闭包不执行。闭包内不允许 `.await`。锁外副作用（写盘、删盘、写库）在执行前用 `still_current(epoch)` 预检；**凭据写盘还有第二道闸**：`store.save_if(generation, …)`（见 §6），它把"预检通过之后、真正拿锁写盘之前"发生的注销也一并挡住。
 
-- `finish_login` 在 `gateway()` 之前先检查一次；写盘后 `commit_login` 若返回 `None`（刚好注销），立刻 `delete_async()` 删掉刚写的文件，绝不复活凭据。
+- `finish_login` 在 `gateway()` 之前先检查一次；写盘走 `save_async_if`，代次已推进就直接 `SessionEnded`（不会重建主密钥）；`commit_login` 若返回 `None`（刚好注销），仍会 `delete_async()` 兜底，绝不复活凭据。
 - `persist_profile`、`store_quota` 先 `still_current` 再写，注销后的档案与额度快照不再落库。
 - `record_failure` 也走 `commit_if_current`，注销后到达的失败不会把状态改回 `error`。
 - 深链完成流程捕获 `SessionEnded` 后保持「已登出」，不覆盖状态。
@@ -147,7 +147,8 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 | 明文 | `serde_json` 序列化的 `Credentials { access_token, auth_key, user, server_url, issued_at, expires_at }` |
 | 主密钥 | 系统凭据库（Windows 为 Credential Manager）：service `codemaker-hub-light`、user `master-key`，内容是 32 字节密钥的 hex |
 | 写盘 | `auth.lock` 排他锁内：临时文件 + `sync_all` + `rename` 原子替换；Unix 上权限 `0600` |
-| 删除 | `auth.bin` 与主密钥一起删，缺文件/缺条目都当成功 |
+| 删除 | 先删主密钥，再删 `auth.bin`，两侧都尝试、不短路；扣锁内自增写盘代次。任一失败返回 `StoreError::DeleteIncomplete`（注销会重试一次，仍失败则写进 `AuthStatus.message` 让用户看见）。缺文件/缺条目都当成功 |
+| 写盘代次 | `CredentialStore::generation`：`delete()` 每次自增，`save_if(generation, …)` 在**同一把 `auth.lock` 内**比对，不一致就不写（连主密钥都不创建）。因此"注销之后才拿到锁的写盘"必然是 no-op |
 
 不落明文的依据是设计与代码同时满足：`Credentials` 只实现 `Serialize`/`Deserialize` 供加密用，不参与任何 IPC 序列化；`Debug` 把 `access_token` 与 `auth_key` 打印成 `<redacted>`；日志只记录长度与错误分类。
 
@@ -217,13 +218,15 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 ## 9. 注销语义
 
-顺序固定（`logout`）：代次自增 → 停循环并等任务结束 → 删 `auth.bin` 与主密钥 → 清内存状态 → 数据库里把账号档案标记为非激活。
+顺序固定（`logout`）：代次自增 → 停循环并等任务结束 → 删主密钥与 `auth.bin` → 清内存状态 → 数据库里把账号档案标记为非激活。
+
+删除失败的处理：先删主密钥（残留密文从此不可解密），再删文件；两侧都尝试，失败重试一次（100ms 后），仍失败则写 `error!` 日志并把原因写进 `last_error`，登录页以提示条展示——**不会**静默报告"已退出"。即使文件残留也不可用：下次启动 `load_strict` 只会报 `KeyringMissing` 并要求重新登录，不会自动登录成上一个人；残留密文保留原样（下次正常登录会原子覆盖它），因为"发现没主密钥就删文件"会与并发登录的写盘竞争。
 
 | 清除 | 保留 |
 | --- | --- |
 | 内存 `credentials`、`profile`、`models`、`pending` | `epoch` 本身（继续作废在途操作） |
 | `offline_grace`、`credentials_valid`、`last_error` | 数据库 `auth_profiles` 的历史行（只把 `is_active` 置 0） |
-| `last_validated_at`、`last_quota_at`、续期运行时（退避/静默期/无进展计数） | `usage_daily`、请求明细、额度快照、`exports/` 下的 CSV |
+| `last_validated_at`、`last_quota_at`、续期运行时（退避/静默期/无进展计数） | `usage_daily`、请求明细、额度快照 |
 | 磁盘 `auth.bin` 与系统凭据库主密钥 | 设置文件、日志、代理端口文件 |
 
 代理的即时反应：`credentials_snapshot()` 在无凭据或 `ReauthRequired` 时返回 `None`，下一次请求走早期失败分支，返回 401 与协议对应的错误体，文案固定为「未登录或登录已失效，请先登录 CodeMaker Hub Light」，`error_kind` 记为 `unauthorized`（用量库里这一行会计入错误数）。
@@ -249,7 +252,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 | 额度 404 | `AuthError::Http`，「用量接口不存在，请检查服务版本（HTTP 404）」 | 提示检查网关地址或服务端版本 |
 | 额度网络失败 | `AuthError::Http` | 有旧快照时提示「已保留上次成功数据」 |
 
-前端把 `message` 当作唯一的状态说明来源，但登录页只在 `message` 不以「等待浏览器」开头时才当作提示，避免把后端默认的等待文案重复显示。
+前端把 `message` 当作唯一的状态说明来源，但登录页只在 `message` 不以「等待浏览器」开头时才当作提示，避免把后端默认的等待文案重复显示。注销后落到登录页时，`unauthenticated` 状态里的 `message`（例如"未能清除本地凭据"）同样以提示条展示。
 
 ## 11. 安全边界
 
@@ -259,7 +262,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 - 不跟随重定向：`redirect::Policy::none()`，避免 `X-Access-Token` 自定义头被带到非预期主机；代理侧遇到上游 3xx 同样拒绝跟随。
 - 深链只在 Rust 侧解析与消费：前端只拿到 `poll_uuid` 与「是否带凭据」，手动粘贴的链接提交后立即从前端状态清除。
 - 明文 `http://` 网关只对本机回环放行，其余一律拒绝，防止凭据在链路上暴露。
-- 注销是安全边界：先停机再删凭据，删除后旧代次的在途写入全部作废。
+- 注销是安全边界：先停机再删凭据；主密钥先删，因此即便文件残留也不可解密；写盘代次让旧代次的在途写入全部作废；删除不完整会以 `message` 告知用户，不静默成功。
 
 已知不一致（待验证）：前端 `src/lib/quota.ts` 的额度超时文案写的是「30 秒」，后端认证请求超时是 `HTTP_TIMEOUT_SECS`=20 秒；暂未确认这是历史文案未更新还是另有前端等待上限。
 

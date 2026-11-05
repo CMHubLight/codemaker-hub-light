@@ -96,7 +96,7 @@ GitHub 与 SignPath 两端均需启用双因素认证（MFA）；申请前请按
 | 账号凭据（token） | 只在本机内存与 `auth.bin` 密文中；只发给**你配置的网关** |
 | 登录、校验、续期、额度请求 | 只发给你在设置里填写的网关 |
 | 代理转发的对话请求 | 只发给你在设置里填写的网关 |
-| 请求日志与用量统计 | 只写本机 SQLite；导出 CSV 也只在你指定的本地目录 |
+| 请求日志与用量统计 | 只写本机 SQLite，不向任何远端发送用量数据 |
 | 日志文件 | 只写本机数据目录 |
 
 This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
