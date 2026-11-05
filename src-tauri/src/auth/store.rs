@@ -19,7 +19,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use aes_gcm::{
@@ -55,6 +58,13 @@ pub enum StoreError {
     Keyring(String),
     #[error("系统凭据库中没有主密钥，无法解密已有凭据文件")]
     KeyringMissing,
+    /// 注销时凭据文件与主密钥没能全部删除（两侧都试过，不短路）。
+    ///
+    /// 主密钥**先删**，因此即使文件残留，那份密文也已不可解密（下次启动报
+    /// [`Self::KeyringMissing`] 而不是静默自动登录）；这里仍要报错，因为
+    /// "磁盘上留着可用凭据"是安全承诺的失败，必须让用户看见。
+    #[error("凭据未完全删除（文件：{file}；主密钥：{key}）")]
+    DeleteIncomplete { file: String, key: String },
     /// 阻塞线程池任务失败（`spawn_blocking` 的 JoinError）。
     ///
     /// 生产配置是 `panic = "abort"`，正常走不到这里；保留显式错误而不是 unwrap。
@@ -176,6 +186,13 @@ pub struct CredentialStore {
     path: PathBuf,
     lock_path: PathBuf,
     key_source: Arc<dyn MasterKeySource>,
+    /// 写盘代次：`delete()` 每次自增，`save_if` 写盘前比对。
+    ///
+    /// 这把"注销之后才拿到锁的写盘"变成 no-op：`fs2` 排他锁把 `save_if` 与
+    /// `delete` 串行化，所以"先比代次再写"这一步在锁内完成就不可能被插队。
+    /// 为什么不用"提交失败就把刚写的文件删掉"：续期与"注销后重新登录"可以并发，
+    /// 补删会误删新会话刚写出的凭据（且无法写出确定性测试）。
+    generation: Arc<AtomicU64>,
 }
 
 impl CredentialStore {
@@ -190,7 +207,13 @@ impl CredentialStore {
             path: data_dir.join(AUTH_FILE),
             lock_path: data_dir.join(LOCK_FILE),
             key_source: Arc::from(key_source),
+            generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 当前写盘代次。要在**发盘之前**取一次，然后交给 [`Self::save_if`]。
+    pub fn credential_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn path(&self) -> &Path {
@@ -216,24 +239,56 @@ impl CredentialStore {
 
     /// 加密写盘（原子替换）。
     pub fn save(&self, credentials: &Credentials) -> Result<(), StoreError> {
+        self.locked(|| self.write_locked(credentials))
+    }
+
+    /// 带代次守卫的写盘：注销之后到达的写盘直接放弃（返回 `false`，一个字节都不写）。
+    ///
+    /// 调用方要在**发起写盘之前**取 [`Self::credential_generation`]。比对与写入都在
+    /// `auth.lock` 内完成，而 `delete()` 也在同一把锁内自增代次，因此不存在
+    /// "检查通过、然后注销、然后写回去" 的窗口。
+    pub fn save_if(&self, generation: u64, credentials: &Credentials) -> Result<bool, StoreError> {
         self.locked(|| {
-            let key = self.key_source.get_or_create()?;
-            let plaintext = serde_json::to_vec(credentials)?;
-            let blob = encrypt(&key, &plaintext)?;
-            atomic_write(&self.path, &blob)
+            if self.credential_generation() != generation {
+                return Ok(false);
+            }
+            self.write_locked(credentials)?;
+            Ok(true)
         })
     }
 
+    /// 写入实体（必须在 [`Self::locked`] 内调用）。
+    fn write_locked(&self, credentials: &Credentials) -> Result<(), StoreError> {
+        let key = self.key_source.get_or_create()?;
+        let plaintext = serde_json::to_vec(credentials)?;
+        let blob = encrypt(&key, &plaintext)?;
+        atomic_write(&self.path, &blob)
+    }
+
     /// 删除凭据文件与主密钥。
+    ///
+    /// 两条纪律：
+    /// - **先删主密钥**，且两侧都尝试、不短路：主密钥没了，残留密文就不可解密，
+    ///   下次启动是"加载失败 + 需要重新登录"，而不是静默自动登录成上一个人。
+    /// - 无论成败都推进写盘代次：注销这件事已经发生，任何在途续期都不能再写回来。
     pub fn delete(&self) -> Result<(), StoreError> {
         self.locked(|| {
-            match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(StoreError::Io(err)),
+            let key_result = self.key_source.delete();
+            let file_result = match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(StoreError::Io(err)),
+            };
+            // 即使在锁内获取，代次也必须先推进再返回：调用方会依据失败做重试，
+            // 重试期间到达的写盘同样必须作废。
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            match (file_result, key_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (file, key) => Err(StoreError::DeleteIncomplete {
+                    file: delete_state(file),
+                    key: delete_state(key),
+                }),
             }
-            self.key_source.delete()?;
-            Ok(())
         })
     }
 
@@ -271,6 +326,19 @@ impl CredentialStore {
         let store = self.clone_for_blocking();
         let credentials = credentials.clone();
         tokio::task::spawn_blocking(move || store.save(&credentials))
+            .await
+            .map_err(|err| StoreError::Join(err.to_string()))?
+    }
+
+    /// 带代次守卫的异步写盘；`Ok(false)` 表示会话已作废、没有写入。
+    pub async fn save_async_if(
+        &self,
+        generation: u64,
+        credentials: &Credentials,
+    ) -> Result<bool, StoreError> {
+        let store = self.clone_for_blocking();
+        let credentials = credentials.clone();
+        tokio::task::spawn_blocking(move || store.save_if(generation, &credentials))
             .await
             .map_err(|err| StoreError::Join(err.to_string()))?
     }
@@ -370,6 +438,14 @@ fn decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Credentials, StoreError> 
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
+/// 把单侧删除结果压成一句可读状态，供 [`StoreError::DeleteIncomplete`] 展示。
+fn delete_state(result: Result<(), StoreError>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(err) => err.to_string(),
+    }
+}
+
 /// 临时文件 + fsync + rename 的原子写；Unix 上权限 0600。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let mut tmp_os = path.as_os_str().to_owned();
@@ -425,6 +501,10 @@ impl MasterKeySource for StaticKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("chl-store-{tag}-{}", uuid::Uuid::new_v4()));
@@ -555,5 +635,124 @@ mod tests {
         assert_eq!(hex.len(), KEY_LEN * 2);
         assert_eq!(decode_key(&hex).expect("解码应成功"), key);
         assert!(decode_key("zz").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // 注销屏障：先删主密钥、两侧都试、写盘代次守卫
+    // -----------------------------------------------------------------------
+
+    /// 记录 `delete()` 调用的主密钥来源，用来证明"文件删不掉也照样删主密钥"。
+    struct SpyKey {
+        deleted: Arc<AtomicUsize>,
+    }
+
+    impl MasterKeySource for SpyKey {
+        fn get(&self) -> Result<Option<[u8; KEY_LEN]>, StoreError> {
+            Ok(Some([3u8; KEY_LEN]))
+        }
+
+        fn get_or_create(&self) -> Result<[u8; KEY_LEN], StoreError> {
+            Ok([3u8; KEY_LEN])
+        }
+
+        fn delete(&self) -> Result<(), StoreError> {
+            self.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 用同名目录占住 `auth.bin`，让 `fs::remove_file` 必然失败（Windows/Linux 一致）。
+    fn occupy_auth_path(store: &CredentialStore) {
+        if store.path().is_file() {
+            fs::remove_file(store.path()).expect("先删掉真实文件");
+        }
+        fs::create_dir_all(store.path()).expect("目录应可创建");
+    }
+
+    /// 文件删不掉时主密钥仍必须被删：残留密文不可解密 ⇒ 下次启动需要重新登录。
+    #[test]
+    fn delete_removes_key_even_when_file_cannot_be_removed() {
+        let dir = temp_dir("delete-partial");
+        let deleted = Arc::new(AtomicUsize::new(0));
+        let store = CredentialStore::with_key_source(
+            &dir,
+            Box::new(SpyKey {
+                deleted: deleted.clone(),
+            }),
+        );
+        occupy_auth_path(&store);
+
+        let err = store.delete().expect_err("文件删不掉必须报错");
+        assert!(
+            matches!(err, StoreError::DeleteIncomplete { .. }),
+            "应是部分删除失败：{err}"
+        );
+        assert_eq!(
+            deleted.load(Ordering::SeqCst),
+            1,
+            "主密钥必须照样尝试删除（不能因文件失败而短路）"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 注销之前取到的代次，写盘必须被丢弃——这是"续期把凭据写回来"的正解。
+    #[test]
+    fn save_after_delete_is_a_noop() {
+        let dir = temp_dir("generation");
+        let store = store(&dir, 6);
+        let generation = store.credential_generation();
+        assert!(store
+            .save_if(generation, &sample())
+            .expect("首次写盘应成功"));
+        assert!(store.exists());
+
+        store.delete().expect("删除应成功");
+        assert!(!store.exists());
+        assert_ne!(
+            store.credential_generation(),
+            generation,
+            "删除必须推进代次"
+        );
+
+        assert!(
+            !store
+                .save_if(generation, &sample())
+                .expect("放弃写入不是错误"),
+            "旧代次的写盘必须被放弃"
+        );
+        assert!(!store.exists(), "注销后到达的写盘不得复活凭据");
+
+        // 新会话重新取代次后可以正常写盘（登录不会被守卫挡住）。
+        let fresh = store.credential_generation();
+        assert!(store.save_if(fresh, &sample()).expect("新代次应可写"));
+        assert!(store.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 即使删除只成功一半，代次也必须推进：否则重试窗口里的写盘仍会复活凭据。
+    #[test]
+    fn delete_bumps_generation_even_on_partial_failure() {
+        let dir = temp_dir("generation-partial");
+        let store = store(&dir, 8);
+        let generation = store.credential_generation();
+        assert!(store.save_if(generation, &sample()).expect("保存应成功"));
+
+        occupy_auth_path(&store);
+        assert!(store.delete().is_err(), "文件删不掉应报错");
+        assert_ne!(
+            store.credential_generation(),
+            generation,
+            "部分失败也必须推进代次"
+        );
+        assert!(
+            !store
+                .save_if(generation, &sample())
+                .expect("放弃写入不是错误"),
+            "部分失败后的旧代次写盘同样必须被放弃"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -282,7 +282,11 @@ impl AuthService {
         if !self.still_current(epoch).await {
             return Err(AuthError::SessionEnded);
         }
-        self.store.save_async(&credentials).await?;
+        // 同样过"代次大门"：注销期间到达的写盘直接放弃（连主密钥都不会重建）。
+        let generation = self.store.credential_generation();
+        if !self.store.save_async_if(generation, &credentials).await? {
+            return Err(AuthError::SessionEnded);
+        }
 
         let committed = self
             .commit_login(
