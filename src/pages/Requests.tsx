@@ -1,17 +1,11 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Panel, PanelHeader } from '../components/Panel'
 import { StatusPill } from '../components/StatusPill'
-import { useAsyncResource, useCommand } from '../lib/async'
+import { useAsyncResource } from '../lib/async'
 import { formatCompact, formatDateTime, formatDuration, formatYuan } from '../lib/format'
 import { invokeCmd } from '../lib/ipc'
 import { protocolLabel, requestStatus } from '../lib/labels'
-import type {
-  Cursor,
-  RecentRequest,
-  RequestFilter,
-  RequestPage,
-  UsageExportResult
-} from '../lib/types'
+import type { Cursor, RecentRequest, RequestFilter, RequestPage } from '../lib/types'
 
 interface FilterState {
   range: string
@@ -78,7 +72,6 @@ export function Requests({ revision = 0 }: RequestsProps) {
   const [reloadNonce, setReloadNonce] = useState(0)
   /** 用户主动查询（改筛选/翻页/重试）时置位：只有它显示阻塞式“查询中…”。 */
   const [querying, setQuerying] = useState(false)
-  const [exportMessage, setExportMessage] = useState<string | null>(null)
   const revisionRef = useRef(revision)
 
   const currentCursor = cursors[pageIndex] ?? null
@@ -99,7 +92,6 @@ export function Requests({ revision = 0 }: RequestsProps) {
       filter: toRequestFilter(applied, currentCursor, includeTotal)
     })
   )
-  const { run: runExport, running: exporting } = useCommand<UsageExportResult>('usage_export_csv')
 
   // 用户查询的结果（成功或失败）落地后收起“查询中…”。
   useEffect(() => {
@@ -165,29 +157,6 @@ export function Requests({ revision = 0 }: RequestsProps) {
   function retry() {
     setQuerying(true)
     resetToFirstPage()
-  }
-
-  async function exportCsv() {
-    const filter = toRequestFilter(applied, null, false)
-    setExportMessage(null)
-    const outcome = await runExport({
-      // 命令顶层参数名必须是 camelCase（Rust `from_day` → JS `fromDay`）；
-      // 写成 snake_case 不会报错，只会被当成缺失、静默退回默认区间。
-      fromDay: filter.from,
-      toDay: filter.to
-    })
-    if (outcome.status === 'ok') {
-      const result = outcome.data
-      setExportMessage(
-        result.saved
-          ? `已导出 ${result.rows ?? 0} 行到 ${result.path ?? '本地 exports 目录'}${
-              result.truncated ? '（已截断：上限 20 万行，请缩小时间范围）' : ''
-            }`
-          : (result.message ?? '导出失败')
-      )
-    } else if (outcome.status === 'error') {
-      setExportMessage(`导出失败：${outcome.error.raw}`)
-    }
   }
 
   const pageData = pageResource.data
@@ -276,28 +245,14 @@ export function Requests({ revision = 0 }: RequestsProps) {
             <button type="button" className="btn btn--ghost" onClick={resetFilters} disabled={loading}>
               重置
             </button>
-            <button
-              type="button"
-              className="btn btn--ghost"
-              onClick={() => void exportCsv()}
-              disabled={exporting || loading}
-            >
-              {exporting ? '导出中…' : '导出 CSV'}
-            </button>
           </div>
         </div>
         <p className="panel-meta">
           筛选与分页在本地用量库执行；请求列表暂未关联会话记录，客户端列固定显示 unknown。
-          导出的 CSV 只按时间范围，不受协议/状态/关键字筛选影响。
         </p>
         {filtersPending ? (
           <p className="panel-meta" role="status">
             筛选未应用：当前列表仍按上次查询条件，点击“查询”后生效。
-          </p>
-        ) : null}
-        {exportMessage ? (
-          <p className="panel-meta" role="status">
-            {exportMessage}
           </p>
         ) : null}
       </Panel>

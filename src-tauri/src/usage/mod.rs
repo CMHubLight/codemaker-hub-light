@@ -331,28 +331,6 @@ pub struct CostTrend {
     pub credit_to_yuan: f64,
 }
 
-/// CSV 导出结果（内部）。
-#[derive(Debug, Clone, Serialize)]
-pub struct CsvExport {
-    pub path: String,
-    pub rows: usize,
-    pub bytes: u64,
-    /// 是否因为超过行数上限而截断（只导出到上限为止）。
-    pub truncated: bool,
-}
-
-/// 导出命令返回（前端 `UsageExportResult`）。
-#[derive(Debug, Clone, Serialize)]
-pub struct UsageExportResult {
-    pub saved: bool,
-    pub path: Option<String>,
-    pub message: Option<String>,
-    // ---- 附加字段 ----
-    pub rows: usize,
-    pub bytes: u64,
-    /// 行数超过上限被截断（前端应提示缩小时间范围）。
-    pub truncated: bool,
-}
 #[cfg(test)]
 mod tests {
     use super::*;

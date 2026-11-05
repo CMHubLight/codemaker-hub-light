@@ -1,46 +1,18 @@
-//! 用量查询与导出命令（返回结构与前端 `src/lib/types.ts` 对齐）。
+//! 用量查询命令（返回结构与前端 `src/lib/types.ts` 对齐）。
 //!
 //! 所有 SQLite 访问都经 `db::blocking::run`：`rusqlite` 是同步 API，直接在 async
 //! fn 里调用会占住 Tokio worker（取连接最长还要等 5s），代理与 IPC 一起排队。
 
-use chrono::{Duration, Local, NaiveDate, SecondsFormat, Utc};
+use chrono::{Duration, Local, SecondsFormat, Utc};
 use tauri::State;
 
 use crate::{
     db::blocking,
     state::AppState,
     usage::{
-        queries, CostTrend, CostTrendPoint, RequestDetail, RequestFilter, RequestPage,
-        UsageExportResult, UsageSummary,
+        queries, CostTrend, CostTrendPoint, RequestDetail, RequestFilter, RequestPage, UsageSummary,
     },
 };
-
-const EXPORT_DEFAULT_DAYS: i64 = 30;
-
-fn parse_day(value: &str) -> Result<NaiveDate, String> {
-    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
-        .map_err(|_| format!("日期格式应为 YYYY-MM-DD：{value}"))
-}
-
-/// 导出区间：缺省最近 30 天（含今天）。
-fn resolve_export_range(
-    from_day: Option<String>,
-    to_day: Option<String>,
-) -> Result<(String, String), String> {
-    let today = Local::now().date_naive();
-    let from = match from_day.as_deref() {
-        Some(value) => parse_day(value)?,
-        None => today - Duration::days(EXPORT_DEFAULT_DAYS - 1),
-    };
-    let to = match to_day.as_deref() {
-        Some(value) => parse_day(value)?,
-        None => today,
-    };
-    if from > to {
-        return Err("起始日期不能晚于结束日期".to_string());
-    }
-    Ok((from.to_string(), to.to_string()))
-}
 
 #[tauri::command]
 pub async fn usage_summary(state: State<'_, AppState>) -> Result<UsageSummary, String> {
@@ -137,63 +109,4 @@ pub async fn usage_request_detail(
     blocking::run(&state.db, move |db| queries::request_detail(&db, id))
         .await
         .map_err(|err| format!("读取请求详情失败：{err}"))
-}
-
-/// 导出 CSV 到 `~/.codemaker-hub-light/exports/`（UTF-8 BOM，Excel 友好）。
-#[tauri::command]
-pub async fn usage_export_csv(
-    state: State<'_, AppState>,
-    from_day: Option<String>,
-    to_day: Option<String>,
-) -> Result<UsageExportResult, String> {
-    let (from, to) = resolve_export_range(from_day, to_day)?;
-    tracing::info!(from = %from, to = %to, "导出 CSV（只按时间范围，不应用列表筛选）");
-    let exports_dir = state.exports_dir();
-    match blocking::run(&state.db, move |db| {
-        queries::export_csv(&db, &exports_dir, &from, &to)
-    })
-    .await
-    {
-        Ok(export) => Ok(UsageExportResult {
-            saved: true,
-            path: Some(export.path),
-            message: None,
-            rows: export.rows,
-            bytes: export.bytes,
-            truncated: export.truncated,
-        }),
-        Err(err) => Ok(UsageExportResult {
-            saved: false,
-            path: None,
-            message: Some(format!("导出 CSV 失败：{err}")),
-            rows: 0,
-            bytes: 0,
-            truncated: false,
-        }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn export_range_defaults_to_last_30_days() {
-        let (from, to) = resolve_export_range(None, None).expect("默认区间应合法");
-        let from = parse_day(&from).unwrap();
-        let to = parse_day(&to).unwrap();
-        assert_eq!((to - from).num_days(), EXPORT_DEFAULT_DAYS - 1);
-    }
-
-    #[test]
-    fn export_range_rejects_reversed_dates() {
-        let err = resolve_export_range(Some("2026-02-01".into()), Some("2026-01-01".into()))
-            .expect_err("倒序区间应被拒绝");
-        assert!(err.contains("起始日期"));
-    }
-
-    #[test]
-    fn export_range_rejects_bad_format() {
-        assert!(resolve_export_range(Some("2026/01/01".into()), None).is_err());
-    }
 }

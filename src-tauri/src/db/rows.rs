@@ -146,40 +146,6 @@ impl FromRow for UsageDimRow {
     }
 }
 
-/// CSV 导出的一行（`usage_daily` 原始维度行）。
-#[derive(Debug, Clone)]
-pub struct UsageExportRow {
-    pub day: String,
-    pub api_format: String,
-    pub model: String,
-    pub client: String,
-    pub request_count: i64,
-    pub error_count: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_yuan: f64,
-}
-
-impl FromRow for UsageExportRow {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            day: row.get("day")?,
-            api_format: row.get("api_format")?,
-            model: row.get("model")?,
-            client: row.get("client")?,
-            request_count: row.get("request_count")?,
-            error_count: row.get("error_count")?,
-            input_tokens: row.get("input_tokens")?,
-            output_tokens: row.get("output_tokens")?,
-            cache_read_tokens: row.get("cache_read_tokens")?,
-            cache_write_tokens: row.get("cache_write_tokens")?,
-            cost_yuan: row.get("cost_yuan")?,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 请求明细
 // ---------------------------------------------------------------------------

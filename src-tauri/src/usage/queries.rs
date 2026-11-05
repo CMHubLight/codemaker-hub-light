@@ -1,23 +1,18 @@
-//! 用量只读查询与 CSV 导出。
+//! 用量只读查询（汇总、趋势、请求列表与详情）。
 //!
 //! 空库返回零值结构（比率为 null），与前端空态一致；不伪造 0 费率。
 //!
 //! 本层只做"参数解析 + 读事务 + DTO 组装"，SQL 与行解码在 `db::sql` / `db::rows`。
 
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    io::{BufWriter, Write},
-    path::Path,
-};
+use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, SecondsFormat, Utc};
 
 use crate::{
     db::{repo, Db, DbError},
     usage::{
-        aggregate, CostTrend, CostTrendPoint, CsvExport, Cursor, RequestDetail, RequestFilter,
-        RequestPage, UsageSummary,
+        aggregate, CostTrend, CostTrendPoint, Cursor, RequestDetail, RequestFilter, RequestPage,
+        UsageSummary,
     },
 };
 
@@ -26,11 +21,6 @@ const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 200;
 const RECENT_LIMIT: u32 = 10;
 const EPOCH_DAY: &str = "0000-01-01";
-/// 单次 CSV 导出的行数硬上限：超过则截断并在结果里标记（前端应提示缩小范围）。
-const MAX_EXPORT_ROWS: usize = 200_000;
-/// CSV 表头（含 UTF-8 BOM，Excel 直接双击不乱码）。
-const EXPORT_HEADER: &str = "\u{feff}day,api_format,model,client,request_count,error_count,\
-     input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_yuan\n";
 
 fn today() -> NaiveDate {
     Local::now().date_naive()
@@ -281,112 +271,6 @@ pub fn request_detail(db: &Db, id: i64) -> Result<Option<RequestDetail>, DbError
     }))
 }
 
-/// CSV 导出（UTF-8 BOM；文件名含日期区间，重复导出覆盖同名文件）。
-///
-/// 流式写盘：逐行从 SQLite 读、逐行写 `BufWriter`，内存占用与行数无关。
-/// 超过 [`MAX_EXPORT_ROWS`] 截断并标记 `truncated`。
-pub fn export_csv(
-    db: &Db,
-    exports_dir: &Path,
-    from_day: &str,
-    to_day: &str,
-) -> Result<CsvExport, DbError> {
-    export_csv_with_limit(db, exports_dir, from_day, to_day, MAX_EXPORT_ROWS)
-}
-
-fn export_csv_with_limit(
-    db: &Db,
-    exports_dir: &Path,
-    from_day: &str,
-    to_day: &str,
-    max_rows: usize,
-) -> Result<CsvExport, DbError> {
-    std::fs::create_dir_all(exports_dir)?;
-    let path = exports_dir.join(format!("usage_{from_day}_{to_day}.csv"));
-    // 先写 .part 再改名：中途失败不会把上一次成功的导出截成半截文件。
-    let temp_path = exports_dir.join(format!("usage_{from_day}_{to_day}.csv.part"));
-
-    let (rows, truncated) = match write_export_file(db, &temp_path, from_day, to_day, max_rows) {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(err);
-        }
-    };
-    let bytes = std::fs::metadata(&temp_path)?.len();
-    // Windows 的 rename 目标已存在时会失败，先删旧文件再原子替换。
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    std::fs::rename(&temp_path, &path)?;
-
-    Ok(CsvExport {
-        path: path.to_string_lossy().into_owned(),
-        rows,
-        bytes,
-        truncated,
-    })
-}
-
-fn write_export_file(
-    db: &Db,
-    temp_path: &Path,
-    from_day: &str,
-    to_day: &str,
-    max_rows: usize,
-) -> Result<(usize, bool), DbError> {
-    let file = std::fs::File::create(temp_path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(EXPORT_HEADER.as_bytes())?;
-
-    let conn = db.conn()?;
-    let (rows, truncated) = repo::export_rows_stream(&conn, from_day, to_day, max_rows, |row| {
-        writeln!(
-            writer,
-            "{},{},{},{},{},{},{},{},{},{},{:.4}",
-            csv_field(&row.day),
-            csv_field(&row.api_format),
-            csv_field(&row.model),
-            csv_field(&row.client),
-            row.request_count,
-            row.error_count,
-            row.input_tokens,
-            row.output_tokens,
-            row.cache_read_tokens,
-            row.cache_write_tokens,
-            // 固定 4 位小数：与界面 round4 一致，避免长尾与科学计数观感。
-            row.cost_yuan
-        )?;
-        Ok(())
-    })?;
-    writer.flush()?;
-    Ok((rows, truncated))
-}
-
-/// CSV 字段转义：含逗号/引号/换行时加引号并把 `"` 翻倍。
-///
-/// 先做公式中和再决定是否加引号（Excel/WPS 连引号内的 `=...` 也会执行）。
-fn csv_field(value: &str) -> String {
-    let value = sanitize_formula(value);
-    if value
-        .chars()
-        .any(|ch| matches!(ch, ',' | '"' | '\n' | '\r'))
-    {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.into_owned()
-    }
-}
-
-/// 中和 CSV 公式注入：以 `= + - @` 或制表符/回车开头的单元格会被 Excel/WPS
-/// 当公式执行，前置单引号让它按文本显示。
-fn sanitize_formula(value: &str) -> Cow<'_, str> {
-    match value.chars().next() {
-        Some('=' | '+' | '-' | '@' | '\t' | '\r') => Cow::Owned(format!("'{value}")),
-        _ => Cow::Borrowed(value),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,99 +279,6 @@ mod tests {
         let db = Db::open_in_memory().expect("内存库应可打开");
         crate::db::run_migrations(&db).expect("迁移应成功");
         db
-    }
-
-    #[test]
-    fn csv_field_escapes_specials() {
-        assert_eq!(csv_field("gpt-4o"), "gpt-4o");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
-    }
-
-    /// CSV 公式注入——外部可控的 model/client 以 = + - @ 开头会被 Excel 执行。
-    #[test]
-    fn csv_field_neutralizes_formula_prefixes() {
-        for raw in ["=1+1", "+x", "-x", "@SUM(A1)", "\tcmd", "\rcmd"] {
-            let out = csv_field(raw);
-            // 回车会触发加引号，去掉外层引号后再看前缀。
-            let cell = out.trim_matches('"');
-            assert!(cell.starts_with('\''), "{raw:?} 应被中和：{out:?}");
-            assert!(cell.contains(raw), "原始内容必须保留：{out:?}");
-        }
-        // 危险开头 + 逗号：先中和再加引号
-        assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
-        // 普通文本不受影响
-        assert_eq!(csv_field("claude-sonnet-4"), "claude-sonnet-4");
-    }
-
-    /// 导出时 model 被中和、费用固定 4 位小数。
-    #[test]
-    fn export_csv_sanitizes_model_and_rounds_cost() {
-        let db = empty_db();
-        {
-            let conn = db.conn().expect("取连接应成功");
-            conn.execute(
-                "INSERT INTO usage_daily \
-                   (day, api_format, model, client, request_count, error_count, input_tokens, \
-                    output_tokens, cache_read_tokens, cache_write_tokens, cost_yuan, \
-                    total_duration_ms, updated_at) \
-                 VALUES ('2026-10-22', 'anthropic', '=cmd|calc', 'claude-code', 1, 0, 10, 5, 0, 0, \
-                         0.0123456789, 100, '2026-10-22T00:00:00Z')",
-                [],
-            )
-            .expect("插入日聚合应成功");
-        }
-
-        let dir = std::env::temp_dir().join(format!("chl-csv-inject-{}", uuid::Uuid::new_v4()));
-        let export = export_csv(&db, &dir, "2026-10-22", "2026-10-22").expect("导出应成功");
-        let content = std::fs::read_to_string(&export.path).expect("导出文件应可读");
-        assert!(
-            content.contains("'=cmd|calc"),
-            "模型名必须被中和：{content}"
-        );
-        assert!(
-            !content.contains(",=cmd"),
-            "不得出现裸公式单元格：{content}"
-        );
-        assert!(content.contains("0.0123"), "费用应为 4 位小数：{content}");
-        assert!(
-            !content.contains("0.0123456789"),
-            "费用不应带长尾：{content}"
-        );
-        assert!(!export.truncated, "单行导出不应被截断");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 行数超过上限时截断：只写上限行数，并如实标记 truncated。
-    #[test]
-    fn export_csv_truncates_at_row_limit() {
-        let db = empty_db();
-        {
-            let conn = db.conn().expect("取连接应成功");
-            for (index, model) in ["m-1", "m-2", "m-3"].iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO usage_daily \
-                       (day, api_format, model, client, request_count, error_count, input_tokens, \
-                        output_tokens, cache_read_tokens, cache_write_tokens, cost_yuan, \
-                        total_duration_ms, updated_at) \
-                     VALUES ('2026-10-22', 'anthropic', ?1, 'claude-code', ?2, 0, 1, 1, 0, 0, \
-                             0.5, 10, '2026-10-22T00:00:00Z')",
-                    rusqlite::params![model, index as i64],
-                )
-                .expect("插入日聚合应成功");
-            }
-        }
-
-        let dir = std::env::temp_dir().join(format!("chl-csv-cap-{}", uuid::Uuid::new_v4()));
-        let export =
-            export_csv_with_limit(&db, &dir, "2026-10-22", "2026-10-22", 2).expect("导出应成功");
-        assert_eq!(export.rows, 2, "只应写出上限行数");
-        assert!(export.truncated, "超出上限必须标记 truncated");
-        let content = std::fs::read_to_string(&export.path).expect("导出文件应可读");
-        // 表头 + 2 行数据
-        assert_eq!(content.lines().count(), 3, "实际内容：{content}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -810,16 +601,5 @@ mod tests {
         .expect("列表应成功");
         assert_eq!(page.total, -1, "未统计时 total 为 -1");
         assert_eq!(page.items.len(), 1);
-    }
-
-    #[test]
-    fn export_csv_writes_header_even_when_empty() {
-        let db = empty_db();
-        let dir = std::env::temp_dir().join(format!("chl-csv-test-{}", uuid::Uuid::new_v4()));
-        let export = export_csv(&db, &dir, "2026-01-01", "2026-01-02").expect("导出应成功");
-        assert_eq!(export.rows, 0);
-        let content = std::fs::read_to_string(&export.path).expect("导出文件应可读");
-        assert!(content.contains("day,api_format,model,client"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

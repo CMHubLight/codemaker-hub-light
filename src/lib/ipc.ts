@@ -10,7 +10,6 @@ import type {
   RequestFilter,
   RequestPage,
   TrendRange,
-  UsageExportResult,
   UsageSummary
 } from './types'
 
@@ -20,7 +19,7 @@ import type {
  * 参数命名规则（踩过的坑，别再踩）：
  * - 命令**顶层**参数名一律 camelCase：Rust `from_day` / `to_day` → JS `fromDay` / `toDay`。
  *   Tauri 默认把命令参数名转成 lowerCamelCase；写成 snake_case 不会报错，
- *   而 `Option<T>` 参数会静默收到 `None`（用到 export 区间就是这么丢的）。
+ *   而 `Option<T>` 参数会静默收到 `None`（`usage_requests` 的日期区间就是这么丢的）。
  * - 嵌套 payload（`filter`、`settings`）走 serde 反序列化，字段名保持 Rust 的 snake_case。
  */
 export type CommandName =
@@ -38,7 +37,6 @@ export type CommandName =
   | 'usage_summary'
   | 'cost_trend_get'
   | 'usage_requests'
-  | 'usage_export_csv'
   | 'settings_get'
   | 'settings_update'
   | 'app_open_logs'
@@ -82,7 +80,7 @@ export interface CommandError {
  * 命令等待超时。
  *
  * 注意：Tauri 的 `invoke` 没有取消机制，超时只让**界面止损**，Rust 侧命令仍会跑完
- * （写操作可能仍在后台执行，例如导出 CSV、重启代理）。
+ * （写操作可能仍在后台执行，例如重启代理、保存设置）。
  */
 export class CommandTimeoutError extends Error {
   readonly command: CommandName
@@ -148,7 +146,6 @@ const COMMAND_TIMEOUT_MS: Partial<Record<CommandName, number>> = {
   auth_retry_renewal: 30_000,
   quota_get: 30_000,
   proxy_restart: 30_000,
-  usage_export_csv: 30_000,
   app_open_logs: 15_000,
   auth_poll_status: 10_000
 }
@@ -339,16 +336,6 @@ async function mockInvoke(
       void (args as { filter?: RequestFilter } | undefined)
       const page: RequestPage = { total: 0, items: [] }
       return page
-    }
-    case 'usage_export_csv': {
-      const result: UsageExportResult = {
-        saved: false,
-        path: null,
-        message: '浏览器预览模式没有本地数据库，导出不可用。',
-        rows: 0,
-        bytes: 0
-      }
-      return result
     }
     case 'settings_get':
       return clone(mockSettings)

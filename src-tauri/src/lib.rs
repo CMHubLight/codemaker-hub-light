@@ -126,7 +126,6 @@ pub fn run() {
             commands::usage::cost_trend_get,
             commands::usage::usage_requests,
             commands::usage::usage_request_detail,
-            commands::usage::usage_export_csv,
         ])
         .build(tauri::generate_context!())
     {

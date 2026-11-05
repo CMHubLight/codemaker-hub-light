@@ -260,16 +260,6 @@ export interface AppInfo {
   schema_version: number
 }
 
-export interface UsageExportResult {
-  saved: boolean
-  path: string | null
-  message: string | null
-  rows: number
-  bytes: number
-  /** 行数超过导出上限（20 万行）被截断，界面需提示缩小时间范围。 */
-  truncated?: boolean
-}
-
 export interface AppLogResult {
   opened: boolean
   message: string | null

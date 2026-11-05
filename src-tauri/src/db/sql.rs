@@ -28,13 +28,6 @@ pub const MODEL_PRICE_COLUMNS: &str = "model AS model, input_per_mtok AS input_p
      cache_write_per_mtok AS cache_write_per_mtok, currency AS currency, source AS source, \
      effective_from AS effective_from, updated_at AS updated_at";
 
-/// CSV 导出的 `usage_daily` 维度列。
-pub const USAGE_EXPORT_COLUMNS: &str = "day AS day, api_format AS api_format, model AS model, \
-     client AS client, request_count AS request_count, error_count AS error_count, \
-     input_tokens AS input_tokens, output_tokens AS output_tokens, \
-     cache_read_tokens AS cache_read_tokens, cache_write_tokens AS cache_write_tokens, \
-     cost_yuan AS cost_yuan";
-
 /// `usage_daily` 的 8 个聚合列。
 ///
 /// 只在这里写一次：总量 / 按日 / 按维度三处查询共用，口径不会再各自漂移。
@@ -223,17 +216,6 @@ pub fn usage_by_dimension(dimension: UsageDimension) -> String {
     format!(
         "SELECT {column} AS key, {TOTALS_AGG} FROM usage_daily WHERE day >= ? AND day <= ? \
          GROUP BY {column} ORDER BY cost_yuan DESC, request_count DESC"
-    )
-}
-
-/// CSV 导出的原始维度行。
-///
-/// `ORDER BY day ASC, id ASC` 是"稳定且能走索引"的导出顺序（逐行流式写盘，不需要
-/// 排序缓冲）；旧实现按 `cost_yuan DESC` 排，会为任意区间建临时 B 树。
-pub fn usage_export() -> String {
-    format!(
-        "SELECT {USAGE_EXPORT_COLUMNS} FROM usage_daily WHERE day >= ? AND day <= ? \
-         ORDER BY day ASC, id ASC"
     )
 }
 

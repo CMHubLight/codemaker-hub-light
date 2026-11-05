@@ -239,54 +239,6 @@ fn list_requests_latency_100k() {
     );
 }
 
-/// 导出是逐行流式写盘：10 万行区间内导出不会把结果集读进内存。
-#[test]
-#[ignore = "性能采样：需要手动运行 --ignored --nocapture"]
-fn export_csv_streams_100k_rows() {
-    let db = test_db();
-    {
-        let mut conn = db.conn().expect("应能取连接");
-        let tx = conn.transaction().expect("应能开事务");
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO usage_daily \
-                   (day, api_format, model, client, request_count, error_count, input_tokens, \
-                    output_tokens, cache_read_tokens, cache_write_tokens, cost_yuan, \
-                    total_duration_ms, updated_at) \
-                 VALUES (?1, 'anthropic', ?2, 'claude-code', 1, 0, 10, 5, 0, 0, 0.5, 100, ?3)",
-            )
-            .expect("应能准备插入");
-        for index in 0..100_000 {
-            // model 唯一 ⇒ 不撞 ux_usage_daily_dim；day 全部落在 2026 年内。
-            let day = format!(
-                "2026-{:02}-{:02}",
-                1 + (index / 3_500) % 12,
-                1 + (index / 125) % 28
-            );
-            stmt.execute(rusqlite::params![
-                day,
-                format!("model-{index}"),
-                "2026-10-01T00:00:00Z"
-            ])
-            .expect("插入日聚合应成功");
-        }
-        drop(stmt);
-        tx.commit().expect("提交应成功");
-    }
-
-    let dir = std::env::temp_dir().join(format!("chl-perf-export-{}", uuid::Uuid::new_v4()));
-    let started = Instant::now();
-    let export = queries::export_csv(&db, &dir, "2026-01-01", "2026-12-31").expect("导出应成功");
-    println!(
-        "export 100k rows: rows={} bytes={} truncated={} elapsed={:?}",
-        export.rows,
-        export.bytes,
-        export.truncated,
-        started.elapsed()
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// 跨层小校验：游标可以直接放进 `RequestFilter`（序列化/反序列化形状由
 /// `Cursor` 的 serde 派生保证），`FromRow` 也能按列名解出总量行。
 #[test]
