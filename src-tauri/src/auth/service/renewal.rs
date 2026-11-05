@@ -244,8 +244,15 @@ impl AuthService {
         if !self.still_current(epoch).await {
             return false;
         }
-        if let Err(err) = self.store.save_async(&current).await {
-            warn!(error = %err, "续期后保存凭据失败（内存已更新）");
+        // 写盘还要过"代次大门"：`still_current` 与真正拿锁写盘之间有窗口
+        // （`save_async` 要排队进阻塞线程池），期间发生的注销必须让这次写盘作废。
+        // 不能改用"提交失败就删刚写的文件"：续期与"注销后重新登录"可并发，
+        // 补删会误删新会话刚写出的凭据。
+        let generation = self.store.credential_generation();
+        match self.store.save_async_if(generation, &current).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(err) => warn!(error = %err, "续期后保存凭据失败（内存已更新）"),
         }
         let committed = self
             .commit_if_current(epoch, |state| {

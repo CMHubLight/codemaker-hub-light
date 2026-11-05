@@ -174,3 +174,19 @@ describe('Login AuthKey 直登', () => {
     expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'password')
   })
 })
+
+describe('Login 注销告警', () => {
+  it('logout_warning_is_visible：注销后磁盘凭据没清干净的告警必须显示在登录页', () => {
+    const message = '退出登录未能清除本地凭据（凭据文件读写失败：拒绝访问）。'
+    render(
+      <Login
+        previewMode={false}
+        initialStatus={{ ...AUTH_UNAUTHENTICATED, message }}
+        onAuthenticated={vi.fn()}
+        onPreviewSignIn={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText(/未能清除本地凭据/)).toBeInTheDocument()
+  })
+})

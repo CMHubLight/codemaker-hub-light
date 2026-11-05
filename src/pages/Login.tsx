@@ -38,8 +38,14 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
     }
     return null
   })
-  /** 非致命提示（轮询重试、浏览器未自动打开等）。 */
-  const [notice, setNotice] = useState<string | null>(null)
+  /** 非致命提示（轮询重试、浏览器未自动打开、注销后磁盘残留告警等）。 */
+  const [notice, setNotice] = useState<string | null>(() => {
+    // 刚注销完落到登录页：后端可能没能清干净本地凭据，必须让用户看见。
+    if (initialStatus?.state === 'unauthenticated' && initialStatus.message) {
+      return initialStatus.message
+    }
+    return null
+  })
   const [session, setSession] = useState<LoginSession | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [manualUrl, setManualUrl] = useState('')
@@ -362,7 +368,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
             </p>
           )}
 
-          {phase === 'waiting' && notice ? (
+          {notice && phase !== 'error' ? (
             <p className="login-notice" role="status">
               {notice}
             </p>

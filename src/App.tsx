@@ -145,12 +145,16 @@ export default function App() {
 
   async function handleLogout() {
     const outcome = await runLogout()
-    if (outcome.status === 'error') {
-      // 即使命令失败也回到未登录界面，避免把用户困在已登录态。
-      setAuthError(outcome.error.raw)
-    }
+    // 注销结果里的告警（例如磁盘上的凭据没删干净）必须跟着登录态带到登录页；
+    // 不能再塞进 authError —— 那只在"连不上后端"的失败屏里显示。
+    const warning =
+      outcome.status === 'ok'
+        ? (outcome.data.message ?? null)
+        : outcome.status === 'error'
+          ? outcome.error.raw
+          : null
     setPreviewSignedIn(false)
-    setAuth(UNAUTHENTICATED)
+    setAuth({ ...UNAUTHENTICATED, message: warning })
     setPage('dashboard')
     bumpData()
     bumpQuota()

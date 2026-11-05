@@ -30,7 +30,7 @@ use tokio::{
     sync::{oneshot, Mutex, RwLock},
     task::JoinHandle,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tauri::Manager;
 
@@ -792,6 +792,170 @@ mod tests {
             "注销后代理不得再拿到旧 token"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 注销屏障：删除失败要可见、残留密文要清掉、续期不得把凭据写回来
+    // -----------------------------------------------------------------------
+
+    fn sample_credentials() -> Credentials {
+        Credentials {
+            access_token: "test-access-token".to_string(),
+            auth_key: Some("test-auth-key".to_string()),
+            user: "tester".to_string(),
+            server_url: "https://api.example.test".to_string(),
+            issued_at: 1,
+            expires_at: 2,
+        }
+    }
+
+    /// 凭据文件删不掉时：内存态照旧退出，但必须把原因通过 `message` 交给界面。
+    #[tokio::test]
+    async fn logout_reports_incomplete_delete() {
+        let (service, dir) = temp_service();
+        service
+            .store
+            .save(&sample_credentials())
+            .expect("写凭据应成功");
+        service.load_strict().await.expect("严格加载应成功");
+
+        // 用同名目录占住 auth.bin，让 `fs::remove_file` 必然失败。
+        let path = service.store.path().to_path_buf();
+        fs::remove_file(&path).expect("先删掉真实文件");
+        fs::create_dir_all(&path).expect("目录应可创建");
+
+        let update = service.logout().await;
+
+        assert_eq!(update.status.state, "unauthenticated", "内存态必须已退出");
+        assert!(!service.has_credentials().await);
+        let message = update.status.message.unwrap_or_default();
+        assert!(
+            message.contains("未能清除本地凭据"),
+            "删除失败必须对用户可见：{message}"
+        );
+
+        fs::remove_dir_all(&path).expect("清理占位目录");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 主密钥没了 + 密文还在（注销只删掉了主密钥）：启动时不能自动登录。
+    ///
+    /// 残留密文本身不可解密，因此不需要（也不应该）在这里删文件：
+    /// "读盘 → 发现没密钥 → 删文件"与并发的登录写盘有竞争，可能删掉新会话的凭据。
+    /// 下次正常登录会原子覆盖这个文件，错误自然消失。
+    #[tokio::test]
+    async fn load_strict_missing_key_does_not_autologin() {
+        struct WriteOnlyKey;
+
+        impl crate::auth::store::MasterKeySource for WriteOnlyKey {
+            fn get(&self) -> Result<Option<[u8; 32]>, crate::auth::store::StoreError> {
+                // 主密钥"已不存在"：模拟注销先删主密钥、后删文件失败。
+                Ok(None)
+            }
+
+            fn get_or_create(&self) -> Result<[u8; 32], crate::auth::store::StoreError> {
+                Ok([7u8; 32])
+            }
+
+            fn delete(&self) -> Result<(), crate::auth::store::StoreError> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("chl-auth-orphan-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("临时目录应可创建");
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        crate::db::run_migrations(&db).expect("迁移应成功");
+        let store = CredentialStore::with_key_source(&dir, Box::new(WriteOnlyKey));
+        store.save(&sample_credentials()).expect("写盘应成功");
+        assert!(store.exists());
+
+        let service = AuthService::with_store(db, store);
+        let err = service
+            .load_strict()
+            .await
+            .expect_err("主密钥缺失必须报错，不能自动登录");
+
+        assert!(matches!(err, AuthError::Store(_)), "应是存储错误：{err}");
+        assert!(!service.has_credentials().await, "不得载入任何凭据");
+        assert_eq!(
+            service.status().await.state,
+            "unauthenticated",
+            "必须停在未登录，不能自动登录成上一个人"
+        );
+        assert!(
+            service.store.exists(),
+            "残留密文保持原样（删除会与并发登录竞争）"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "续期在途时注销"：注销必须赢——磁盘上不得留下可用凭据。
+    ///
+    /// 本机 mock 网关在**响应续期请求之前**执行注销，复现"注销发生在续期写盘之前/期间"。
+    #[tokio::test]
+    async fn logout_during_renew_leaves_no_credentials_file() {
+        use std::sync::Arc;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let (service, dir) = temp_service();
+        service
+            .store
+            .save(&sample_credentials())
+            .expect("写凭据应成功");
+        service.load_strict().await.expect("严格加载应成功");
+
+        let service = Arc::new(service);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("应可绑定");
+        let addr = listener.local_addr().expect("应可读取地址");
+        let server_service = Arc::clone(&service);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if request.starts_with("POST /renew_token") {
+                    // 注销发生在续期响应之前：写盘必须被代次守卫丢弃。
+                    server_service.logout().await;
+                    let body = r#"{"token":"renewed-token","expire":1700172800}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                } else {
+                    // `/get_auth_key` 等：404 让调用方回落到已存的 auth_key。
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let _ = service.retry_renewal(&format!("http://{addr}")).await;
+
+        assert!(
+            !service.store.exists(),
+            "注销之后不得留下 auth.bin（在途续期写盘必须被丢弃）"
+        );
+        assert!(!service.has_credentials().await, "注销后不得再有凭据");
+        assert_eq!(
+            service.status().await.state,
+            "unauthenticated",
+            "状态必须停在已退出"
+        );
+
+        server.abort();
         let _ = fs::remove_dir_all(&dir);
     }
 }
