@@ -10,7 +10,7 @@
 |---|---|
 | 账号登录（浏览器 + 深链回调）与凭据加密保存、自动续期 | Agent 编排、聊天会话、技能/插件市场 |
 | 本地 HTTP 代理：把 Anthropic / OpenAI 请求转发到上游网关并注入账号凭据 | 跨协议之外的模型路由决策（由上游网关决定） |
-| 用量统计：逐请求 token/费用、日聚合、额度快照、CSV 导出 | 自动更新、定时任务、通知推送 |
+| 用量统计：逐请求 token/费用、日聚合、额度快照、请求列表 | 自动更新、定时任务、通知推送 |
 
 它是一个**桌面壳 + 常驻后台服务**：Tauri 主进程里同时跑 WebView2 前端、Axum 本地代理和 SQLite 访问层。关闭窗口不退出进程，代理继续服务。
 
@@ -22,7 +22,7 @@ flowchart LR
     subgraph Main["Tauri 主进程（Rust）"]
       AUTH["auth<br/>登录 / 续期 / validate"]
       PROXY["proxy<br/>Axum :15721"]
-      USAGE["usage<br/>聚合 / 导出"]
+      USAGE["usage<br/>聚合 / 列表"]
       DB[("SQLite<br/>WAL")]
       TRAY["tray / window"]
     end
@@ -31,7 +31,7 @@ flowchart LR
     CLIENT["Claude Code / Codex / SDK"]
     GW["上游网关（需自行配置）"]
   end
-  WV -->|"Tauri IPC 20 个命令 + 6 个事件"| Main
+  WV -->|"Tauri IPC 19 个命令 + 6 个事件"| Main
   CLIENT -->|"HTTP 127.0.0.1:15721"| PROXY
   PROXY -->|"注入凭据后转发"| GW
   AUTH -->|"登录 / 校验 / 续期 / 额度"| GW
@@ -58,8 +58,8 @@ flowchart LR
 | `auth` | 登录、凭据加密、`/validate`、续期、额度 | `auth/*` |
 | `proxy` | HTTP 服务、路由、转发、协议翻译、用量解析 | `proxy/*` |
 | `db` | 连接池、迁移、仓储、维护清理 | `db/*` |
-| `usage` | 聚合、请求列表、CSV 导出 | `usage/*` |
-| `commands` | 20 个 IPC 命令 | `commands/*` |
+| `usage` | 聚合、请求列表 | `usage/*` |
+| `commands` | 19 个 IPC 命令 | `commands/*` |
 | `tray` / `window` | 托盘图标与 tooltip、主窗口显示与"关闭即隐藏" | `tray/*`、`window.rs` |
 | `deep_link` | scheme 注册、回调监听、二次启动转发 | `deep_link.rs` |
 | `compat` | Windows/MSVC 旧工具链的 CRT 链接垫片 | `compat/msvc_crt.rs` |
@@ -78,7 +78,7 @@ flowchart LR
 | 6 | 安装托盘 | 视为致命：没有托盘时关闭窗口将无法恢复 |
 | 7 | 监听深链回调；scheme 注册丢到线程池（不阻塞） | 仅告警，可用手动粘贴兜底 |
 | 8 | 派生后台任务：凭据懒加载、代理启动、保留期清理（启动后一次 + 每 24h） | 记录错误并继续 |
-| 9 | 注册 20 个 IPC 命令，进入事件循环 | — |
+| 9 | 注册 19 个 IPC 命令，进入事件循环 | — |
 
 每个阶段用 `bootstrap::PhaseTimer` 记一行 `phase` / `elapsed_ms`，启动慢时先看这几行日志。
 

@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
+## [未发布]
+
+### 移除
+
+- **移除「导出 CSV」功能**：请求页不再提供导出入口，后端 `usage_export_csv` 命令与整条导出链路一并删除（`usage::queries::export_csv`、`db::repo::export_rows_stream`、`db::rows::UsageExportRow`、`db::sql::usage_export`、`state::exports_dir`，以及前端 `UsageExportResult` / `CommandName` 成员 / mock 分支）。IPC 命令数 20 → 19；数据库结构与设置项不变，历史已导出的 `exports/*.csv` **不会被删除**，需要时请手动清理该目录。
+
+### 修复
+
+- **注销后本地凭据可能复活（安全）**：`store.delete` 现在**先删系统凭据库主密钥、再删 `auth.bin`**，两侧都尝试、不短路；`logout` 失败会重试一次，仍失败则写 `error!` 并在登录页以提示条告知（不再静默报告"已退出"）。同时给凭据写盘加了**代次守卫**（`CredentialStore::generation` + `save_if`）：注销之后才到达的登录/续期写盘一律作废，不会再把 `auth.bin` 写回来。启动时若发现"主密钥已没了、密文还在"，只会报 `KeyringMissing` 并要求重新登录——不会再出现"注销后下次启动自动登录成上一个人"。
+
 ## [0.1.1] - 2026-10-30
 
 ### 新增

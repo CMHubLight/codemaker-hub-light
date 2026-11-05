@@ -1,6 +1,6 @@
 # 用量统计
 
-> 这篇讲代理把请求写进本地库的时机与字段、token 四元组的归一规则、费用从哪里来怎么换算，以及账号级与本机级两种口径的区别、本地日、聚合保留、分页与 CSV 导出规则；给要读用量数字或改统计代码的维护者看。
+> 这篇讲代理把请求写进本地库的时机与字段、token 四元组的归一规则、费用从哪里来怎么换算，以及账号级与本机级两种口径的区别、本地日、聚合保留与分页规则；给要读用量数字或改统计代码的维护者看。
 
 ## 1. 请求是怎么被记录的
 
@@ -80,7 +80,7 @@ cost_yuan = round(total_credit × credit_to_yuan, 8)
 | 数据来源 | `GET /api/v1/user_quota/usage?quota_type=global`、`GET /vega/user_hourly_cost` | `usage_daily`、`proxy_session_requests` |
 | 覆盖范围 | 该账号在上游网关的全部用量（含不经本机代理的客户端） | 只覆盖经本机代理转发的请求 |
 | 时间窗 | 月度额度由服务端 `period_start` / `reset_day` 决定；小时费用是最近 24 小时快照 | 今天 / 本地月 1 号起 / 最近 30 天，全部按**本地日** |
-| 单位 | 积分（额度、已用、剩余、本月消耗、模型分布、24h 曲线） | 元（今日费用、30 天曲线、请求明细、CSV） |
+| 单位 | 积分（额度、已用、剩余、本月消耗、模型分布、24h 曲线） | 元（今日费用、30 天曲线、请求明细） |
 | 存储 | `quota_snapshots` 只存快照（含 `raw_json`），不参与本地聚合 | `usage_daily` 是唯一聚合源 |
 | 能否相加 | 不能 | 不能 |
 
@@ -129,8 +129,6 @@ UPDATE proxy_session_requests
 
 `cutoff = 今天 - (retention_days - 1)`，即保留期包含当天；`day_local IS NULL` 的异常行一律保留。有删除时最后执行一次 `ANALYZE`，否则大删除后查询计划会继续按旧估算选索引。
 
-`exports/` 下的 CSV 不在这套清理里，保留期改小不会删掉已导出的文件。
-
 ## 7. 请求页分页：keyset
 
 排序键是 `r.day_local DESC, r.started_at DESC, r.id DESC`。`day_local` 放在最前面才能命中 `ix_psr_day_started_id`，`id` 作为最后一级 tie-break 保证游标严格唯一。
@@ -149,23 +147,7 @@ UPDATE proxy_session_requests
 
 非法筛选值（未知协议、未知状态）会返回参数错误，而不是静默退回「不过滤」；空串按未选择处理。
 
-## 8. CSV 导出
-
-| 项目 | 规则 |
-| --- | --- |
-| 数据源 | `usage_daily`（维度行），不是逐请求明细 |
-| 表头 | UTF-8 BOM + `day,api_format,model,client,request_count,error_count,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_yuan` |
-| 时间范围 | 只按日期区间（`from_day` / `to_day`，含端点），**不应用**协议 / 状态 / 关键字筛选 |
-| 缺省区间 | 最近 30 天（含今天）；起点晚于终点直接报错 |
-| 行数上限 | `MAX_EXPORT_ROWS`=200000，超过则只写到上限并标 `truncated` |
-| 费用格式 | 固定 4 位小数（`{:.4}`），与界面 `round4` 一致 |
-| 公式中和 | 以 `=`、`+`、`-`、`@`、制表符、回车开头的单元格前置单引号；中和后再判断是否需要加引号并把 `"` 翻倍 |
-| 写盘方式 | 逐行从 SQLite 读、逐行写 `BufWriter`，内存与行数无关 |
-| 文件名与落地 | `exports/usage_{from}_{to}.csv`；先写 `.csv.part` 再改名，同名旧文件先删 |
-
-因为是流式写盘，导出中途失败不会把上一次成功的文件截成半截。
-
-## 9. 界面单位
+## 8. 界面单位
 
 | 位置 | 来源 | 单位 | 格式化 |
 | --- | --- | --- | --- |
@@ -180,11 +162,10 @@ UPDATE proxy_session_requests
 | 请求明细的费用列 | `proxy_request_costs.cost_yuan` | 元 | `formatYuan`（¥ + 4 位） |
 | 请求明细的「首字节」列 | `proxy_session_requests.first_byte_ms` | 毫秒 | `formatDuration`；仅流式请求有值，非流式为 `—` |
 
-## 10. 已知边界（待验证）
+## 9. 已知边界（待验证）
 
 - 请求明细的「客户端」列固定显示 `unknown`：列表查询没有关联 `proxy_sessions.client`，聚合层直接写死。
 - 请求明细的「首字节」列口径是**首个上游响应字节**（收到第一个 SSE chunk 的时间），不是"首 token"；非流式请求不记录、显示 `—`。不要把它与"首 token 耗时（TTFT）"直接对比，两者计时终点不同。
-- CSV 导出仍是 `usage_daily` 的日聚合，不含逐请求首字节/总耗时；需要逐请求延迟请看请求明细页。
 - `cost_source=estimated` 只有枚举与注释，没有写入路径；看到非 `upstream` / `none` 的值应视为数据异常。
 - `QuotaInfo.currency` 后端固定序列化为 `CNY`，但界面按「积分」展示同一批字段；以上游口径为准，字段名是否该改（待验证）。
 - 账号级「本月」与本地「本月」的月界在跨时区场景下必然不同，两个数字不可互相校验。

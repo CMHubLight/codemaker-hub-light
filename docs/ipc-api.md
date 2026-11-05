@@ -1,6 +1,6 @@
 # IPC 命令与事件
 
-> 这篇讲前端能调用的 20 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
+> 这篇讲前端能调用的 19 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
 
 ## 约定
 
@@ -18,11 +18,11 @@
 |---|---|
 | 默认（未单独列出） | 10s（`DEFAULT_COMMAND_TIMEOUT_MS`） |
 | `auth_login_with_auth_key` | 60s（登录含 token 交换 + validate + 模型目录 + 额度） |
-| `auth_start_login`、`auth_submit_deep_link`、`auth_retry_renewal`、`quota_get`、`proxy_restart`、`usage_export_csv` | 30s |
+| `auth_start_login`、`auth_submit_deep_link`、`auth_retry_renewal`、`quota_get`、`proxy_restart` | 30s |
 | `app_open_logs` | 15s |
 | `auth_poll_status` | 10s（显式配置，与默认一致） |
 
-超时只让**界面止损**，不取消后端任务：Tauri 的 `invoke` 没有取消机制，写操作（导出 CSV、重启代理、保存设置）可能仍在后台跑完。超时抛 `CommandTimeoutError`，消息包含命令名与秒数，提示“若这是写操作，它可能仍在后台执行”。
+超时只让**界面止损**，不取消后端任务：Tauri 的 `invoke` 没有取消机制，写操作（重启代理、保存设置）可能仍在后台跑完。超时抛 `CommandTimeoutError`，消息包含命令名与秒数，提示“若这是写操作，它可能仍在后台执行”。
 
 ### 错误分类
 
@@ -50,10 +50,9 @@ usage_summary
 cost_trend_get
 usage_requests
 usage_request_detail
-usage_export_csv
 ```
 
-命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前收录 18 个：`auth_refresh_validate` 与 `usage_request_detail` 已注册但未进入该类型、界面也未调用（`auth_refresh_validate` 的注释写明“预留给设置页检查登录状态”）。
+命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前收录 18 个：`usage_request_detail` 已注册但未进入该类型、界面也未调用；`auth_refresh_validate` 在类型里但当前没有调用点（源码注释写明“预留给设置页检查登录状态”）。
 
 ## 命令明细
 
@@ -109,13 +108,11 @@ usage_export_csv
 | `cost_trend_get` | `range: string`（`24h` / `30d`） | `CostTrend` | 10s | `不支持的费用曲线范围：…`、`读取本机费用趋势失败：…` |
 | `usage_requests` | `filter?: RequestFilter` | `RequestPage` | 10s | `读取请求列表失败：…`（含 `未知的协议筛选值` / `未知的状态筛选值`） |
 | `usage_request_detail` | `id: number` | `RequestDetail \| null` | 10s | `读取请求详情失败：…` |
-| `usage_export_csv` | `fromDay?: string`、`toDay?: string` | `UsageExportResult` | 30s | 日期参数错误返回 `Err`；导出失败返回 `Ok(saved: false, message: …)` |
 
 - `usage_summary` 在一个读事务里跑 5 个查询（今日、本月、近 30 天、本月模型分布、最近 10 条请求），保证页面内数字同快照。
 - `cost_trend_get("24h")` 打上游小时费用接口，返回积分（`source = cloud`、`unit = points`）；`"30d"` 读本机 `usage_daily`，返回人民币（`source = local`、`unit = cny`），缺失日期补 0。
 - `usage_requests` 默认 `limit = 50`（上限 200），`offset` 上限 100000；优先用 `after` 游标（keyset），`include_total = false` 时跳过 `COUNT` 并让 `total = -1`。排序键是 `(day_local, started_at, id)`，游标原样传回即可翻页。
 - `usage_request_detail` 返回正文、费用明细等；正文默认未记录时为 `null`。该命令目前界面未使用。
-- `usage_export_csv` 默认导出最近 30 天（含今天），只按日期区间过滤、不套用列表里的协议/状态筛选；写到 `exports/usage_<from>_<to>.csv`，带 UTF-8 BOM，单次上限 20 万行，超出时 `truncated = true`。
 
 ### 主要返回类型
 
@@ -131,7 +128,6 @@ usage_export_csv
 | `UsageTotals` | `requests`、四类 token、`total_tokens`、`cost_yuan`、`cache_hit_rate`、`avg_latency_ms`、`error_rate`（无数据为 `null`） |
 | `RecentRequest` | `id`、`created_at`、`model`、`protocol`、`client`、`status`、`latency_ms`、`first_byte_ms`（首个上游响应字节，仅流式请求有值）、`input_tokens`、`output_tokens`、`cost_yuan` |
 | `RequestPage` | `total`（`-1` 表示未统计）、`items`、`next_cursor`、`prev_cursor` |
-| `UsageExportResult` | `saved`、`path`、`message`、`rows`、`bytes`、`truncated` |
 | `OpenLogsResult`（前端 `AppLogResult`） | `opened`、`message`、`path` |
 
 ## 事件清单
@@ -165,7 +161,7 @@ app://second-instance
 | 应用外壳（启动、登录态、退出登录、失败屏） | `auth_status`、`auth_logout`、`app_open_logs` | 全部 6 个（合并刷新后再分发） |
 | 登录页 | `auth_start_login`、`auth_login_with_auth_key`、`auth_poll_status`、`auth_submit_deep_link` | `auth://state`、`auth://callback` |
 | 概览 | `quota_get`（普通读与手动 `force` 刷新）、`usage_summary`、`cost_trend_get` | `quota://updated` 驱动额度与 24h 曲线；其余事件经合并刷新 |
-| 请求 | `usage_requests`、`usage_export_csv` | 无直接订阅，由外壳的合并刷新触发表格回第一页 |
+| 请求 | `usage_requests` | 无直接订阅，由外壳的合并刷新触发表格回第一页 |
 | 设置 | `settings_get`、`settings_update`、`proxy_status`、`proxy_restart`、`app_info`、`app_open_logs`、`auth_retry_renewal`（账户面板手动续期） | 无直接订阅，代理状态与应用信息按外壳 revision 刷新 |
 | 未接入界面 | `auth_refresh_validate`、`usage_request_detail` | — |
 
@@ -179,19 +175,19 @@ mock 的关键行为：
 - 登录：`auth_start_login` 返回 `login_url: ''`，登录页据此提示“需在桌面端登录”；`auth_login_with_auth_key` 在预览模式直接抛错（不会伪造登录成功）；认证类命令统一返回 `unauthenticated` 状态的 mock 快照（含 `mock-poll-uuid`）；
 - 额度：`quota_get` 返回 `null`，页面按“暂无额度数据”处理；
 - 用量：`usage_summary` 返回全 0 且比率为 `null`；`cost_trend_get` 回显传入的 `range`，`24h` 标为 `cloud/points`、`30d` 标为 `local/cny`，`points` 为空；`usage_requests` 返回 `total: 0`；
-- 写操作：`settings_update` 直接把补丁合并进内存（不做后端校验），`proxy_restart` 把 mock 状态改成运行中并重置 `started_at` / `uptime_secs`，`usage_export_csv` 返回 `saved: false`（“浏览器预览模式没有本地数据库，导出不可用”），`app_open_logs` 返回 `opened: false`；
+- 写操作：`settings_update` 直接把补丁合并进内存（不做后端校验），`proxy_restart` 把 mock 状态改成运行中并重置 `started_at` / `uptime_secs`，`app_open_logs` 返回 `opened: false`；
 - 事件：`useTauriEvent` 在 `isTauri()` 为假时直接 return，不发起 `listen`。
 
 ## 源码索引
 
 | 路径 | 用到的内容 |
 |---|---|
-| `src-tauri/src/lib.rs` | `generate_handler!` 的 20 个命令、单实例事件发射 |
+| `src-tauri/src/lib.rs` | `generate_handler!` 的 19 个命令、单实例事件发射 |
 | `src-tauri/src/commands/app.rs` | `app_info` / `app_open_logs` 的返回结构与错误 |
 | `src-tauri/src/commands/settings.rs` | `settings_get` / `settings_update` |
 | `src-tauri/src/commands/auth.rs` | 认证命令、`auth://state` 与 `quota://updated` 发射点 |
 | `src-tauri/src/commands/proxy.rs` | `proxy_status` / `proxy_restart`、`proxy://status` |
-| `src-tauri/src/commands/usage.rs` | 用量命令的参数校验、导出区间与返回 |
+| `src-tauri/src/commands/usage.rs` | 用量命令的参数校验与返回 |
 | `src-tauri/src/bootstrap.rs` | `proxy://status` / `proxy://error`、启动期 `auth://state` |
 | `src-tauri/src/deep_link.rs` | `auth://callback` 发射与 `auth://state` 补发 |
 | `src-tauri/src/auth/service/loops.rs` | 后台循环发射 `auth://state` / `quota://updated` |
