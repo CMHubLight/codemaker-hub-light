@@ -145,6 +145,7 @@ Release installers are intended to be signed through SignPath Foundation: **free
 |---|---|
 | `v0.1.0` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
 | `v0.1.1` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
+| `v0.2.0` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
 | Next releases | Signed by SignPath Foundation after manual approval |
 
 The certificate is issued to SignPath Foundation, so Windows shows `SignPath Foundation` as the publisher. Verify a download with `Get-AuthenticodeSignature` or `signtool verify /pa`, or compare the SHA-256 published with each release.

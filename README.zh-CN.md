@@ -211,6 +211,7 @@ print(resp.choices[0].message.content)
 |---|---|
 | `v0.1.0` | **未签名**——请用 Release 说明里的 SHA-256 校验，或从 tag 源码自行构建 |
 | `v0.1.1` | **未签名**——请用 Release 说明里的 SHA-256 校验，或从 tag 源码自行构建 |
+| `v0.2.0` | **未签名**——请用 Release 说明里的 SHA-256 校验，或从 tag 源码自行构建 |
 | 后续版本 | 经维护者人工批准后由 SignPath Foundation 签名 |
 
 证书签发给 SignPath Foundation，因此 Windows 上显示的签名者是 `SignPath Foundation`。可用 `Get-AuthenticodeSignature` 或 `signtool verify /pa` 验签，也可比对每次发布附带的 SHA-256。
