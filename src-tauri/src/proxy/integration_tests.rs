@@ -400,7 +400,18 @@ struct TestProxy {
     server: ProxyServer,
     base_url: String,
     db: Db,
-    data_dir: PathBuf,
+    /// 最后一个字段：`Drop` 在 `server`/`db` 之后执行，句柄释放后再删目录，漏调
+    /// `shutdown()` 的用例也不会在 `%TEMP%` 留下 `chl-proxy-it-*`。
+    cleanup: TempDirCleanup,
+}
+
+/// 析构时重试删除临时目录（Windows 句柄释放可能滞后）。
+struct TempDirCleanup(PathBuf);
+
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        crate::test_util::remove_dir_all_retry(&self.0);
+    }
 }
 
 async fn free_port() -> u16 {
@@ -439,14 +450,25 @@ async fn start_proxy_with_cell(
         server,
         base_url: status.base_url,
         db,
-        data_dir,
+        cleanup: TempDirCleanup(data_dir),
     }
 }
 
 impl TestProxy {
     async fn shutdown(self) {
-        self.server.stop().await;
-        let _ = std::fs::remove_dir_all(&self.data_dir);
+        // 先停服务、再放掉数据库句柄，最后交给 cleanup 删目录：Windows 上句柄
+        // 未释放时 `remove_dir_all` 会失败，历史上一度在 %TEMP% 留下数千个
+        // chl-proxy-it-*（完全没调用 shutdown 的用例也由 TestProxy 的 Drop 兜底）。
+        let TestProxy {
+            server,
+            db,
+            cleanup,
+            ..
+        } = self;
+        server.stop().await;
+        drop(server);
+        drop(db);
+        drop(cleanup);
     }
 }
 

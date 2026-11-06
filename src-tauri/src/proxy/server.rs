@@ -453,28 +453,34 @@ mod tests {
         }
     }
 
-    fn test_server(tag: &str) -> ProxyServer {
+    fn test_server(tag: &str) -> (ProxyServer, std::path::PathBuf) {
         let data_dir =
             std::env::temp_dir().join(format!("chl-proxy-{tag}-{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("临时目录应可创建");
         let db = Db::open(&data_dir.join("test.db")).expect("数据库应可打开");
-        ProxyServer::with_provider(data_dir, db, Arc::new(NoopProvider))
+        (
+            ProxyServer::with_provider(data_dir.clone(), db, Arc::new(NoopProvider)),
+            data_dir,
+        )
     }
 
     #[tokio::test]
     async fn status_reports_stopped_with_configured_values() {
-        let server = test_server("status");
+        let (server, data_dir) = test_server("status");
         let status = server
             .status("127.0.0.1", 15721, "https://example.test")
             .await;
         assert!(!status.running);
         assert_eq!(status.port, 15721);
         assert!(status.health_url.ends_with("/health"));
+
+        drop(server);
+        crate::test_util::remove_dir_all_retry(&data_dir);
     }
 
     #[tokio::test]
     async fn rejects_non_loopback_bind() {
-        let server = test_server("bind");
+        let (server, data_dir) = test_server("bind");
         let err = server
             .start(
                 "0.0.0.0",
@@ -485,5 +491,8 @@ mod tests {
             .await
             .expect_err("非回环地址必须拒绝");
         assert!(matches!(err, ProxyError::NonLoopback(_)));
+
+        drop(server);
+        crate::test_util::remove_dir_all_retry(&data_dir);
     }
 }
