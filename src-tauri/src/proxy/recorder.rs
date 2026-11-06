@@ -423,7 +423,8 @@ mod tests {
             "日聚合必须与请求行同一天"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
     }
 
     /// 并发首次请求：两个请求同时首次进入时，旧的 SELECT-then-INSERT 会撞唯一索引，
@@ -481,7 +482,8 @@ mod tests {
             "费用累加应完整：{cost}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
     }
 
     #[test]
@@ -536,7 +538,8 @@ mod tests {
         );
         assert_eq!(scalar_i64(&db, "SELECT request_count FROM usage_daily"), 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
     }
 
     #[test]
@@ -567,7 +570,8 @@ mod tests {
         );
         assert!(outcome.request_id > 0);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
     }
 
     #[test]
@@ -584,7 +588,8 @@ mod tests {
             scalar_text(&db, "SELECT error_kind FROM proxy_session_requests").as_deref(),
             Some("upstream_error")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
     }
 
     /// `ErrorKind::as_str` 是数据库文本的唯一来源，改名/新增必须让这里失败。

@@ -27,6 +27,8 @@ pub(crate) mod settings_store;
 mod shutdown;
 mod startup;
 pub(crate) mod state;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub(crate) mod tray;
 pub mod usage;
 mod window;
