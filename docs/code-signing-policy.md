@@ -66,7 +66,7 @@ GitHub 与 SignPath 两端均需启用双因素认证（MFA）；申请前请按
 | 属性 | 要求值 | 当前产物 |
 |---|---|---|
 | `ProductName` | `CodeMaker Hub Light` | ✅ |
-| `ProductVersion` | `<version>`（如 `0.1.1`） | ✅ |
+| `ProductVersion` | `<version>`（如 `0.2.0`） | ✅ |
 
 产物配置模板见 [`.github/signpath/artifact-configuration.xml`](../.github/signpath/artifact-configuration.xml)，在 SignPath 项目里作为 Artifact Configuration 导入（slug 建议 `nsis-installer`）。
 
@@ -123,14 +123,14 @@ This program will not transfer any information to other networked systems unless
 
 ```powershell
 # 1) 查看签名状态与签名者
-Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.1.1_x64-setup.exe |
+Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.0_x64-setup.exe |
   Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
 
 # 2) 用 signtool 严格校验（需要 Windows SDK）
-signtool verify /pa /v CodeMaker-Hub-Light_0.1.1_x64-setup.exe
+signtool verify /pa /v CodeMaker-Hub-Light_0.2.0_x64-setup.exe
 
 # 3) 对照 Release 说明里的 SHA-256
-Get-FileHash .\CodeMaker-Hub-Light_0.1.1_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\CodeMaker-Hub-Light_0.2.0_x64-setup.exe -Algorithm SHA256
 ```
 
 期望结果（签名生效后）：`Status = Valid`，签名者证书主体含 `SignPath Foundation`，且带可信时间戳。未签名时 `Status = NotSigned`。
