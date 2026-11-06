@@ -402,7 +402,7 @@ struct TestProxy {
     db: Db,
     /// 最后一个字段：`Drop` 在 `server`/`db` 之后执行，句柄释放后再删目录，漏调
     /// `shutdown()` 的用例也不会在 `%TEMP%` 留下 `chl-proxy-it-*`。
-    cleanup: TempDirCleanup,
+    _cleanup: TempDirCleanup,
 }
 
 /// 析构时重试删除临时目录（Windows 句柄释放可能滞后）。
@@ -450,25 +450,22 @@ async fn start_proxy_with_cell(
         server,
         base_url: status.base_url,
         db,
-        cleanup: TempDirCleanup(data_dir),
+        _cleanup: TempDirCleanup(data_dir),
     }
 }
 
 impl TestProxy {
-    async fn shutdown(self) {
-        // 先停服务、再放掉数据库句柄，最后交给 cleanup 删目录：Windows 上句柄
-        // 未释放时 `remove_dir_all` 会失败，历史上一度在 %TEMP% 留下数千个
-        // chl-proxy-it-*（完全没调用 shutdown 的用例也由 TestProxy 的 Drop 兜底）。
-        let TestProxy {
-            server,
-            db,
-            cleanup,
-            ..
-        } = self;
-        server.stop().await;
-        drop(server);
-        drop(db);
-        drop(cleanup);
+    /// 只负责停止代理，并给分离任务留出退出的调度机会。
+    ///
+    /// 临时目录交给 `cleanup` 字段在 `TestProxy` 析构时删除。`#[tokio::test]` 默认是
+    /// 单线程运行时：`spawn_producer` 这类分离任务只有遇到 await 点才会被调度；它们
+    /// 持有 `RoutesState`（内含 DB 句柄），不退出就删不掉目录（Windows 报“文件被占用”）。
+    async fn shutdown(&self) {
+        self.server.stop().await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
