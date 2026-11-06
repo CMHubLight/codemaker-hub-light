@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
-## [未发布]
+## [0.2.0] - 2026-11-06
 
 ### 移除
 
@@ -11,6 +11,10 @@
 ### 修复
 
 - **注销后本地凭据可能复活（安全）**：`store.delete` 现在**先删系统凭据库主密钥、再删 `auth.bin`**，两侧都尝试、不短路；`logout` 失败会重试一次，仍失败则写 `error!` 并在登录页以提示条告知（不再静默报告"已退出"）。同时给凭据写盘加了**代次守卫**（`CredentialStore::generation` + `save_if`）：注销之后才到达的登录/续期写盘一律作废，不会再把 `auth.bin` 写回来。启动时若发现"主密钥已没了、密文还在"，只会报 `KeyringMissing` 并要求重新登录——不会再出现"注销后下次启动自动登录成上一个人"。
+
+### 安全
+
+- **依赖安全升级**：`vite` 6.4.4 → 6.4.5（npm advisory，开发依赖）、`tokio` 1.54.0 → 1.54.1（Cargo advisory）。两者都是 Dependabot 标记的 medium 级告警，升级后对应告警已关闭；无 API 与行为变化，`pnpm verify`、`cargo test` 与 `pnpm tauri build` 均通过。
 
 ## [0.1.1] - 2026-10-30
 
@@ -51,5 +55,6 @@
 - 账号级数字来自上游网关，可能包含其他设备的用量，不能与本机请求明细对账。
 - AuthKey 直登要求兼容网关实现 `POST /api/v2/tokens`；未实现的网关可在登录页改用浏览器登录。
 
+[0.2.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.0
 [0.1.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.1
 [0.1.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.0

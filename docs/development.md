@@ -78,7 +78,7 @@ Tauri v2 的 release 可执行文件需要 `custom-protocol` feature 才会内�
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.1.1_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 ### 5.2 `panic = "abort"` 的连带影响

@@ -47,7 +47,7 @@ Artifacts:
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.1.1_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.0_x64-setup.exe
 ```
 
 > Do **not** run `cargo build --release` on its own: Tauri needs the `custom-protocol` feature to embed the frontend. See [development notes](docs/development.md).
