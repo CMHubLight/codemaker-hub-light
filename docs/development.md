@@ -50,7 +50,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 `docs` job 检查四件事：
 
-1. **敏感信息**：内网域名、公司/部门名、个人账号与姓名、本机用户目录的绝对路径、来源说明用语、内部错误码。
+1. **敏感信息**：本机用户目录的绝对路径、企业/内网域名形状、个人邮箱域名、常见凭据形状（`sk-`、`ghp_`、私钥块）、组织/业务单元类标识字样。**具体厂商与个人词表不入库**：维护者可在本地用 `REDACTION_TERMS_FILE=<gitignored 文件>` 指向一份逐行词表做更严格的扫描，CI 只跑通用规则。
 2. **禁止入库的路径**：不随仓库分发的外部材料与旧版产品文档。
 3. **链接**：所有 Markdown 相对链接必须指向**已纳入版本库**的文件。
 4. **文档与代码一致**：`docs/ipc-api.md`、`docs/settings.md`、`docs/data-model.md`、`docs/proxy.md` 里的清单块必须与代码逐项相等。
@@ -158,6 +158,17 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 | GitHub → Variables | `SIGNPATH_PROJECT_SLUG`、`SIGNPATH_SIGNING_POLICY_SLUG`、`SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` | 与上面三个 slug 对应 |
 
 工作流启动时会先检查这 5 个变量/密钥是否齐全，缺一个就直接失败并提示。
+
+两条加固纪律：
+
+- **签名 token 只挂 step 级**：`SIGNPATH_*` 只出现在「检查配置」step 的 `env:` 与「提交签名请求」step 的 `with:`，不要写成 job 级 `env:`——同一 job 里的 `pnpm install` / `pnpm tauri build` 会执行第三方构建脚本（`pnpm-workspace.yaml` 允许 esbuild 的 postinstall），job 级环境变量对它们可读。
+- **第三方 Action 固定 commit SHA**，不使用浮动 tag/分支。升级时：
+
+  ```powershell
+  git ls-remote https://github.com/actions/checkout "refs/tags/v7^{}"
+  ```
+
+  把输出的 40 位 SHA 替换到 `.github/workflows/*.yml`，并更新行尾的 `# v7` 注释；`dtolnay/rust-toolchain` 固定的是 `stable` 分支当时的提交，升级后同时更新注释里的日期。
 
 ### 9.2 每次发布
 

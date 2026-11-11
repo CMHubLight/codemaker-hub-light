@@ -10,18 +10,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# 默认 GITHUB_TOKEN 只读：CI 只需要读仓库内容（写权限只留给签名工作流）。
+permissions:
+  contents: read
+
 jobs:
   frontend:
     name: 前端（typecheck / lint / test / build）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           version: 11
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: pnpm
@@ -49,13 +55,17 @@ jobs:
     # Tauri 在 Windows 上的链接依赖 MSVC 与 WebView2，windows-latest 均自带。
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支，2026-11-11
+        with:
+          # SHA 固定后不再跟随上游更新；显式声明 toolchain 避免默认值漂移。
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
 
@@ -72,9 +82,11 @@ jobs:
     name: 文档与脱敏门禁
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
 
