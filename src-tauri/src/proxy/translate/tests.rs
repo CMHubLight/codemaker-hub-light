@@ -132,7 +132,7 @@ fn translates_stream_text_events_in_order() {
     for chunk in chunks {
         out.extend(translator.push(chunk.as_bytes()));
     }
-    out.extend(translator.finish());
+    out.extend(translator.finish(false));
     let text = String::from_utf8(out).expect("应是 UTF-8");
     let order = [
         "event: message_start",
@@ -166,7 +166,7 @@ fn translates_stream_tool_call_events() {
     for chunk in chunks {
         out.extend(translator.push(chunk.as_bytes()));
     }
-    out.extend(translator.finish());
+    out.extend(translator.finish(false));
     let text = String::from_utf8(out).expect("应是 UTF-8");
     assert!(text.contains("\"type\":\"tool_use\""));
     assert!(text.contains("\"name\":\"read\""));
