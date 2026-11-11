@@ -54,7 +54,7 @@ sequenceDiagram
     SVC-->>UI: auth://state（+ quota://updated）
 ```
 
-轮询与深链是两条兜底：任一条先完成登录，另一条随后到达会被判为重复而静默忽略。`finish_login` 用 `login_serial` 互斥锁单飞，深链与轮询同时成功时只会做一遍 `/validate` 与落盘。
+轮询与深链是两条兜底：任一条先完成登录，另一条随后到达会被判为重复而静默忽略。`finish_login` 用 `login_serial` 互斥锁单飞，深链与轮询同时成功时只会做一遍 `/validate` 与落盘。单飞只挡"同时发生"；**串行错开的旧结果**由登录绑定挡住：轮询与深链的收尾必须仍绑定发起时的 `pending.poll_uuid`，当前 pending 已换人（用户取消后重新登录、或另一条登录已提交）时旧结果一律静默作废——不发网络后续请求、不写 `auth.bin`、不改状态。
 
 发起登录的细节（`start_login`）：
 
@@ -64,6 +64,8 @@ sequenceDiagram
 - 浏览器唤起失败不报错，`opened_browser=false`，登录页展示链接供复制。
 
 登录完成（`finish_login`）的顺序固定为：`/validate` → 并发取模型目录与续期 key → 组装并加密写盘 → 提交内存状态 → 写账号档案 → 拉额度。额度失败不影响登录，只保留上次快照。
+
+收尾全程做三次同一组校验（入口、写盘前、提交时）：`epoch` 未变（注销即作废），且（轮询/深链）`pending.poll_uuid` 仍是本次登录。两者语义不同：`epoch` 变化表示已注销，锁外已写出的凭据要补偿删除；pending 变化表示被新登录取代，此时磁盘上的 `auth.bin` 可能已属于新会话，**不能删**。AuthKey 直登不建立 pending，只受 `epoch` 约束。
 
 ## 2.1 AuthKey 直登（账号 + AuthKey）
 

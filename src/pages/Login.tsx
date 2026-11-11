@@ -452,12 +452,18 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
                 {authKeyError}
               </p>
             ) : null}
+            {phase === 'waiting' ? (
+              // 两种登录入口并存时，AuthKey 提交会与浏览器轮询的收尾竞争同一个
+              // 登录代次。后端已把收尾绑定到 pending 的 poll_uuid，这里再从 UI 上
+              // 避免用户误以为可以"同时换一种方式登录"。
+              <p className="hint">等待浏览器登录中；如需改用 AuthKey，请先取消等待。</p>
+            ) : null}
             <div className="login-actions">
               <button
                 type="button"
                 className="btn btn--primary btn--block"
                 onClick={() => void submitAuthKeyLogin()}
-                disabled={authKeyBusy}
+                disabled={authKeyBusy || phase === 'waiting'}
               >
                 {authKeyBusy ? '登录中…' : 'AuthKey 登录'}
               </button>

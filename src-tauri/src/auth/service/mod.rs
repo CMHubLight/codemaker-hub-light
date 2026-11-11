@@ -73,6 +73,32 @@ pub struct AuthUpdate {
     pub quota_updated: bool,
 }
 
+/// 登录收尾是否仍被允许的判定结果。
+///
+/// `epoch` 只由注销推进，`start_login` / `commit_login` 都不推进它，因此
+/// "旧轮询早发出、晚返回"仅靠 epoch 挡不住；轮询与深链还必须绑定到发起时的
+/// `poll_uuid`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoginBinding {
+    /// 代次未变，且（若来自轮询/深链）仍是当前 pending 的同一次登录。
+    Fresh,
+    /// 已被新的登录会话（或"取消等待后重新登录"）取代：静默作废，不落盘、不改状态。
+    Superseded,
+    /// 会话已注销：按 [`AuthError::SessionEnded`] 处理，锁外写盘由调用方补偿删除。
+    Ended,
+}
+
+/// [`AuthService::commit_login`] 的提交结果（区分"注销"与"被取代"）。
+///
+/// 两者都必须放弃本次收尾，但补偿动作不同：注销要删掉锁外写入的凭据，
+/// 被取代时那份文件可能已经属于新的登录，**不能删**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoginCommit {
+    Committed,
+    Superseded,
+    Ended,
+}
+
 #[derive(Debug, Default, Clone)]
 struct RenewRuntime {
     last_success_at: Option<DateTime<Utc>>,
@@ -165,6 +191,29 @@ impl AuthService {
         self.state.read().await.epoch == epoch
     }
 
+    /// 本次登录收尾是否仍被允许（epoch + pending 绑定）。
+    ///
+    /// `expected_poll` 为 `None` 表示 AuthKey 直登：它不建立 pending，只受 epoch 约束。
+    /// 轮询与深链必须传发起时拿到的 `poll_uuid`——当前 pending 已换成另一次登录
+    /// （或已被取消/提交）时返回 [`LoginBinding::Superseded`]，调用方必须静默作废。
+    pub(super) async fn login_binding(
+        &self,
+        epoch: u64,
+        expected_poll: Option<uuid::Uuid>,
+    ) -> LoginBinding {
+        let state = self.state.read().await;
+        if state.epoch != epoch {
+            return LoginBinding::Ended;
+        }
+        let Some(expected) = expected_poll else {
+            return LoginBinding::Fresh;
+        };
+        match state.pending.as_ref() {
+            Some(pending) if pending.poll_uuid == expected => LoginBinding::Fresh,
+            _ => LoginBinding::Superseded,
+        }
+    }
+
     /// 在"代次未变"的前提下修改状态；返回 `None` 表示会话已作废、闭包未执行。
     ///
     /// 两个纪律：
@@ -195,14 +244,23 @@ impl AuthService {
             return None;
         }
         let credentials = state.credentials.as_ref()?;
+        // `serverUrl` 来自服务端响应，不能因为它是"登录返回的"就当成可信网关：
+        // 代理侧还有一道同样的校验（`routes::forward::effective_gateway`），这里
+        // 先在源头挡掉明文非回环地址，避免它被透传成转发目标。
+        let gateway_url = state
+            .profile
+            .as_ref()
+            .map(|profile| profile.server_url.clone())
+            .unwrap_or_default();
+        let gateway_url = if crate::settings::gateway_url_is_acceptable(&gateway_url) {
+            gateway_url
+        } else {
+            String::new()
+        };
         Some(crate::auth::CredentialsSnapshot {
             access_token: credentials.access_token.clone(),
             user: credentials.user.clone(),
-            gateway_url: state
-                .profile
-                .as_ref()
-                .map(|profile| profile.server_url.clone())
-                .unwrap_or_default(),
+            gateway_url,
         })
     }
 
@@ -667,11 +725,156 @@ mod tests {
         };
         // 网关地址指向不可达主机；代次检查在 gateway() 之前，因此不会真的发请求。
         let result = service
-            .finish_login(stale_epoch, "https://example.test", tokens)
+            .finish_login(stale_epoch, "https://example.test", tokens, None)
             .await;
 
         assert!(matches!(result, Err(AuthError::SessionEnded)));
         assert!(!service.store.exists(), "被放弃的完成请求不能落盘凭据");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 旧轮询晚于新登录提交时必须被忽略：不落盘、不改状态、不清掉新的 pending。
+    ///
+    /// 这是 `auth_poll_status` 覆盖 AuthKey/新登录的回归用例：`finish_login`
+    /// 只校验 epoch 与 login_serial 时，这里会以旧账号的凭据覆盖并清空 pending。
+    #[tokio::test]
+    async fn late_poll_after_new_login_is_ignored_without_writing_credentials() {
+        let (service, dir) = temp_service();
+        let first = service
+            .start_login("https://example.test")
+            .await
+            .expect("首次登录应可发起");
+        let second = service
+            .start_login("https://example.test")
+            .await
+            .expect("第二次登录应可发起");
+        let epoch = service.epoch().await;
+        let tokens = LoginTokens {
+            access_token: "stale-access-token".to_string(),
+            auth_key: None,
+            user: Some("alice".to_string()),
+            server_url: None,
+            expires_at: None,
+        };
+
+        let update = service
+            .finish_login(epoch, "https://example.test", tokens, Some(first.poll_uuid))
+            .await
+            .expect("被取代的收尾应静默作废，而不是报错");
+
+        assert_eq!(update.status.state, "pending");
+        let expected_uuid = second.poll_uuid.to_string();
+        assert_eq!(
+            update.status.pending_poll_uuid.as_deref(),
+            Some(expected_uuid.as_str()),
+            "新的 pending 不能被旧轮询清掉"
+        );
+        assert!(!service.has_credentials().await);
+        assert!(!service.store.exists(), "被取代的收尾不得写盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 转发快照不得携带不合法的 serverUrl（明文非回环），合法 https 原样保留。
+    #[tokio::test]
+    async fn snapshot_drops_unacceptable_server_url() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        let profile = AuthProfile {
+            user: "alice".to_string(),
+            display_name: None,
+            dept: None,
+            server_url: "http://10.0.0.5:8080".to_string(),
+            issued_at: None,
+            expires_at: None,
+        };
+        service
+            .commit_if_current(epoch, |state| {
+                state.credentials = Some(sample_credentials());
+                state.profile = Some(profile);
+            })
+            .await
+            .expect("代次未变应可写");
+
+        let snapshot = service.credentials_snapshot().await.expect("应有凭据快照");
+        assert_eq!(
+            snapshot.gateway_url, "",
+            "明文非回环 serverUrl 不得进入转发快照"
+        );
+
+        // 合法的 https 地址必须原样保留（否则代理会无谓回退设置网关）。
+        let epoch = service.epoch().await;
+        service
+            .commit_if_current(epoch, |state| {
+                state.profile.as_mut().expect("应有账号档案").server_url =
+                    "https://api.example.test".to_string();
+            })
+            .await
+            .expect("代次未变应可写");
+        let snapshot = service.credentials_snapshot().await.expect("应有凭据快照");
+        assert_eq!(snapshot.gateway_url, "https://api.example.test");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 提交阶段也要再验绑定：旧收尾即便走到提交，也不能覆盖新登录。
+    #[tokio::test]
+    async fn commit_login_rejects_superseded_binding() {
+        use super::login::LoginArtifacts;
+        use super::LoginCommit;
+
+        let (service, dir) = temp_service();
+        let first = service
+            .start_login("https://example.test")
+            .await
+            .expect("首次登录应可发起");
+        let second = service
+            .start_login("https://example.test")
+            .await
+            .expect("第二次登录应可发起");
+        let epoch = service.epoch().await;
+        let profile = AuthProfile {
+            user: "alice".to_string(),
+            display_name: None,
+            dept: None,
+            server_url: "https://example.test".to_string(),
+            issued_at: Some(1),
+            expires_at: Some(2),
+        };
+
+        let rejected = service
+            .commit_login(
+                epoch,
+                Some(first.poll_uuid),
+                LoginArtifacts {
+                    credentials: sample_credentials(),
+                    profile: profile.clone(),
+                    models: Vec::new(),
+                    offline_grace: false,
+                    now: Utc::now(),
+                },
+            )
+            .await;
+        assert_eq!(rejected, LoginCommit::Superseded);
+        assert!(!service.has_credentials().await, "被取代的提交不能写入凭据");
+
+        let committed = service
+            .commit_login(
+                epoch,
+                Some(second.poll_uuid),
+                LoginArtifacts {
+                    credentials: sample_credentials(),
+                    profile,
+                    models: Vec::new(),
+                    offline_grace: false,
+                    now: Utc::now(),
+                },
+            )
+            .await;
+        assert_eq!(committed, LoginCommit::Committed);
+        assert_eq!(service.status().await.state, "authenticated");
+        assert!(service.has_credentials().await);
 
         let _ = fs::remove_dir_all(&dir);
     }
