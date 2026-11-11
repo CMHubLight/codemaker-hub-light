@@ -3,8 +3,10 @@
  * 公开仓库门禁（零依赖，只用 Node 内置模块 + git）。
  *
  * 四项检查：
- *   1. 敏感信息：内网域名、公司名、个人账号、本机路径、逆向过程用语；
- *   2. 路径：逆向证据与旧版文档不得进入版本库；
+ *   1. 敏感信息：本机绝对路径、企业/内网域名形状、个人邮箱域名、常见凭据形状、
+ *      公司/事业部字样；具体厂商与个人词表不入库，维护者可用
+ *      REDACTION_TERMS_FILE 指向一份 gitignored 词表追加；
+ *   2. 路径：本地参考材料与旧版文档不得进入版本库；
  *   3. 链接：Markdown 相对链接必须指向版本库内的真实文件；
  *   4. 文档与代码一致：IPC 命令 / 事件 / 设置键 / 数据表 / 代理路由逐项对账。
  *
@@ -64,32 +66,39 @@ function compareSet(scope, docLabel, docItems, codeLabel, codeItems) {
 
 // ---------------------------------------------------------------- 1. 敏感信息
 
-// 关键字拆开拼接，避免脚本自身被扫到（脚本在扫描时也被排除）。
-const words = {
-  vendorDomain: ['nie', 'netease', 'com'].join('\\.'),
-  vendor: ['net', 'ease'].join(''),
-  cnVendor: '\u7f51\u6613',
-  businessUnit: '\u4e8b\u4e1a\u7fa4',
-  personalAccount: ['cheng', 'ziqian'].join(''),
-  personalName: '\u6210\u5b50\u8c26',
-  capture: '\u6293\u5305',
-  internalCode: 'SIG' + '001'
+// 只保留"形状类"通用规则。具体厂商/个人/内部标识**不写进仓库**：否则为了保护
+// 仓库反而把它保护的词公开了。维护者本地可设 REDACTION_TERMS_FILE 指向一份
+// gitignored 词表（每行一个词，# 开头为注释）做更严格的扫描；CI 只跑通用规则。
+const GENERIC_TERMS = [
+  ['本机绝对路径', /C:\\Users\\/i],
+  ['企业/内网域名', /\.(?:internal|intra|corp)\b/i],
+  ['公司/事业部字样', /事业部|事业群/],
+  ['个人邮箱域名', /@(?:qq|163|126|gmail|outlook)\.com/i],
+  ['API 凭据形状', /\b(?:sk-[A-Za-z0-9]{20,}|(?:ghp|gho|ghs)_[A-Za-z0-9]{20,})\b/],
+  ['私钥块', /-----BEGIN [A-Z ]*PRIVATE KEY-----/]
+]
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** 读取本地词表（可选，不随仓库分发）。 */
+function localTerms() {
+  const file = process.env.REDACTION_TERMS_FILE
+  if (!file || !existsSync(file)) return []
+  return readFileSync(file, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
 }
 
 const FORBIDDEN = [
-  ['内网域名', new RegExp(words.vendorDomain, 'i')],
-  ['公司域名', new RegExp(words.vendor, 'i')],
-  ['公司名', new RegExp(words.cnVendor)],
-  ['部门名', new RegExp(words.businessUnit)],
-  ['个人账号', new RegExp(words.personalAccount, 'i')],
-  ['个人姓名', new RegExp(words.personalName)],
-  ['本机绝对路径', /C:\\Users\\/i],
-  ['逆向过程用语', new RegExp(words.capture)],
-  ['内部错误码', new RegExp(words.internalCode)]
+  ...GENERIC_TERMS,
+  ...localTerms().map((term) => ['本地词表', new RegExp(escapeRegExp(term), 'i')])
 ]
 
-/** 允许出现关键字的文件：本脚本与 .gitignore 需要用它来阻挡这些字符串。 */
-const SCAN_EXEMPT = new Set([SELF, '.gitignore'])
+/** 允许出现关键字的文件：本脚本自身（它必须写出这些规则）。 */
+const SCAN_EXEMPT = new Set([SELF])
 
 // ---------------------------------------------------------------- 主流程
 
@@ -116,11 +125,11 @@ for (const relPath of files) {
 
 // 2. 禁止入库的路径
 const FORBIDDEN_PATHS = [
-  [/^research\//, '逆向证据目录'],
+  [/^research\//, '本地参考材料目录'],
   [/^docs\/appendix\//, '旧版文档（附录）'],
   [/^docs\/review\//, '内部评审记录'],
   [/^docs\/design\//, '旧版设计文档'],
-  [/^docs\/\d{2}-/, '原版产品功能文档']
+  [/^docs\/\d{2}-/, '旧版功能文档']
 ]
 for (const relPath of files) {
   for (const [pattern, label] of FORBIDDEN_PATHS) {
