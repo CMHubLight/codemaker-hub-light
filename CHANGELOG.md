@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
+## [0.2.1] - 2026-11-11
+
+### 修复
+
+- **下游停读导致流式请求永久挂住**：响应生产者原来的两处 `tx.send().await` 写在 `select!` 之外。客户端停读（TCP 零窗口）把 16 槽通道塞满后，写出永久 Pending，300 s 上游空闲超时因 await 点不在 `select!` 内而完全失效——任务不结束、上游连接与内存不释放、该请求也永不落库。现在两处写出统一走 `send_with_idle_deadline`，与上游读取共享同一个 deadline，失败按 `client_aborted` / `timeout` 落库。
+- **上游中途断流被伪装成完整回复**：`/v1/messages` 翻译路由在上游中途断开或空闲超时后会补 `content_block_stop` + `message_delta`（usage 全 0）+ `message_stop`，客户端看到的是"成功且完整"的回复，实际是被截断的答案，并按 0 token 记账。现在 `StreamTranslator::finish(failed)` 区分结束原因：失败路径关闭已开内容块后发 `event: error`，不再发 `message_delta` / `message_stop`；"上游一帧都没有"的空流语义保持不变。
+- **已登录时一次认证状态刷新失败会打回失败屏**：`app://second-instance` 或深链回调触发的 `auth_status` 失败（含 10 s 超时）会把内存里的有效登录态覆盖成 error 占位并置 `bootFailed`，直接切到全屏"无法连接本地后端"，页面内的筛选与未保存编辑随之丢失。现在只有"尚没有任何有效登录"时才进入失败屏，其余情况显示内联"登录状态异常"并保留当前界面。
+- **请求页翻页失败后页码与内容错配**：`useAsyncResource` 按设计在失败时保留旧数据，页面又把旧页的 `next_cursor` 当作兜底继续前进，于是出现"第 3 页显示第 2 页内容"和重复游标 `[null, c1, c1]`。资源返回值现在携带所属查询 `key`，只有当前页的响应才参与渲染与前进；失败页显示错误与重试，不再复用上一页行。
+- **浅色主题对比度不达 WCAG AA**：`--text-muted` 在 `--bg` / `--bg-subtle` 上仅 2.79:1 / 2.66:1，`--success` 在 `--success-soft` 上 4.37:1，`.pill--info` 也不足 4.5:1。分别调整为 5.0:1 / 5.4:1，并新增对比度回归测试防止回退。
+
+### 安全
+
+- **rustls-webpki 0.103.15 → 0.103.16**（RUSTSEC-2026-0382 / CVE-2026-111943）：证书校验可能接受已吊销的中间 CA。该 crate 由 `reqwest → hyper-rustls → rustls` 引入，正是发布产物里校验网关证书的那一层。
+- **rusqlite 0.32 → 0.41、r2d2_sqlite 0.25 → 0.36**，带入 `libsqlite3-sys 0.39.1`（SQLite 3.54.1），修掉 RUSTSEC-2026-0459 / CVE-2026-119375（构造的 `-wal` 可让普通查询返回进程内存残留）。无代码改动。
+- `cargo audit` 结果为 0 漏洞（剩余 6 条均为 glib / zbus / proc-macro-error 等 Linux-only 或构建期依赖的 informational 告警）。
+
+### 工程
+
+- 新增回归测试：`send_with_idle_deadline_times_out_when_receiver_stalls`、`broken_upstream_stream_emits_error_without_message_stop`（替换原先"钉住旧行为"的用例）、`src/App.test.tsx`、请求页失败翻页用例、浅色主题对比度用例。
+- `docs/proxy.md` 的翻译语义与排障表同步到"失败收尾发 `event: error`、写出同样受 idle 超时约束"。
+
 ## [0.2.0] - 2026-11-06
 
 ### 移除
@@ -55,6 +76,7 @@
 - 账号级数字来自上游网关，可能包含其他设备的用量，不能与本机请求明细对账。
 - AuthKey 直登要求兼容网关实现 `POST /api/v2/tokens`；未实现的网关可在登录页改用浏览器登录。
 
+[0.2.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.1
 [0.2.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.0
 [0.1.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.1
 [0.1.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.0
