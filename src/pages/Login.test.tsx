@@ -173,6 +173,28 @@ describe('Login AuthKey 直登', () => {
     fireEvent.click(screen.getByRole('button', { name: '隐藏' }))
     expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'password')
   })
+
+  it('authkey_login_is_disabled_while_waiting_for_browser', async () => {
+    vi.useFakeTimers()
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_start_login') return LOGIN_SESSION
+      if (command === 'auth_poll_status') return AUTH_PENDING
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    const { onAuthenticated } = renderAuthKeyPage()
+
+    fireEvent.click(screen.getByRole('button', { name: '登录' }))
+    await flushMicrotasks()
+
+    expect(screen.getByText(/等待浏览器登录中/)).toBeInTheDocument()
+    const authKeyButton = screen.getByRole('button', { name: 'AuthKey 登录' })
+    expect(authKeyButton).toBeDisabled()
+
+    fireEvent.click(authKeyButton)
+    await flushMicrotasks()
+    expect(invokeMock).not.toHaveBeenCalledWith('auth_login_with_auth_key', expect.anything())
+    expect(onAuthenticated).not.toHaveBeenCalled()
+  })
 })
 
 describe('Login 注销告警', () => {

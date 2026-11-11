@@ -70,7 +70,11 @@ impl AuthService {
                 .await;
                 Ok(self.make_update(None, false).await)
             }
-            Ok(PollOutcome::Success(tokens)) => self.finish_login(epoch, gateway_url, tokens).await,
+            Ok(PollOutcome::Success(tokens)) => {
+                // 收尾必须绑定本次轮询的 poll_uuid：旧轮询晚返回时不能覆盖新登录。
+                self.finish_login(epoch, gateway_url, tokens, Some(pending.poll_uuid))
+                    .await
+            }
             Err(err) => {
                 self.commit_if_current(epoch, |state| {
                     let consecutive_errors = if let Some(current) = state.pending.as_mut() {
@@ -113,6 +117,15 @@ impl AuthService {
     ) -> Result<AuthUpdate, AuthError> {
         self.ensure_loaded().await;
         let epoch = self.epoch().await;
+        // 先记下"本次回调要绑定到哪一次登录"，再做领取：领取与收尾之间若用户
+        // 又发起了新登录，按这里记下的 uuid 校验就会失败并作废本次结果。
+        let binding = self
+            .state
+            .read()
+            .await
+            .pending
+            .as_ref()
+            .map(|pending| pending.poll_uuid);
 
         let Some(verdict) = self
             .commit_if_current(epoch, |state| claim_deep_link(state, payload, Utc::now()))
@@ -163,7 +176,7 @@ impl AuthService {
             expires_at: None,
         };
 
-        match self.finish_login(epoch, gateway_url, tokens).await {
+        match self.finish_login(epoch, gateway_url, tokens, binding).await {
             Ok(update) => Ok(update),
             Err(AuthError::SessionEnded) => {
                 // 完成过程中被注销：保持"已登出"，不要把状态改回 error。
@@ -227,7 +240,8 @@ impl AuthService {
             tokens.user = Some(user.to_string());
         }
         let expected = tokens.access_token.clone();
-        let update = self.finish_login(epoch, gateway_url, tokens).await?;
+        // AuthKey 直登不建立 pending，因此不受 poll_uuid 绑定约束。
+        let update = self.finish_login(epoch, gateway_url, tokens, None).await?;
         // 并发登录（例如另一条 OpenID 收尾）时 finish_login 会静默单飞跳过；
         // AuthKey 路径必须确认本次 token 真的落到了内存，否则不能向界面报成功。
         let current = {
@@ -246,16 +260,39 @@ impl AuthService {
         Ok(update)
     }
 
+    /// 收尾前的绑定检查：`Ok(false)` = 被新登录取代（调用方静默作废，不落盘）。
+    ///
+    /// 注销（epoch 变化）必须仍然返回错误，让调用方走补偿删除与"保持已登出"的语义。
+    async fn login_still_fresh(
+        &self,
+        epoch: u64,
+        expected_poll: Option<uuid::Uuid>,
+    ) -> Result<bool, AuthError> {
+        match self.login_binding(epoch, expected_poll).await {
+            LoginBinding::Fresh => Ok(true),
+            LoginBinding::Superseded => {
+                info!("登录收尾被更新的登录取代，放弃本次轮询/深链结果");
+                Ok(false)
+            }
+            LoginBinding::Ended => Err(AuthError::SessionEnded),
+        }
+    }
+
     /// 登录成功后的落库与状态切换（validate → get_auth_key → 加密保存 → quota）。
+    ///
+    /// `expected_poll`：轮询/深链必须传入发起时拿到的 `poll_uuid`，收尾全程都要
+    /// 确认它仍是当前 pending；AuthKey 直登传 `None`。
     pub(super) async fn finish_login(
         &self,
         epoch: u64,
         gateway_url: &str,
         tokens: LoginTokens,
+        expected_poll: Option<uuid::Uuid>,
     ) -> Result<AuthUpdate, AuthError> {
         // 注销后到达的完成请求：立即放弃，不发网络、不落盘。
-        if !self.still_current(epoch).await {
-            return Err(AuthError::SessionEnded);
+        // 被新登录取代的旧轮询/深链同样放弃；但它不是"注销"，只是本次结果作废。
+        if !self.login_still_fresh(epoch, expected_poll).await? {
+            return Ok(self.make_update(None, false).await);
         }
         // 单飞：深链与轮询可能同时成功，重复做一遍 validate/落盘/额度快照毫无意义。
         let Ok(_serial) = self.login_serial.try_lock() else {
@@ -278,9 +315,10 @@ impl AuthService {
         let now = Utc::now();
         let (credentials, profile) =
             build_login_credentials(tokens, validate_info, auth_key, gateway.base(), now)?;
-        // 落盘前最后一次确认会话仍然有效：注销后绝不能再写出一份凭据。
-        if !self.still_current(epoch).await {
-            return Err(AuthError::SessionEnded);
+        // 落盘前最后一次确认：注销后绝不能再写出一份凭据；被新登录取代时也
+        // 不能覆盖它的 auth.bin（此时尚未写盘，直接放弃即可）。
+        if !self.login_still_fresh(epoch, expected_poll).await? {
+            return Ok(self.make_update(None, false).await);
         }
         // 同样过"代次大门"：注销期间到达的写盘直接放弃（连主密钥都不会重建）。
         let generation = self.store.credential_generation();
@@ -288,20 +326,31 @@ impl AuthService {
             return Err(AuthError::SessionEnded);
         }
 
-        let committed = self
+        let commit = self
             .commit_login(
                 epoch,
-                credentials.clone(),
-                profile.clone(),
-                models.clone(),
-                offline_grace,
-                now,
+                expected_poll,
+                LoginArtifacts {
+                    credentials: credentials.clone(),
+                    profile: profile.clone(),
+                    models: models.clone(),
+                    offline_grace,
+                    now,
+                },
             )
             .await;
-        if committed.is_none() {
-            // 极端窗口：刚写盘就发生注销。删掉刚写的文件，绝不复活凭据。
-            let _ = self.store.delete_async().await;
-            return Err(AuthError::SessionEnded);
+        match commit {
+            LoginCommit::Committed => {}
+            LoginCommit::Superseded => {
+                // 刚写出的 auth.bin 可能已被新登录覆盖：绝不能删，静默作废即可。
+                info!("登录收尾被更新的登录取代，保留新会话写出的凭据");
+                return Ok(self.make_update(None, false).await);
+            }
+            LoginCommit::Ended => {
+                // 极端窗口：刚写盘就发生注销。删掉刚写的文件，绝不复活凭据。
+                let _ = self.store.delete_async().await;
+                return Err(AuthError::SessionEnded);
+            }
         }
 
         let profile_id = self
@@ -379,36 +428,72 @@ impl AuthService {
         (models, auth_key)
     }
 
-    /// 仅在代次未变时提交登录态；`None` 表示注销已发生（调用方负责删掉刚写的凭据）。
-    async fn commit_login(
+    /// 在"代次未变且 pending 绑定仍有效"时提交登录态。
+    ///
+    /// 返回 [`LoginCommit::Ended`] 表示刚写盘就发生注销（调用方负责删掉刚写的凭据）；
+    /// [`LoginCommit::Superseded`] 表示被更新的登录取代（调用方**不能**删文件，
+    /// 那份 auth.bin 可能已经属于新会话）。
+    pub(super) async fn commit_login(
         &self,
         epoch: u64,
-        credentials: Credentials,
-        profile: AuthProfile,
-        models: Vec<ModelSummary>,
-        offline_grace: bool,
-        now: DateTime<Utc>,
-    ) -> Option<()> {
-        self.commit_if_current(epoch, |state| {
-            state.credentials = Some(credentials);
-            state.profile = Some(profile);
-            state.models = models;
-            state.pending = None;
-            state.offline_grace = offline_grace;
-            state.credentials_valid = !offline_grace;
-            state.phase = if offline_grace {
-                AuthPhase::OfflineGrace
-            } else {
-                AuthPhase::LoggedIn
-            };
-            state.last_error =
-                offline_grace.then(|| "登录成功，但 /validate 暂不可用（离线宽限）".to_string());
-            state.last_validated_at = (!offline_grace).then_some(now);
-            state.renew = RenewRuntime::default();
-            state.loaded = true;
-        })
-        .await
+        expected_poll: Option<uuid::Uuid>,
+        artifacts: LoginArtifacts,
+    ) -> LoginCommit {
+        let LoginArtifacts {
+            credentials,
+            profile,
+            models,
+            offline_grace,
+            now,
+        } = artifacts;
+        let committed = self
+            .commit_if_current(epoch, |state| {
+                if let Some(expected) = expected_poll {
+                    let bound = state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.poll_uuid == expected);
+                    if !bound {
+                        return false;
+                    }
+                }
+                state.credentials = Some(credentials);
+                state.profile = Some(profile);
+                state.models = models;
+                state.pending = None;
+                state.offline_grace = offline_grace;
+                state.credentials_valid = !offline_grace;
+                state.phase = if offline_grace {
+                    AuthPhase::OfflineGrace
+                } else {
+                    AuthPhase::LoggedIn
+                };
+                state.last_error = offline_grace
+                    .then(|| "登录成功，但 /validate 暂不可用（离线宽限）".to_string());
+                state.last_validated_at = (!offline_grace).then_some(now);
+                state.renew = RenewRuntime::default();
+                state.loaded = true;
+                true
+            })
+            .await;
+        match committed {
+            None => LoginCommit::Ended,
+            Some(false) => LoginCommit::Superseded,
+            Some(true) => LoginCommit::Committed,
+        }
     }
+}
+
+/// 一次登录收尾要提交的产物。
+///
+/// 打包成结构体而不是继续加参数：`commit_login` 已经需要 epoch / 绑定 / 五份数据，
+/// 单独加参数会越过 clippy 的 7 参数上限，也更容易在调用点接错顺序。
+pub(super) struct LoginArtifacts {
+    pub(super) credentials: Credentials,
+    pub(super) profile: AuthProfile,
+    pub(super) models: Vec<ModelSummary>,
+    pub(super) offline_grace: bool,
+    pub(super) now: DateTime<Utc>,
 }
 
 /// 把 AuthKey 登录的网关错误映射成用户可见错误；不包含响应正文/凭据。
