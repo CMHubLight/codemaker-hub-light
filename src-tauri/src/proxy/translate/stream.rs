@@ -89,16 +89,20 @@ impl StreamTranslator {
         out.into_bytes()
     }
 
-    pub fn finish(&mut self) -> Vec<u8> {
+    pub fn finish(&mut self, failed: bool) -> Vec<u8> {
         let mut out = String::new();
-        if !self.finished && !self.buffer.is_empty() {
+        if !failed && !self.finished && !self.buffer.is_empty() {
             let rest = std::mem::take(&mut self.buffer);
             if let Some(data) = sse_frames::frame_data(&rest) {
                 self.handle_data(data.as_ref(), &mut out);
             }
         }
         if !self.finished {
-            self.finalize(&mut out);
+            if failed {
+                self.fail(&mut out);
+            } else {
+                self.finalize(&mut out);
+            }
         }
         out.into_bytes()
     }
@@ -244,6 +248,25 @@ impl StreamTranslator {
         if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
             block.arguments.push_str(arguments);
         }
+    }
+
+    fn fail(&mut self, out: &mut String) {
+        if self.finished {
+            return;
+        }
+        if !self.started {
+            self.error_event(out, "api_error", "上游流式响应为空");
+            return;
+        }
+        if let Some(index) = self.text_index.take() {
+            push_event(
+                out,
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": index }),
+            );
+        }
+        self.tool_blocks.clear();
+        self.error_event(out, "api_error", "上游流式响应中断");
     }
 
     fn finalize(&mut self, out: &mut String) {

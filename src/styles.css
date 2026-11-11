@@ -20,7 +20,7 @@
   --border-strong: #c9d2e0;
   --text: #1a2233;
   --text-secondary: #58657a;
-  --text-muted: #8b95a8;
+  --text-muted: #58657a;
   /* 历史命名的别名：解析后跟随 --text 的主题取值（登录页粘贴框等使用）。 */
   --text-primary: var(--text);
 
@@ -29,7 +29,7 @@
   --accent-soft: #e8f0ff;
   --accent-soft-border: #c9dbff;
 
-  --success: #15805a;
+  --success: #0b6b48;
   --success-soft: #e2f6ec;
   --warning: #96620f;
   --warning-soft: #fdf3e0;
@@ -1123,7 +1123,7 @@ form .form-actions {
 
 .pill--info {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-hover);
 }
 
 .pill--idle {

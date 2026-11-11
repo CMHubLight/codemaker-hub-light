@@ -129,7 +129,7 @@
 | `tool_result` 块 | 递归其 `content` |
 | `tools` | `description` 字符数 + `input_schema` 的 JSON 序列化字符数 |
 
-非流式响应翻译：`choices[0].message.content` → `text` 块，`tool_calls` → `tool_use` 块（`arguments` 解析失败回 `{}`），`finish_reason` 映射为 `length→max_tokens`、`tool_calls`/`function_call→tool_use`、其余 `end_turn`，`usage` 映射为 `input_tokens`/`output_tokens`/`cache_*`。流式响应由 `StreamTranslator` 状态机把 OpenAI SSE 增量翻译成 Anthropic SSE：`message_start` 里的输入 token 用本地估算值，文本块延迟到首个 delta 才开块，工具参数先按 OpenAI `index` 聚合、结束时按 index 顺序整块输出（避免并行工具造成块交错）。客户端要流式但上游回了 JSON 时，会把该 JSON 合成一次性 SSE；上游返回 `error` 对象、流为空或单帧超过 2 MiB 时，都改为一条 `event: error`。
+非流式响应翻译：`choices[0].message.content` → `text` 块，`tool_calls` → `tool_use` 块（`arguments` 解析失败回 `{}`），`finish_reason` 映射为 `length→max_tokens`、`tool_calls`/`function_call→tool_use`、其余 `end_turn`，`usage` 映射为 `input_tokens`/`output_tokens`/`cache_*`。流式响应由 `StreamTranslator` 状态机把 OpenAI SSE 增量翻译成 Anthropic SSE：`message_start` 里的输入 token 用本地估算值，文本块延迟到首个 delta 才开块，工具参数先按 OpenAI `index` 聚合、结束时按 index 顺序整块输出（避免并行工具造成块交错）。客户端要流式但上游回了 JSON 时，会把该 JSON 合成一次性 SSE；上游返回 `error` 对象、流为空、单帧超过 2 MiB，或上游流在中途断开/空闲超时时，都改为一条 `event: error`（已发出的增量保留，但不会补 `message_stop` 冒充正常完成）。
 
 翻译失败统一返回 400 `invalid_request_error`，message 为具体原因（不是合法 JSON / 请求体必须是 JSON 对象 / 缺少 model / 缺少 messages 数组 / messages 不能为空 / content 类型错误）。
 
@@ -219,7 +219,7 @@
 | `POST /v1/messages` 体有问题 | 400 `invalid_request_error` | 看 message：非法 JSON / 缺 model / messages 为空 / content 类型错误 |
 | 上游 120 s 没回头 | 504 `upstream_timeout`（「上游首字节超时」） | 上游排队或模型太慢；重试或换模型 |
 | 上游返回 302 | 502 `upstream_redirect` | 网关地址配成了会跳转的入口，改成直连地址 |
-| 流式响应突然截断且用量里有 `timeout` | 头已经发出，只能表现为断流 | 上游相邻 chunk 间隔超过 300 s |
+| 流式响应突然截断且用量里有 `timeout` | 翻译路由补一条 `event: error`；透传路由只能表现为断流 | 上游相邻 chunk 间隔超过 300 s，或下游长时间不读（写出同样受该超时约束） |
 | 中途 Ctrl-C | 用量里 `error_kind = client_aborted` | 正常现象，其余请求不受影响 |
 | 请求未知路径 | 404 `not_found` | 响应体里带 `path`，对照路由表 |
 | `GET /v1/models` 返回 503 | `service_unavailable` | 模型目录未缓存：先登录并完成 `/validate`（含 `/models` 别名）|

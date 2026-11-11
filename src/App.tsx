@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useCoalescedRefresh, useCommand } from './lib/async'
 import { useTauriEvent } from './lib/events'
@@ -63,6 +63,13 @@ export default function App() {
   const [bootFailed, setBootFailed] = useState(false)
   /** 浏览器预览（无 Tauri 后端）时允许跳过登录查看界面；仅内存态。 */
   const [previewSignedIn, setPreviewSignedIn] = useState(false)
+  const authRef = useRef<AuthStatus | null>(null)
+  const previewSignedInRef = useRef(false)
+
+  useEffect(() => {
+    authRef.current = auth
+    previewSignedInRef.current = previewSignedIn
+  }, [auth, previewSignedIn])
 
   const { revision: dataRevision, bump: bumpData } = useCoalescedRefresh(50)
   const { revision: quotaRevision, bump: bumpQuota } = useCoalescedRefresh(50)
@@ -81,8 +88,12 @@ export default function App() {
       setBootFailed(false)
     } else {
       setAuthError(outcome.error.raw)
-      setBootFailed(true)
-      setAuth({ ...UNAUTHENTICATED, state: 'error', message: outcome.error.raw })
+      if (authRef.current?.state === 'authenticated' || previewSignedInRef.current) {
+        setBootFailed(false)
+      } else {
+        setBootFailed(true)
+        setAuth({ ...UNAUTHENTICATED, state: 'error', message: outcome.error.raw })
+      }
     }
     setAuthLoading(false)
   }, [runAuthStatus])

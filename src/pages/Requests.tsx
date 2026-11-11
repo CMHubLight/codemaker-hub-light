@@ -50,6 +50,11 @@ interface RequestsProps {
   revision?: number
 }
 
+interface LoadedRequestPage {
+  key: string
+  page: RequestPage
+}
+
 /**
  * 请求页：在本地用量库上做真实筛选与分页（usage_requests）。
  * 错误时保留上次结果并提示重试，不用空表覆盖。
@@ -87,11 +92,12 @@ export function Requests({ revision = 0 }: RequestsProps) {
     page: pageIndex,
     nonce: reloadNonce
   })
-  const pageResource = useAsyncResource(queryKey, () =>
-    invokeCmd<RequestPage>('usage_requests', {
+  const pageResource = useAsyncResource<LoadedRequestPage>(queryKey, async () => ({
+    key: queryKey,
+    page: await invokeCmd<RequestPage>('usage_requests', {
       filter: toRequestFilter(applied, currentCursor, includeTotal)
     })
-  )
+  }))
 
   // 用户查询的结果（成功或失败）落地后收起“查询中…”。
   useEffect(() => {
@@ -100,7 +106,8 @@ export function Requests({ revision = 0 }: RequestsProps) {
 
   // 第一页带回 total；后续页 total = -1 表示“未统计”，沿用已有总数。
   // 派生值优先用当前响应（同帧可见），ref 只作为后续页的兜底。
-  const pageTotal = pageResource.data?.total
+  const pageData = pageResource.data?.key === queryKey ? pageResource.data.page : null
+  const pageTotal = pageData?.total
   const total = pageTotal != null && pageTotal >= 0 ? pageTotal : knownTotalRef.current
   useEffect(() => {
     if (pageTotal != null && pageTotal >= 0) knownTotalRef.current = pageTotal
@@ -141,7 +148,7 @@ export function Requests({ revision = 0 }: RequestsProps) {
 
   function nextPage() {
     // 回退过的页游标还在栈里：前进优先复用，避免再依赖当前页的 next_cursor。
-    const next = cursors[pageIndex + 1] ?? pageResource.data?.next_cursor ?? null
+    const next = cursors[pageIndex + 1] ?? pageData?.next_cursor ?? null
     if (!next) return
     setQuerying(true)
     setCursors((current) => [...current.slice(0, pageIndex + 1), next])
@@ -159,7 +166,6 @@ export function Requests({ revision = 0 }: RequestsProps) {
     resetToFirstPage()
   }
 
-  const pageData = pageResource.data
   const error = pageResource.error
   const loading = pageResource.loading || querying
   const refreshing = pageResource.refreshing && !loading

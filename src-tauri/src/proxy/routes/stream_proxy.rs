@@ -79,6 +79,7 @@ pub(super) fn spawn_producer(
         let mut response_bytes: u64 = 0;
         let mut first_byte_ms = None;
         let mut error_kind: Option<ErrorKind> = None;
+        let mut upstream_failed = false;
         // 只反映"响应侧"是否超限（缓冲上限 / SSE 解析上限）。
         let mut response_truncated = false;
 
@@ -89,12 +90,14 @@ pub(super) fn spawn_producer(
         loop {
             let chunk = tokio::select! {
                 _ = &mut idle_deadline => {
+                    upstream_failed = true;
                     error_kind = Some(ErrorKind::Timeout);
                     break;
                 }
                 next = upstream_stream.next() => match next {
                     None => break,
                     Some(Err(_)) => {
+                        upstream_failed = true;
                         error_kind = Some(ErrorKind::UpstreamError);
                         break;
                     }
@@ -141,8 +144,9 @@ pub(super) fn spawn_producer(
                 if record_body {
                     append_recorded(&mut recorded_response_body, max_recorded_bytes, &outgoing);
                 }
-                if tx.send(Ok(outgoing)).await.is_err() {
-                    error_kind = Some(ErrorKind::ClientAborted);
+                if let Err(kind) = send_with_idle_deadline(&tx, outgoing, &mut idle_deadline).await
+                {
+                    error_kind = Some(kind);
                     break;
                 }
             }
@@ -150,7 +154,7 @@ pub(super) fn spawn_producer(
 
         if let Some(mut translator) = translator {
             let outgoing = if is_sse {
-                translator.finish()
+                translator.finish(upstream_failed)
             } else {
                 let translated = if status_code >= 400 {
                     translate::openai_error_body(&collected)
@@ -172,11 +176,22 @@ pub(super) fn spawn_producer(
                 }
             };
             if !outgoing.is_empty() {
+                if upstream_failed {
+                    idle_deadline
+                        .as_mut()
+                        .reset(TokioInstant::now() + idle_timeout);
+                }
                 response_bytes += outgoing.len() as u64;
                 if record_body {
                     append_recorded(&mut recorded_response_body, max_recorded_bytes, &outgoing);
                 }
-                let _ = tx.send(Ok(Bytes::from(outgoing))).await;
+                if let Err(kind) =
+                    send_with_idle_deadline(&tx, Bytes::from(outgoing), &mut idle_deadline).await
+                {
+                    if error_kind.is_none() {
+                        error_kind = Some(kind);
+                    }
+                }
             }
         }
         drop(tx);
@@ -223,6 +238,17 @@ enum Outgoing {
     Owned(Vec<u8>),
 }
 
+async fn send_with_idle_deadline(
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    bytes: Bytes,
+    idle_deadline: &mut Pin<Box<Sleep>>,
+) -> Result<(), ErrorKind> {
+    tokio::select! {
+        result = tx.send(Ok(bytes)) => result.map_err(|_| ErrorKind::ClientAborted),
+        _ = idle_deadline.as_mut() => Err(ErrorKind::Timeout),
+    }
+}
+
 /// 按录制上限追加响应字节（只截断录制，不影响中继）。
 fn append_recorded(buffer: &mut Vec<u8>, limit: usize, bytes: &[u8]) {
     if buffer.len() >= limit {
@@ -238,4 +264,23 @@ fn parse_buffered(bytes: &[u8], format: ApiFormat, credit_to_yuan: f64) -> (Toke
     };
     let usage = usage_parser::parse_usage(format, &value).unwrap_or_default();
     (usage, usage_parser::parse_cost(&value, credit_to_yuan))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn send_with_idle_deadline_times_out_when_receiver_stalls() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"full")))
+            .await
+            .expect("第一块应填满通道");
+        let mut deadline: Pin<Box<Sleep>> = Box::pin(sleep(Duration::from_millis(1)));
+
+        let result =
+            send_with_idle_deadline(&tx, Bytes::from_static(b"blocked"), &mut deadline).await;
+
+        assert_eq!(result, Err(ErrorKind::Timeout));
+    }
 }

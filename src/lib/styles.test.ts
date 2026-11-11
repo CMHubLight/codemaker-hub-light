@@ -33,4 +33,41 @@ describe('styles.css', () => {
     // 1180 是窄窗口下统计卡变两列的有效断点，必须保留。
     expect(breakpoints).toContain(1180)
   })
+
+  it('light_theme_status_text_keeps_aa_contrast', () => {
+    expect(contrast(token('--text-muted'), token('--bg'))).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(token('--text-muted'), token('--bg-subtle'))).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(token('--success'), token('--success-soft'))).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(token('--accent-hover'), token('--accent-soft'))).toBeGreaterThanOrEqual(4.5)
+  })
 })
+
+const lightRootCss = css.slice(0, css.indexOf('@media (prefers-color-scheme: dark)'))
+
+function token(name: string): string {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = lightRootCss.match(new RegExp(`${escaped}\\s*:\\s*(#[0-9a-f]{6})`, 'i'))
+  if (!match) throw new Error(`缺少浅色主题 token：${name}`)
+  return match[1]
+}
+
+function contrast(foreground: string, background: string): number {
+  const fg = luminance(foreground)
+  const bg = luminance(background)
+  const [light, dark] = fg > bg ? [fg, bg] : [bg, fg]
+  return (light + 0.05) / (dark + 0.05)
+}
+
+function luminance(hex: string): number {
+  const [, r, g, b] = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex) ?? []
+  if (!r || !g || !b) throw new Error(`非法颜色：${hex}`)
+  const [red, green, blue] = [r, g, b].map((part) => channel(Number.parseInt(part, 16)))
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+}
+
+function channel(value: number): number {
+  const normalized = value / 255
+  return normalized <= 0.03928
+    ? normalized / 12.92
+    : ((normalized + 0.055) / 1.055) ** 2.4
+}

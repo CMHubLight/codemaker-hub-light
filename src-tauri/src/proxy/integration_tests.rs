@@ -1467,9 +1467,9 @@ async fn translated_sse_event_sequence_is_stable() {
     proxy.shutdown().await;
 }
 
-/// 上游流中途断开：钉住**当前**事件序列。本轮不改语义；将来若改，必须先显式更新这个断言。
+/// 上游流中途断开：保留已收到的增量，但不能补 `message_stop` 伪装成正常完成。
 #[tokio::test]
-async fn broken_upstream_stream_event_sequence_is_pinned() {
+async fn broken_upstream_stream_emits_error_without_message_stop() {
     let (upstream, _capture, _handle) = start_upstream().await;
     let proxy = start_proxy(
         provider_with_credentials(),
@@ -1501,18 +1501,19 @@ async fn broken_upstream_stream_event_sequence_is_pinned() {
             "content_block_start",
             "content_block_delta",
             "content_block_stop",
-            "message_delta",
-            "message_stop",
+            "error",
         ],
-        "异常结束的当前事件序列（含 message_stop）不得变化：{body}"
+        "异常结束必须对客户端可见，不能发 message_stop：{body}"
     );
     let data = sse_event_data(&body);
     assert_eq!(data[2]["delta"]["text"], "partial");
     assert_eq!(data[3]["index"], 0);
-    assert_eq!(data[5]["type"], "message_stop");
-    // 上游没发 usage，message_delta 里的 usage 全 0。
-    assert_eq!(data[4]["usage"]["input_tokens"], 0);
-    assert_eq!(data[4]["usage"]["output_tokens"], 0);
+    assert_eq!(data[4]["type"], "error");
+    assert_eq!(data[4]["error"]["type"], "api_error");
+    assert!(
+        !body.contains("message_stop"),
+        "断流不得伪装成正常完成：{body}"
+    );
 
     wait_for_requests(&proxy.db, 1).await;
     assert_eq!(
