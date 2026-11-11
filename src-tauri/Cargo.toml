@@ -38,9 +38,10 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 # --- 本地存储 ---
-rusqlite = { version = "0.32", features = ["bundled"] }
+# rusqlite 0.41+ / libsqlite3-sys 0.39+ 才有 SQLite 3.54（RUSTSEC-2026-0459 修复合入）。
+rusqlite = { version = "0.41", features = ["bundled"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.25"
+r2d2_sqlite = "0.36"
 
 # --- 工具 ---
 uuid = { version = "1", features = ["v4", "serde"] }
