@@ -75,6 +75,39 @@ describe('Requests 分页（keyset 游标）', () => {
     expect(screen.queryByText(/第 \d+ \/ 3 页/)).toBeNull()
   })
 
+  it('failed_next_page_does_not_render_previous_rows_under_new_page', async () => {
+    const user = userEvent.setup()
+    const filters: RequestFilter[] = []
+
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== 'usage_requests') throw new Error(`未 mock 的命令：${String(command)}`)
+      const filter = filterOf(args)
+      filters.push(filter)
+      if (filter.after == null) {
+        return {
+          total: 60,
+          items: [request('3', 'model-3'), request('2', 'model-2')],
+          next_cursor: PAGE_ONE_CURSOR,
+          prev_cursor: null
+        }
+      }
+      throw new Error('db busy')
+    })
+
+    render(<Requests revision={0} />)
+    await waitFor(() => expect(screen.getByText('model-3')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: '下一页' }))
+
+    await waitFor(() => expect(screen.getByText(/读取请求列表失败：db busy/)).toBeInTheDocument())
+    expect(screen.queryByText('model-3')).toBeNull()
+    expect(screen.queryByText('model-2')).toBeNull()
+    expect(screen.getByText('请求列表加载失败')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled()
+    expect(filters[1]?.after).toEqual(PAGE_ONE_CURSOR)
+    expect(filters).toHaveLength(2)
+  })
+
   it('cursor_pagination_does_not_duplicate_or_skip：中途插入行也不重复、不跳行', async () => {
     const user = userEvent.setup()
     const filters: RequestFilter[] = []
