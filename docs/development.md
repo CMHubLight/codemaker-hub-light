@@ -78,7 +78,7 @@ Tauri v2 的 release 可执行文件需要 `custom-protocol` feature 才会内�
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.1_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.2_x64-setup.exe
 ```
 
 ### 5.2 `panic = "abort"` 的连带影响
@@ -185,10 +185,10 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 签名私钥在 SignPath 的 HSM 中，本地只能验签：
 
 ```powershell
-Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.1_x64-setup.exe | Format-List Status,SignerCertificate
+Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.2_x64-setup.exe | Format-List Status,SignerCertificate
 ```
 
-不要把任何签名私钥、API Token 或 `.pfx` 提交到仓库。`v0.2.1` 安装包在审批通过前仍是未签名状态，以 Release 说明里的 SHA-256 与 tag 源码为准。
+不要把任何签名私钥、API Token 或 `.pfx` 提交到仓库。`v0.2.2` 安装包在审批通过前仍是未签名状态，以 Release 说明里的 SHA-256 与 tag 源码为准。
 
 ### 9.4 未签名版本的构建、烟雾测试与发布
 

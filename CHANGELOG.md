@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.2.2] - 2026-11-11
 
 ### 修复
 
@@ -90,6 +90,7 @@
 - 账号级数字来自上游网关，可能包含其他设备的用量，不能与本机请求明细对账。
 - AuthKey 直登要求兼容网关实现 `POST /api/v2/tokens`；未实现的网关可在登录页改用浏览器登录。
 
+[0.2.2]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.2
 [0.2.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.1
 [0.2.0]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.0
 [0.1.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.1.1
