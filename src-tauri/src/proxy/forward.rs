@@ -100,6 +100,10 @@ pub const ROUTE_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// 必须剥离的入站头（客户端自带凭据/浏览器上下文/hop-by-hop）。
+///
+/// `accept-encoding` 也在剥离清单里：代理自身不上报压缩能力（reqwest 未启用
+/// gzip/brotli 特性，既不会解压也无法解析压缩后的 usage），因此下面统一注入
+/// `identity`，避免上游压缩导致"客户端正常、本机账务静默记 0"。
 pub const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     "authorization",
     "x-api-key",
@@ -111,6 +115,7 @@ pub const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     "origin",
     "host",
     "content-length",
+    "accept-encoding",
 ];
 
 /// hop-by-hop 头（请求与响应都要去）。
@@ -230,6 +235,12 @@ pub fn build_upstream_headers(
         &format!("Bearer {}", credentials.access_token),
     );
     inject(&mut headers, "x-auth-user", &credentials.user);
+    // 所有路由统一要求上游不压缩：代理的 usage/cost 解析读的是原始 JSON/SSE 字节，
+    // 压缩响应会让解析静默失败（记 0 token）。翻译路由原先单独注入过，现统一在此。
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
     // 不向上游注入代理标识头：部分网关会据此判定为非直连客户端并拒绝。
     headers
 }
@@ -326,6 +337,9 @@ pub fn parse_envelope(body: &[u8]) -> RequestEnvelope {
 }
 
 /// 翻译路由的上游请求头：去掉 Anthropic 专属头，声明 JSON/SSE 期望。
+///
+/// `accept-encoding: identity` 由 [`build_upstream_headers`] 对所有路由统一注入，
+/// 这里不再重复设置（避免两处真理源）。
 pub fn apply_translation_headers(headers: &mut HeaderMap, stream: bool) {
     for name in ["anthropic-version", "anthropic-beta", "x-api-key"] {
         headers.remove(name);
@@ -342,10 +356,6 @@ pub fn apply_translation_headers(headers: &mut HeaderMap, stream: bool) {
         } else {
             "application/json"
         }),
-    );
-    headers.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
     );
 }
 
@@ -410,6 +420,10 @@ mod tests {
         incoming.insert("origin", HeaderValue::from_static("https://x"));
         incoming.insert("host", HeaderValue::from_static("127.0.0.1:15721"));
         incoming.insert("content-length", HeaderValue::from_static("12"));
+        incoming.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflate, br"),
+        );
         incoming.insert("content-type", HeaderValue::from_static("application/json"));
         incoming.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         incoming.insert("x-client-request-id", HeaderValue::from_static("old-id"));
@@ -425,6 +439,12 @@ mod tests {
         assert!(headers.get("content-length").is_none());
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        // 客户端的压缩能力一律丢弃：代理自己解析 usage，必须要求上游不压缩。
+        assert_eq!(
+            headers.get("accept-encoding").unwrap(),
+            "identity",
+            "所有路由都必须强制 accept-encoding: identity"
+        );
         assert_eq!(headers.get("x-access-token").unwrap(), "test-token");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer test-token");
         assert_eq!(headers.get("x-auth-user").unwrap(), "test-user");

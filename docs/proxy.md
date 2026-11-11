@@ -72,7 +72,7 @@
 | 类别 | 头 |
 | --- | --- |
 | 凭据类 | `authorization`、`x-api-key`、`api-key`、`x-goog-api-key`、`x-access-token`、`cookie` |
-| 浏览器/连接类 | `origin`、`host`、`content-length` |
+| 浏览器/连接类 | `origin`、`host`、`content-length`、`accept-encoding` |
 | hop-by-hop | `connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade` |
 
 **注入**（值来自登录态快照，空值跳过）：
@@ -85,7 +85,9 @@
 
 代理**不**向上游注入自身标识头（代码里明确不注入 `downstream-client`，因为部分网关会据此判定为非直连客户端并拒绝）。
 
-翻译路由（`/v1/messages*`）在此之上再改一次：移除 `anthropic-version`、`anthropic-beta`、`x-api-key`、`content-length`，并强制 `content-type: application/json`、`accept: text/event-stream`（流式）或 `application/json`、`accept-encoding: identity`。
+上游网关地址：优先用登录/校验返回的 `serverUrl`，但它必须通过与设置项**相同**的策略——`https://` 允许任意主机，`http://` 只允许本机回环；不合法时回退设置里的 `gateway_url` 并记一条 warn。代理每次转发都会重新校验，不只看协议前缀（否则登录响应里的明文地址会把 token 带去任意主机）。
+
+所有路由都强制 `accept-encoding: identity`：代理自身不启用解压（reqwest 无 gzip/brotli 特性），上游若压缩，客户端仍能正常解码，但代理侧的 usage/cost 解析会拿到压缩字节并静默记 0。日志里出现「上游忽略 accept-encoding: identity」即说明上游仍在压缩，属网关行为。翻译路由（`/v1/messages*`）在此之上再改一次：移除 `anthropic-version`、`anthropic-beta`、`x-api-key`、`content-length`，并强制 `content-type: application/json`、`accept: text/event-stream`（流式）或 `application/json`。
 
 响应头只去 hop-by-hop，其余（含 `content-type`、`content-encoding`）原样透传；翻译路由会额外去掉 `content-length` 与 `content-encoding` 并重设 `content-type`。所有转发响应都会 `append` 一个 `x-hub-request-id`（用 `append` 而非 `insert`，上游若回显同名头则保留多值）。
 
@@ -223,7 +225,7 @@
 | 中途 Ctrl-C | 用量里 `error_kind = client_aborted` | 正常现象，其余请求不受影响 |
 | 请求未知路径 | 404 `not_found` | 响应体里带 `path`，对照路由表 |
 | `GET /v1/models` 返回 503 | `service_unavailable` | 模型目录未缓存：先登录并完成 `/validate`（含 `/models` 别名）|
-| 用量页 token / 费用为 0 | 200，但 usage 为空 | 上游没回 `usage`，或非流式超 8 MiB / SSE 超 2 MiB 已停止解析 |
+| 用量页 token / 费用为 0 | 200，但 usage 为空 | 上游没回 `usage`，或非流式超 8 MiB / SSE 超 2 MiB 已停止解析；若日志有「上游忽略 accept-encoding: identity」，则是网关仍压缩响应 |
 
 ## 源码索引
 

@@ -44,7 +44,7 @@
 | 访问令牌 | `access_token`、`accessToken`、`token` | 是 | 字符串，去首尾空格；缺失即视为「未完成」 |
 | 续期 key | `auth_key`、`authkey`、`access_sso_token`、`sso_token` | 否 | 后续还会被 `/get_auth_key` 覆盖 |
 | 用户标识 | `user`、`access_user`、`username`、`employee_id` | 否 | 缺失时回退 `/validate` 的 `display_name`，两者都没有则登录失败 |
-| 网关地址 | `serverUrl`、`server_url`、`server` | 否 | 只接受 `http(s)`，否则回退设置里的 `gateway_url` |
+| 网关地址 | `serverUrl`、`server_url`、`server` | 否 | 只接受 `https://` 或本机回环 `http://`，否则回退设置里的 `gateway_url` |
 | 过期时间 | `expire`、`expires_at`、`expiresAt`、`expire_at` | 否 | epoch 秒；缺失时按 86400 秒兜底 |
 
 响应可以被 `{"code":0,"data":{...}}` 包裹一层：外层有 `data` 且是对象时只读内层。
@@ -71,7 +71,7 @@
 | 访问令牌 | `access_token`、`accessToken`、`token` | 是 | 缺失/为空视为失败（不会把畸形响应当成登录成功） |
 | 续期 key | `auth_key`、`authkey`、`access_sso_token`、`sso_token` | 否 | 登录后仍会优先用 `/get_auth_key` 的 128 字符 key；取不到才回退这里或本次输入的 AuthKey |
 | 用户标识 | `access_user`、`user`、`username`、`employee_id` | 否 | 缺失时回退本次输入的账号名 |
-| 网关地址 | `server_url`、`serverUrl`、`server` | 否 | 缺失时回退设置里的 `gateway_url` |
+| 网关地址 | `server_url`、`serverUrl`、`server` | 否 | 缺失或不合法时回退设置里的 `gateway_url` |
 | 过期时间 | `expire`、`expires_at`、`expiresAt`、`expire_at` | 否 | epoch 秒；缺失时按 86400 秒兜底 |
 
 该命令成功后仍会走与浏览器登录相同的收尾：`/validate` → 模型目录（`/validate` 未带时补 `/validate/models`）→ `/get_auth_key` → 额度；因此网关需要同时实现上面的端点。
@@ -89,8 +89,8 @@
 | --- | --- | --- |
 | `dept` | `department` | 账号档案里的部门 |
 | `display_name` | `displayName`、`name` | 展示名 |
-| `gateway` | — | 网关地址（优先级低于 `server_url`） |
-| `server_url` | `serverUrl`、`server` | 后续转发优先使用的地址 |
+| `gateway` | — | 网关地址（优先级低于 `server_url`；同样受回环/明文策略约束） |
+| `server_url` | `serverUrl`、`server` | 后续转发优先使用的地址；只接受 `https://` 或本机回环 `http://` |
 | `models` | — | 模型目录（形状见下）；**非空时客户端不再请求** `/validate/models` |
 
 ### `GET /validate/models`
@@ -192,7 +192,7 @@
 
 因此兼容网关最少要实现两个端点：`POST /openai/v1/chat/completions` 与 `POST /openai/v1/responses`。**没有** `/anthropic/...` 这类上游路径——Anthropic 请求是在客户端本地翻译成 OpenAI Chat 之后才发出去的。
 
-网关地址的取值顺序：登录/校验拿到的 `serverUrl`（只接受 `http://` / `https://` 开头）优先，否则用设置里的 `gateway_url`。
+网关地址的取值顺序：登录/校验拿到的 `serverUrl` 优先，但它必须通过**与设置项相同**的策略——`https://` 允许任意主机，`http://` 只允许 `127.0.0.1` / `localhost` / `::1`；不合法时回退设置里的 `gateway_url`。代理在每次转发前重新校验（不只看协议前缀），并在日志里留一条 warn 说明回退原因。
 
 ## 用量元数据
 

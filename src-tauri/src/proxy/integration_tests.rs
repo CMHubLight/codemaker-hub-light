@@ -78,6 +78,21 @@ fn provider_without_credentials() -> Arc<dyn CredentialProvider> {
     })
 }
 
+/// 登录/校验返回的 `serverUrl`：用于验证代理对网关地址的策略校验。
+fn provider_with_gateway(gateway_url: &str) -> Arc<dyn CredentialProvider> {
+    Arc::new(FakeProvider {
+        credentials: Some(CredentialsSnapshot {
+            access_token: "test-access-token".to_string(),
+            user: "test-user".to_string(),
+            gateway_url: gateway_url.to_string(),
+        }),
+        models: vec![ModelSummary {
+            id: "claude-sonnet-4".to_string(),
+            name: None,
+        }],
+    })
+}
+
 // ---------------------------------------------------------------------------
 // mock upstream
 // ---------------------------------------------------------------------------
@@ -1948,6 +1963,128 @@ async fn response_request_id_header_is_appended_not_replaced() {
     );
     assert_eq!(values[0], "upstream-echo");
     assert!(!values[1].is_empty(), "第二个值应是代理生成的请求 id");
+
+    proxy.shutdown().await;
+}
+
+/// P1：登录/校验返回的 `serverUrl` 必须走与设置项同一套网关策略。
+///
+/// 明文 http 指向非回环主机时不能直接当转发目标（token 会明文外发），
+/// 修复前这里会真的去连 `10.0.0.5` 并以 502 结束，且 mock upstream 收不到请求。
+#[tokio::test]
+async fn unacceptable_server_url_falls_back_to_configured_gateway() {
+    let (upstream, capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_gateway("http://10.0.0.5:8080"),
+        &upstream,
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&serde_json::json!({ "model": "gpt-4o" }))
+        .send()
+        .await
+        .expect("请求应完成");
+    let status = response.status();
+    let body = response.text().await.expect("响应体应可读");
+    assert_eq!(status, 200, "不合法 serverUrl 必须回退设置网关：{body}");
+    assert_eq!(capture.last().path, "/openai/v1/chat/completions");
+    wait_for_requests(&proxy.db, 1).await;
+
+    proxy.shutdown().await;
+}
+
+/// P1 的语义钉住：合法 serverUrl（https 任意主机 / http 回环）仍优先于设置网关。
+#[tokio::test]
+async fn acceptable_server_url_overrides_configured_gateway() {
+    let (configured, configured_capture, _handle_a) = start_upstream().await;
+    let (snapshot, snapshot_capture, _handle_b) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_gateway(&snapshot),
+        &configured,
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&serde_json::json!({ "model": "gpt-4o" }))
+        .send()
+        .await
+        .expect("请求应完成");
+    assert_eq!(response.status(), 200);
+
+    assert_eq!(snapshot_capture.last().path, "/openai/v1/chat/completions");
+    assert!(
+        configured_capture.requests.lock().unwrap().is_empty(),
+        "合法 serverUrl 应优先生效，设置网关不应收到请求"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// P1：所有转发路由都必须向上游声明 `accept-encoding: identity`。
+///
+/// 客户端自带的压缩能力会被剥离；否则上游压缩时客户端能正常解码，但代理侧的
+/// usage/cost 解析会拿到压缩字节并静默记 0（reqwest 未启用解压特性）。
+#[tokio::test]
+async fn upstream_requests_are_uncompressed_for_all_routes() {
+    let (upstream, capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_credentials(),
+        &upstream,
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    // 透传路由（/v1/chat/completions）。
+    let passthrough = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header("accept-encoding", "gzip, deflate, br")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("透传请求应完成");
+    assert_eq!(passthrough.status(), 200);
+    let _ = passthrough.text().await;
+    assert_eq!(
+        capture.last().headers.get("accept-encoding").unwrap(),
+        "identity",
+        "透传路由必须剥离客户端的 accept-encoding"
+    );
+
+    // 翻译路由（/v1/messages）。
+    let translation = http()
+        .post(format!("{}/v1/messages", proxy.base_url))
+        .header("accept-encoding", "gzip")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("翻译请求应完成");
+    assert_eq!(translation.status(), 200);
+    let _ = translation.text().await;
+    assert_eq!(
+        capture.last().headers.get("accept-encoding").unwrap(),
+        "identity",
+        "翻译路由必须强制 identity"
+    );
+
+    // 两条请求都要正常记账（证明 identity 没有影响 usage 解析）。
+    wait_for_requests(&proxy.db, 2).await;
+    let input_tokens: i64 = count(
+        &proxy.db,
+        "SELECT SUM(input_tokens) FROM proxy_session_requests",
+    );
+    assert!(input_tokens > 0, "两条请求的 token 都必须落库");
 
     proxy.shutdown().await;
 }

@@ -152,14 +152,10 @@ pub(super) async fn forward_handler(
         }
     };
 
-    // 优先用登录/校验返回的 serverUrl，但只接受 http(s)（否则回退到设置里的网关）。
-    let snapshot_gateway = credentials.gateway_url.trim();
-    let gateway =
-        if snapshot_gateway.starts_with("http://") || snapshot_gateway.starts_with("https://") {
-            snapshot_gateway
-        } else {
-            state.info.gateway_url.as_str()
-        };
+    // 优先用登录/校验返回的 serverUrl，但它必须通过设置层同一套网关地址策略：
+    // 凭据是以请求头形式发出去的，明文 http 只允许本机回环，否则会把 token
+    // 暴露在同网段链路（docs/gateway-contract.md 的承诺）。不合法就回退设置网关。
+    let gateway = effective_gateway(&credentials.gateway_url, &state.info.gateway_url);
     let upstream = forward::upstream_url(gateway, route, query.as_deref());
     let mut upstream_headers = forward::build_upstream_headers(&headers, &credentials);
     if translation.is_some() {
@@ -262,6 +258,21 @@ pub(super) async fn forward_handler(
         );
     }
     let mut response_headers = forward::sanitize_response_headers(upstream_response.headers());
+    // 已强制 accept-encoding: identity；上游若仍返回压缩体，usage/cost 解析会拿到
+    // 压缩字节并静默记 0。这里留一条 warn，便于把"用量为 0"定位到上游行为上。
+    if let Some(encoding) = upstream_response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !encoding.eq_ignore_ascii_case("identity") {
+            warn!(
+                encoding,
+                upstream = %upstream,
+                "上游忽略 accept-encoding: identity，返回了压缩响应；本次用量可能无法解析"
+            );
+        }
+    }
     let content_type = response_headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -328,6 +339,25 @@ pub(super) async fn forward_handler(
     response
 }
 
+/// 选择本次转发的上游网关地址。
+///
+/// `serverUrl` 来自登录/校验响应，不能因为"看起来像 URL"就直接信任：它与设置项
+/// `gateway_url` 走同一套策略（`https://` 允许任意主机；`http://` 只允许本机回环）。
+/// 不合法时回退设置网关并留一条 warn，便于定位"实际用了哪个网关"。
+fn effective_gateway<'a>(snapshot: &'a str, fallback: &'a str) -> &'a str {
+    let snapshot = snapshot.trim();
+    if crate::settings::gateway_url_is_acceptable(snapshot) {
+        return snapshot;
+    }
+    if !snapshot.is_empty() {
+        warn!(
+            gateway = snapshot,
+            "登录返回的 serverUrl 未通过网关地址策略，回退设置里的 gateway_url"
+        );
+    }
+    fallback
+}
+
 /// 客户端要的 stream 在翻译后一定等于输入的 `stream`（翻译逻辑原样复制），
 /// 但 model 需要按 `model_from_body` 的口径归一后才落库。
 fn normalize_model(model: String) -> Option<String> {
@@ -336,5 +366,55 @@ fn normalize_model(model: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_gateway;
+
+    const FALLBACK: &str = "https://settings.example.test";
+
+    /// 合法 serverUrl（https 任意主机 / http 本机回环）优先于设置网关。
+    #[test]
+    fn effective_gateway_prefers_acceptable_snapshot() {
+        for snapshot in [
+            "https://snapshot.example.test",
+            "https://snapshot.example.test/api",
+            "http://127.0.0.1:8080",
+            "http://localhost:9000",
+            "http://[::1]:9000",
+        ] {
+            assert_eq!(
+                effective_gateway(snapshot, FALLBACK),
+                snapshot.trim(),
+                "合法快照应采用：{snapshot}"
+            );
+        }
+        assert_eq!(
+            effective_gateway("  http://127.0.0.1:8080/base  ", FALLBACK),
+            "http://127.0.0.1:8080/base"
+        );
+    }
+
+    /// 明文非回环、非 http(s)、空值都必须回退设置网关（P1：凭据不得明文外发）。
+    #[test]
+    fn effective_gateway_falls_back_for_untrusted_snapshot() {
+        for snapshot in [
+            "",
+            "   ",
+            "http://10.0.0.5:8080",
+            "http://192.168.1.10:9000",
+            "http://evil.example.test",
+            "ftp://example.test",
+            "api.example.test",
+            "//example.test/path",
+        ] {
+            assert_eq!(
+                effective_gateway(snapshot, FALLBACK),
+                FALLBACK,
+                "不合法快照必须回退：{snapshot}"
+            );
+        }
     }
 }
