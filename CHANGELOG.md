@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **旧轮询会覆盖后完成的登录**：`auth_poll_status` 拿到 tokens 后只校验 epoch 与 `login_serial`，而 `start_login` / `commit_login` 都不推进 epoch，因此"旧轮询早发出、晚返回"能覆盖用户刚用 AuthKey 完成的登录（内存、档案与 `auth.bin` 一起换人），反向的深链路径则被 `poll_uuid` 绑定挡住。现在轮询/深链的收尾必须绑定发起时的 `pending.poll_uuid`（`LoginBinding`），入口、写盘前、提交时各校验一次；被取代的收尾静默作废，且**不删**可能已属于新会话的 `auth.bin`。等待态下 UI 同时禁用 AuthKey 提交并提示先取消等待。
+- **登录/校验返回的 `serverUrl` 绕过"http 仅回环"校验**：代理原来只判 `http(s)://` 前缀，且该地址优先级高于设置里校验过的网关，明文 http 可把 `x-access-token` / `Authorization` 发往任意主机（含带凭据的盲 SSRF）。现在 `serverUrl` 与设置项走同一套 `gateway_url_is_acceptable` 策略，不合法时在凭据快照处清空、并在代理转发处回退设置网关 + warn。
+- **透传路由压缩响应导致 usage/cost 静默记 0**：`accept-encoding` 原样转发给上游，而 reqwest 未启用解压特性，上游压缩时客户端正常、代理却解析不出 usage。现在所有转发路由（不只翻译路由）统一剥离客户端 `accept-encoding` 并注入 `identity`；上游仍返回压缩体时记一条 warn 便于定位。
+
+### 安全
+
+- **签名 token 不再挂 job 级 env**：`SIGNPATH_*` 只出现在"检查配置"step 的 `env:` 与"提交签名请求"step 的 `with:`，避免被同 job 的 `pnpm install` / `pnpm tauri build` 及其依赖构建脚本读取。
+- **第三方 Action 全部固定到 commit SHA**（含 `dtolnay/rust-toolchain`），CI 增加 workflow 级 `permissions: contents: read`，两个工作流的 checkout 均 `persist-credentials: false`。
+- **公开仓库改中性措辞并外置脱敏词表**：`.gitignore` 与门禁脚本不再描述本地材料的性质，脚本内嵌的厂商/个人/内部标识改为"形状类"通用规则；具体词表由维护者通过 `REDACTION_TERMS_FILE` 在本地提供，不再随仓库公开。
+
 ## [0.2.1] - 2026-11-11
 
 ### 修复
