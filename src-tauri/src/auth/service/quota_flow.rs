@@ -67,7 +67,10 @@ impl AuthService {
         match self.fetch_quota(&gateway, credentials.access_token()).await {
             Ok(data) => {
                 let profile_id = self.active_profile_id().await;
-                Ok(Some(self.store_quota(epoch, profile_id, &data).await?))
+                Ok(Some(
+                    self.store_quota(epoch, credentials.access_token(), profile_id, &data)
+                        .await?,
+                ))
             }
             Err(QuotaFailure::Forbidden) => Err(AuthError::Rejected(
                 "无权限访问用量信息（HTTP 403）".to_string(),
@@ -121,7 +124,10 @@ impl AuthService {
                 return (None, false);
             }
         };
-        match self.store_quota(epoch, profile_id, &data).await {
+        match self
+            .store_quota(epoch, access_token, profile_id, &data)
+            .await
+        {
             Ok(info) => (Some(info), true),
             Err(err) => {
                 warn!(error = %err, context, "额度快照写入失败");

@@ -65,7 +65,7 @@ sequenceDiagram
 
 登录完成（`finish_login`）的顺序固定为：`/validate` → 并发取模型目录与续期 key → 组装并加密写盘 → 提交内存状态 → 写账号档案 → 拉额度。额度失败不影响登录，只保留上次快照。
 
-收尾全程做三次同一组校验（入口、写盘前、提交时）：`epoch` 未变（注销即作废），且（轮询/深链）`pending.poll_uuid` 仍是本次登录。两者语义不同：`epoch` 变化表示已注销，锁外已写出的凭据要补偿删除；pending 变化表示被新登录取代，此时磁盘上的 `auth.bin` 可能已属于新会话，**不能删**。AuthKey 直登不建立 pending，只受 `epoch` 约束。
+收尾全程做三次同一组校验（入口、写盘前、提交时）：`epoch` 未变（注销即作废），且（轮询/深链）`pending.poll_uuid` 仍是本次登录。两者语义不同：`epoch` 变化表示已注销，锁外已写出的凭据要补偿删除；pending 变化表示被新登录取代，此时磁盘上的 `auth.bin` 可能已属于新会话，**不能删**。AuthKey 直登不建立 pending，只受 `epoch` 约束。这组校验只约束登录收尾；登录完成之后，早先发出的续期与 `/validate` 结果由「身份守卫」挡住（见 §5）。
 
 ## 2.1 AuthKey 直登（账号 + AuthKey）
 
@@ -132,8 +132,13 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 写路径纪律只有一种写法：`commit_if_current(epoch, closure)` 在**同一把 `state.write()` 锁内**比较代次并执行闭包，代次不符返回 `None`，闭包不执行。闭包内不允许 `.await`。锁外副作用（写盘、删盘、写库）在执行前用 `still_current(epoch)` 预检；**凭据写盘还有第二道闸**：`store.save_if(generation, …)`（见 §6），它把"预检通过之后、真正拿锁写盘之前"发生的注销也一并挡住。
 
-- `finish_login` 在 `gateway()` 之前先检查一次；写盘走 `save_async_if`，代次已推进就直接 `SessionEnded`（不会重建主密钥）；`commit_login` 若返回 `None`（刚好注销），仍会 `delete_async()` 兜底，绝不复活凭据。
-- `persist_profile`、`store_quota` 先 `still_current` 再写，注销后的档案与额度快照不再落库。
+代次只由注销推进，它挡不住"登录已经把身份换成另一份凭据"。因此所有**凭据类**提交（续期成功/失败、`/validate` 结果、额度快照）都改用 `commit_if_session(epoch, access_token, closure)`：在写锁内额外比对"内存凭据的 `access_token` 是否仍是本次操作基于的那一份"，不一致就静默作废（不写盘、不改状态、不写库）。配套不变量：
+
+- `finish_login` 与续期提交共用 `credential_write` 串行锁，把「身份检查 → 写盘 → 提交」合成一个临界区；没有它，一次早发的续期可以在登录写盘之后再把 `auth.bin` 覆盖回上一个身份。锁序固定为 `login_serial → credential_write`。
+- 后台 `tick` 在 `pending`（等待浏览器登录）期间直接跳过，不再用旧身份发起 validate / 续期 / 额度请求。
+- 同一账号续期换了 token 后，旧 token 的 `/validate` 结果也会被丢弃（按 token 严格比较）：下一次 tick 会用新 token 重新校验，档案刷新最多延后一个校验周期（10 分钟）。这是有意的 fail-closed 取舍。
+- `finish_login` 在 `gateway()` 之前先检查一次；写盘与提交在 `credential_write` 内走 `save_async_if`，代次已推进就直接 `SessionEnded`（不会重建主密钥）；`commit_login` 若返回 `None`（刚好注销），仍会 `delete_async()` 兜底，绝不复活凭据。
+- `persist_profile` 注销后不再落库；`store_quota` 先 `session_still`，注销或已换身份后的额度快照不再落库、也不刷 `last_quota_at`。
 - `record_failure` 也走 `commit_if_current`，注销后到达的失败不会把状态改回 `error`。
 - 深链完成流程捕获 `SessionEnded` 后保持「已登出」，不覆盖状态。
 

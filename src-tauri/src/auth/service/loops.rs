@@ -83,7 +83,7 @@ impl AuthService {
     ///
     /// 只有**可观察状态真的变化**或额度确有更新时才返回 `Some`：让 `run_loop`
     /// 不再每 300/600 秒盲目广播 `auth://state`（前端每个事件都会整页重拉）。
-    async fn tick(&self, gateway_url: &str) -> Option<AuthUpdate> {
+    pub(super) async fn tick(&self, gateway_url: &str) -> Option<AuthUpdate> {
         self.ensure_loaded().await;
         let epoch = self.epoch().await;
         let before = self.status().await;
@@ -98,8 +98,10 @@ impl AuthService {
             )
         };
         let credentials = credentials?;
-        // 需要重新登录时不做无意义重试，等待用户操作。
-        if phase == AuthPhase::ReauthRequired {
+        // 需要重新登录 / 正在等待浏览器登录时不做后台校验与续期：
+        // 后者会用旧身份的 token 发请求，结果可能在登录提交之后落地（身份守卫会丢弃，
+        // 但更好的做法是根本不去制造这次竞争）。
+        if matches!(phase, AuthPhase::ReauthRequired | AuthPhase::PendingLogin) {
             return None;
         }
 
@@ -133,14 +135,15 @@ impl AuthService {
         let mut quota_updated = false;
         if quota_due {
             let profile_id = self.active_profile_id().await;
+            // 本 tick 的 validate / renew 可能刚把 token 换掉：额度请求与写入要用
+            // **当前**凭据，否则身份守卫会判定"不是同一份凭据"并作废这次快照。
+            let current = { self.state.read().await.credentials.clone() };
+            let access_token = current
+                .as_ref()
+                .map(Credentials::access_token)
+                .unwrap_or_else(|| credentials.access_token());
             let (info, updated) = self
-                .fetch_and_store_quota(
-                    epoch,
-                    &gateway,
-                    credentials.access_token(),
-                    profile_id,
-                    "后台",
-                )
+                .fetch_and_store_quota(epoch, &gateway, access_token, profile_id, "后台")
                 .await;
             quota_info = info;
             quota_updated = updated;

@@ -91,6 +91,8 @@
 
 响应头只去 hop-by-hop，其余（含 `content-type`、`content-encoding`）原样透传；翻译路由会额外去掉 `content-length` 与 `content-encoding` 并重设 `content-type`。所有转发响应都会 `append` 一个 `x-hub-request-id`（用 `append` 而非 `insert`，上游若回显同名头则保留多值）。
 
+直通 Chat（`POST /v1/chat/completions`）的流式请求会额外补齐 `stream_options: {"include_usage": true}`：OpenAI Chat 语义下，`stream: true` 且未声明该字段时上游不会在末帧回 `usage`，代理只能把它记成 0 token。客户端已显式声明 `include_usage`（无论 true/false）时保持原值；`stream_options` 是非对象、或请求体不是合法 JSON 时不做改写（行为与旧版一致）。`/v1/responses` 不需要——usage 在 `response.completed` 事件里。
+
 落库的请求头走白名单，绝不含凭据：`user-agent`、`content-type`、`accept`、`anthropic-version`、`anthropic-beta`、`openai-beta`、`x-client-request-id`、`x-claude-code-session-id`、`x-codemaker-session-id`、`x-session-id`、`x-opencode-session-id`、`downstream-client`、`x-stainless-*`。
 
 ## Anthropic Messages → OpenAI Chat 的翻译边界
@@ -225,7 +227,7 @@
 | 中途 Ctrl-C | 用量里 `error_kind = client_aborted` | 正常现象，其余请求不受影响 |
 | 请求未知路径 | 404 `not_found` | 响应体里带 `path`，对照路由表 |
 | `GET /v1/models` 返回 503 | `service_unavailable` | 模型目录未缓存：先登录并完成 `/validate`（含 `/models` 别名）|
-| 用量页 token / 费用为 0 | 200，但 usage 为空 | 上游没回 `usage`，或非流式超 8 MiB / SSE 超 2 MiB 已停止解析；若日志有「上游忽略 accept-encoding: identity」，则是网关仍压缩响应 |
+| 用量页 token / 费用为 0 | 200，但 usage 为空 | 上游没回 `usage`，或非流式超 8 MiB / SSE 超 2 MiB 已停止解析；若日志有「上游忽略 accept-encoding: identity」，则是网关仍压缩响应。直通 Chat 流式已自动补 `stream_options.include_usage`，此时若仍为 0，说明客户端显式关闭了该字段、或网关忽略了它 |
 
 ## 源码索引
 

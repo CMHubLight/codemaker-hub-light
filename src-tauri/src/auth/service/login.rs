@@ -320,36 +320,45 @@ impl AuthService {
         if !self.login_still_fresh(epoch, expected_poll).await? {
             return Ok(self.make_update(None, false).await);
         }
-        // 同样过"代次大门"：注销期间到达的写盘直接放弃（连主密钥都不会重建）。
-        let generation = self.store.credential_generation();
-        if !self.store.save_async_if(generation, &credentials).await? {
-            return Err(AuthError::SessionEnded);
-        }
-
-        let commit = self
-            .commit_login(
-                epoch,
-                expected_poll,
-                LoginArtifacts {
-                    credentials: credentials.clone(),
-                    profile: profile.clone(),
-                    models: models.clone(),
-                    offline_grace,
-                    now,
-                },
-            )
-            .await;
-        match commit {
-            LoginCommit::Committed => {}
-            LoginCommit::Superseded => {
-                // 刚写出的 auth.bin 可能已被新登录覆盖：绝不能删，静默作废即可。
-                info!("登录收尾被更新的登录取代，保留新会话写出的凭据");
+        // 落盘与提交必须与"续期提交"互斥：否则一次早就发出的续期可以在登录写盘
+        // 之后再把 auth.bin 覆盖回上一个身份。锁序：login_serial → credential_write。
+        {
+            let _write = self.credential_write.lock().await;
+            // 排队等锁期间 pending 可能被另一次登录取代：写盘前用同一套绑定再确认一次。
+            if !self.login_still_fresh(epoch, expected_poll).await? {
                 return Ok(self.make_update(None, false).await);
             }
-            LoginCommit::Ended => {
-                // 极端窗口：刚写盘就发生注销。删掉刚写的文件，绝不复活凭据。
-                let _ = self.store.delete_async().await;
+            // 同样过"代次大门"：注销期间到达的写盘直接放弃（连主密钥都不会重建）。
+            let generation = self.store.credential_generation();
+            if !self.store.save_async_if(generation, &credentials).await? {
                 return Err(AuthError::SessionEnded);
+            }
+
+            let commit = self
+                .commit_login(
+                    epoch,
+                    expected_poll,
+                    LoginArtifacts {
+                        credentials: credentials.clone(),
+                        profile: profile.clone(),
+                        models: models.clone(),
+                        offline_grace,
+                        now,
+                    },
+                )
+                .await;
+            match commit {
+                LoginCommit::Committed => {}
+                LoginCommit::Superseded => {
+                    // 刚写出的 auth.bin 可能已被新登录覆盖：绝不能删，静默作废即可。
+                    info!("登录收尾被更新的登录取代，保留新会话写出的凭据");
+                    return Ok(self.make_update(None, false).await);
+                }
+                LoginCommit::Ended => {
+                    // 极端窗口：刚写盘就发生注销。删掉刚写的文件，绝不复活凭据。
+                    let _ = self.store.delete_async().await;
+                    return Err(AuthError::SessionEnded);
+                }
             }
         }
 

@@ -2,6 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **登录完成后被在途续期/校验覆盖身份**：`state.credentials` 有三个写者（登录、续期、`/validate`），而登录代次（`epoch`）只由注销推进，v0.2.2 的 `poll_uuid` 绑定也只约束登录收尾——于是一次早于新登录发出、晚于其提交返回的续期可以把它覆盖回上一个账号：界面显示 B、代理用 A 的 token 转发并把账记到 A，`auth.bin` 也留下 A（重启后以 A 自动登录）；`/validate` 则会把旧身份的账号档案与模型目录写回去。现在凭据类提交统一走 `commit_if_session`（在同一把写锁内额外比对 `access_token`），续期写盘与登录写盘共用 `credential_write` 串行锁（锁序 `login_serial → credential_write`），后台 `tick` 在等待登录期间停机；同一次续期运行时快照只允许成功提交一次（`renew.seq`），并发续期里晚到的失败不会把已成功的登录态改回 `reauth_required`。
+- **直通 `/v1/chat/completions` 的流式请求从不请求 usage**：翻译路由会给上游补 `stream_options.include_usage=true`，直通路由原样转发；按 OpenAI Chat 语义，未声明该字段时上游不返回 usage 帧，`SseTee` 解析不到任何 usage，该路由的流式流量在本机账务里恒为 0 token / ¥0（云端照扣）。现在直通 Chat 流式同样补 `include_usage`（客户端显式声明时保留原值；`stream_options` 非对象或请求体非 JSON 时不做改写），`/v1/responses` 不受影响。
+
+### 工程
+
+- 新增靶式测试：`renew_success_is_discarded_after_identity_change`、`renew_failure_does_not_mark_reauth_after_identity_change`、`validate_info_is_discarded_after_identity_change`、`store_quota_requires_same_identity`、`late_renew_failure_does_not_override_successful_renewal`、`tick_skips_while_pending_login`；代理侧补 `with_stream_usage` 单测与集成用例 `passthrough_streaming_chat_requests_usage`（顺带首次为直通 SSE 的记账路径建立断言）。
+- `docs/authentication.md`、`docs/proxy.md` 同步身份守卫与 usage 注入语义。
+
 ## [0.2.2] - 2026-11-11
 
 ### 修复

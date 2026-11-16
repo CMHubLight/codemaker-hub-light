@@ -31,18 +31,23 @@ impl AuthService {
             Err(err) if err.is_forbidden() => {
                 // 兼容网关语义：token 过期/被拒时先用 auth_key 续期，再校验一次；
                 // 只有续期也不可用或续期后仍被拒才要求重新登录。
-                self.handle_validate_forbidden(epoch, gateway).await;
+                self.handle_validate_forbidden(epoch, gateway, credentials.access_token())
+                    .await;
             }
             Err(err) => {
-                self.mark_offline_grace(epoch, "网络异常，已按离线宽限继续")
-                    .await;
+                self.mark_offline_grace(
+                    epoch,
+                    credentials.access_token(),
+                    "网络异常，已按离线宽限继续",
+                )
+                .await;
                 warn!(error = %err, "/validate 网络失败，进入 offline grace");
             }
         }
     }
 
     /// `/validate` 成功：合并模型目录并提交账号档案/登录态。
-    async fn apply_validate_info(
+    pub(super) async fn apply_validate_info(
         &self,
         epoch: u64,
         gateway: &AuthGateway,
@@ -53,7 +58,9 @@ impl AuthService {
         // 没带回时才补一次（失败不阻断 validate）。
         let models = load_models(gateway, access_token, std::mem::take(&mut info.models)).await;
         let committed = self
-            .commit_if_current(epoch, |state| {
+            .commit_if_session(epoch, access_token, |state| {
+                // 校验请求在飞期间可能已经换了身份（新登录 / 续期换 token）：
+                // 旧身份的结果不得覆盖新的 profile、models 与登录态。
                 if let Some(profile) = state.profile.as_mut() {
                     if let Some(dept) = info.dept.clone() {
                         profile.dept = Some(dept);
@@ -90,7 +97,12 @@ impl AuthService {
     /// - 续期成功 + 重新校验网络失败 → 离线宽限（相信刚续到的新凭据）；
     /// - 续期瞬时失败 → 离线宽限（保留旧凭据，等后台重试）；
     /// - 没有 auth_key / 续期被拒 → 重新登录（`renew_now` 已写入状态与文案）。
-    async fn handle_validate_forbidden(&self, epoch: u64, gateway: &AuthGateway) {
+    async fn handle_validate_forbidden(
+        &self,
+        epoch: u64,
+        gateway: &AuthGateway,
+        access_token: &str,
+    ) {
         warn!("/validate 返回 401/403：先尝试用 auth_key 自动续期");
         match self.renew_now(epoch, gateway).await {
             Some(RenewOutcome::Renewed) => {
@@ -105,13 +117,21 @@ impl AuthService {
                             .await;
                     }
                     Err(err) if err.is_forbidden() => {
-                        self.mark_reauth(epoch, "续期后仍被服务端拒绝，请重新登录")
-                            .await;
+                        self.mark_reauth(
+                            epoch,
+                            fresh.access_token(),
+                            "续期后仍被服务端拒绝，请重新登录",
+                        )
+                        .await;
                         warn!(error = %err, "续期后 /validate 仍返回 401/403");
                     }
                     Err(err) => {
-                        self.mark_offline_grace(epoch, "续期成功但校验网络失败，已按离线宽限继续")
-                            .await;
+                        self.mark_offline_grace(
+                            epoch,
+                            fresh.access_token(),
+                            "续期成功但校验网络失败，已按离线宽限继续",
+                        )
+                        .await;
                         warn!(error = %err, "续期后 /validate 网络失败，进入 offline grace");
                     }
                 }
@@ -121,15 +141,19 @@ impl AuthService {
                 warn!("/validate 401/403 且自动续期不可用，需要重新登录");
             }
             Some(RenewOutcome::Transient) | None => {
-                self.mark_offline_grace(epoch, "自动续期失败（网络异常），已按离线宽限继续")
-                    .await;
+                self.mark_offline_grace(
+                    epoch,
+                    access_token,
+                    "自动续期失败（网络异常），已按离线宽限继续",
+                )
+                .await;
             }
         }
     }
 
     /// 凭据已失效：要求重新登录。
-    async fn mark_reauth(&self, epoch: u64, message: &str) {
-        self.commit_if_current(epoch, |state| {
+    async fn mark_reauth(&self, epoch: u64, access_token: &str, message: &str) {
+        self.commit_if_session(epoch, access_token, |state| {
             state.phase = AuthPhase::ReauthRequired;
             state.credentials_valid = false;
             state.offline_grace = false;
@@ -139,8 +163,8 @@ impl AuthService {
     }
 
     /// 网络类失败：进入离线宽限（界面仍算已登录，但不再刷新校验时间）。
-    async fn mark_offline_grace(&self, epoch: u64, message: &str) {
-        self.commit_if_current(epoch, |state| {
+    async fn mark_offline_grace(&self, epoch: u64, access_token: &str, message: &str) {
+        self.commit_if_session(epoch, access_token, |state| {
             state.phase = AuthPhase::OfflineGrace;
             state.offline_grace = true;
             state.last_error = Some(message.to_string());
@@ -275,13 +299,6 @@ mod tests {
 
         let (service, dir) = super::super::test_support::temp_service();
         let epoch = service.epoch().await;
-        service
-            .commit_if_current(epoch, |state| {
-                state.phase = AuthPhase::LoggedIn;
-                state.credentials_valid = true;
-            })
-            .await;
-        let gateway = AuthGateway::new(&format!("http://{addr}")).expect("回环网关应可用");
         let credentials = Credentials {
             access_token: "test-token".to_string(),
             auth_key: None,
@@ -290,6 +307,16 @@ mod tests {
             issued_at: 1,
             expires_at: 2,
         };
+        let seeded = credentials.clone();
+        service
+            .commit_if_current(epoch, move |state| {
+                state.phase = AuthPhase::LoggedIn;
+                state.credentials_valid = true;
+                // 身份守卫要求"被校验的凭据就是当前凭据"（生产路径由 tick / 命令保证）。
+                state.credentials = Some(seeded);
+            })
+            .await;
+        let gateway = AuthGateway::new(&format!("http://{addr}")).expect("回环网关应可用");
 
         service.validate_with(epoch, &gateway, &credentials).await;
 
