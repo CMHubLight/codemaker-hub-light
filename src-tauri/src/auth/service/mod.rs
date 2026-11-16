@@ -108,6 +108,9 @@ struct RenewRuntime {
     last_renewed_expires_at: Option<i64>,
     /// 连续"续期成功但有效期未前进"的次数。
     no_progress_count: u32,
+    /// 续期提交序号：每次成功提交 +1。并发续期里晚到的结果（成功或失败）
+    /// 发现序号已变就作废，避免"一成一败"时失败分支把刚续好的登录态改回 reauth。
+    seq: u64,
 }
 
 #[derive(Default)]
@@ -146,6 +149,14 @@ pub struct AuthService {
     gateway_cache: RwLock<Option<(String, Arc<AuthGateway>)>>,
     /// 登录完成单飞：深链/轮询/重复投递不得并发各做一遍 validate + 落盘。
     login_serial: Mutex<()>,
+    /// 凭据"检查身份 → 写盘 → 提交"的串行化（登录收尾与续期提交共用）。
+    ///
+    /// 没有它，一次早就发出的续期可以在新登录写盘之后再把 `auth.bin` 覆盖回上一个身份：
+    /// 单独的身份检查与写盘之间仍有一个窗口，靠这把锁把两者合成一个临界区。
+    ///
+    /// 锁序固定为 `login_serial → credential_write`；持有 `credential_write` 时
+    /// **不得**再去取 `login_serial`（登录收尾会长时间持有它）。
+    credential_write: Mutex<()>,
 }
 
 impl AuthService {
@@ -163,6 +174,7 @@ impl AuthService {
             loops: Mutex::new(LoopHandle::default()),
             gateway_cache: RwLock::new(None),
             login_serial: Mutex::new(()),
+            credential_write: Mutex::new(()),
         }
     }
 
@@ -228,6 +240,46 @@ impl AuthService {
     ) -> Option<T> {
         let mut state = self.state.write().await;
         if state.epoch != epoch {
+            return None;
+        }
+        Some(action(&mut state))
+    }
+
+    /// 会话是否仍是"同一份凭据"：`epoch` 未变，且内存凭据仍是指定的 `access_token`。
+    ///
+    /// 与 [`Self::still_current`] 的区别：后者只挡注销；这里还挡"内存凭据已经被
+    /// 另一次登录/续期换掉"。锁外拿到的网络结果只能在原凭据仍是当前凭据时提交。
+    pub(super) async fn session_still(&self, epoch: u64, access_token: &str) -> bool {
+        let state = self.state.read().await;
+        state.epoch == epoch
+            && state
+                .credentials
+                .as_ref()
+                .map(Credentials::access_token)
+                .is_some_and(|current| current == access_token)
+    }
+
+    /// 在"代次未变且凭据仍是同一份"时提交状态；否则返回 `None`，闭包不执行。
+    ///
+    /// 纪律与 [`Self::commit_if_current`] 相同：闭包内不得 `.await`，所有写路径都在
+    /// 同一把 `state.write()` 里完成"比较 + 写入"。凭据类的锁外副作用（写盘、写库）
+    /// 由调用方另加 [`AuthService::credential_write`] 串行化。
+    pub(super) async fn commit_if_session<T>(
+        &self,
+        epoch: u64,
+        access_token: &str,
+        action: impl FnOnce(&mut RuntimeState) -> T,
+    ) -> Option<T> {
+        let mut state = self.state.write().await;
+        if state.epoch != epoch {
+            return None;
+        }
+        if state
+            .credentials
+            .as_ref()
+            .map(Credentials::access_token)
+            .is_none_or(|current| current != access_token)
+        {
             return None;
         }
         Some(action(&mut state))
@@ -519,8 +571,17 @@ mod tests {
             "is_active": true,
         }));
         let epoch = service.epoch().await;
+        let credentials = sample_credentials();
+        let access_token = credentials.access_token.clone();
+        service
+            .commit_if_current(epoch, |state| {
+                state.phase = AuthPhase::LoggedIn;
+                state.credentials = Some(credentials);
+            })
+            .await
+            .expect("代次未变应可写");
         let info = service
-            .store_quota(epoch, None, &data)
+            .store_quota(epoch, &access_token, None, &data)
             .await
             .expect("额度写入应成功");
         assert_eq!(info.remaining, Some(750.0));
@@ -1159,6 +1220,246 @@ mod tests {
         );
 
         server.abort();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 身份守卫：登录提交之后，早先发出的续期 / 校验结果一律作废
+    // -----------------------------------------------------------------------
+
+    /// 把内存态置成"已登录 user"，并返回该身份的凭据。
+    async fn seed_logged_in(service: &AuthService, user: &str, token: &str) -> Credentials {
+        let credentials = Credentials {
+            access_token: token.to_string(),
+            auth_key: Some(format!("{user}-key")),
+            user: user.to_string(),
+            server_url: "https://api.example.test".to_string(),
+            issued_at: 1,
+            expires_at: 2,
+        };
+        let profile = AuthProfile {
+            user: user.to_string(),
+            display_name: Some(format!("{user}-display")),
+            dept: Some("dept".to_string()),
+            server_url: "https://api.example.test".to_string(),
+            issued_at: Some(1),
+            expires_at: Some(2),
+        };
+        let seeded = credentials.clone();
+        let epoch = service.epoch().await;
+        service
+            .commit_if_current(epoch, move |state| {
+                state.phase = AuthPhase::LoggedIn;
+                state.credentials_valid = true;
+                state.credentials = Some(seeded);
+                state.profile = Some(profile);
+            })
+            .await
+            .expect("代次未变应可写");
+        credentials
+    }
+
+    async fn renew_runtime(service: &AuthService) -> RenewRuntime {
+        service.state.read().await.renew.clone()
+    }
+
+    fn renewed_token(token: &str, expires_at: i64) -> crate::auth::client::RenewedToken {
+        crate::auth::client::RenewedToken {
+            access_token: token.to_string(),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    /// 续期成功返回时身份已被新登录替换：不得改内存、不得写盘。
+    #[tokio::test]
+    async fn renew_success_is_discarded_after_identity_change() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        let alice = seed_logged_in(&service, "alice", "token-alice").await;
+        let renew = renew_runtime(&service).await;
+        seed_logged_in(&service, "bob", "token-bob").await;
+
+        let committed = service
+            .commit_renew_success(
+                epoch,
+                alice,
+                renewed_token("renewed-alice", 1_700_000_000),
+                "server-key".to_string(),
+                Utc::now(),
+                &renew,
+            )
+            .await;
+
+        assert!(!committed, "身份已被替换，续期结果必须作废");
+        let snapshot = service.credentials_snapshot().await.expect("应有 B 的凭据");
+        assert_eq!(snapshot.access_token, "token-bob", "不得改写成旧身份");
+        assert_eq!(snapshot.user, "bob");
+        assert_eq!(
+            service.status().await.display_name.as_deref(),
+            Some("bob-display"),
+            "旧身份的续期也不得改档案"
+        );
+        assert!(!service.store.exists(), "被作废的续期不得写盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 续期失败返回时身份已被替换：不得把新会话打回 reauth_required。
+    #[tokio::test]
+    async fn renew_failure_does_not_mark_reauth_after_identity_change() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        let renew = renew_runtime(&service).await;
+        seed_logged_in(&service, "bob", "token-bob").await;
+
+        let committed = service
+            .commit_renew_failure(
+                epoch,
+                &GatewayError::Status { status: 401 },
+                Utc::now(),
+                &renew,
+                "token-alice",
+            )
+            .await;
+
+        assert!(!committed, "被取代的失败结果必须作废");
+        let status = service.status().await;
+        assert_eq!(status.state, "authenticated", "不得改回 reauth_required");
+        assert!(status.credentials_valid);
+        assert!(status.message.is_none(), "也不得写入失败文案");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `/validate` 返回时身份已被替换：profile / models / phase 都不许被旧身份覆盖。
+    #[tokio::test]
+    async fn validate_info_is_discarded_after_identity_change() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        seed_logged_in(&service, "bob", "token-bob").await;
+        let gateway = AuthGateway::new("https://example.test").expect("网关应可构造");
+
+        service
+            .apply_validate_info(
+                epoch,
+                &gateway,
+                "token-alice",
+                ValidateInfo {
+                    dept: Some("alice-dept".to_string()),
+                    display_name: Some("Alice".to_string()),
+                    gateway: None,
+                    server_url: Some("https://alice.example.test".to_string()),
+                    // 非空目录会短路 `/validate/models`，本用例不触碰网络。
+                    models: vec![ModelSummary {
+                        id: "alice-model".to_string(),
+                        name: None,
+                    }],
+                },
+            )
+            .await;
+
+        let status = service.status().await;
+        assert_eq!(status.user.as_deref(), Some("bob"));
+        assert_eq!(status.display_name.as_deref(), Some("bob-display"));
+        assert_eq!(status.dept.as_deref(), Some("dept"));
+        assert!(
+            service.models_snapshot().await.is_empty(),
+            "旧身份的模型目录不得覆盖新会话"
+        );
+        assert_eq!(status.state, "authenticated");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 额度快照同样属于"某一份凭据"：身份被替换后不得再落库。
+    #[tokio::test]
+    async fn store_quota_requires_same_identity() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        seed_logged_in(&service, "bob", "token-bob").await;
+        let data = quota::parse_quota(&serde_json::json!({ "remaining": 1.0 }));
+
+        let err = service
+            .store_quota(epoch, "token-alice", None, &data)
+            .await
+            .expect_err("旧身份不得写额度快照");
+        assert!(matches!(err, AuthError::SessionEnded));
+        assert!(
+            service.latest_quota().await.expect("读取应成功").is_none(),
+            "不得留下旧身份的额度快照"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 并发续期里晚到的失败不得覆盖已经成功的续期。
+    ///
+    /// 用例刻意让网关返回**同一个 token**：此时身份守卫无法区分，必须靠 `renew.seq`。
+    #[tokio::test]
+    async fn late_renew_failure_does_not_override_successful_renewal() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        let alice = seed_logged_in(&service, "alice", "token-alice").await;
+        let renew = renew_runtime(&service).await;
+
+        assert!(
+            service
+                .commit_renew_success(
+                    epoch,
+                    alice,
+                    renewed_token("token-alice", 1_700_000_000),
+                    "server-key".to_string(),
+                    Utc::now(),
+                    &renew,
+                )
+                .await,
+            "第一次续期应提交成功"
+        );
+
+        // 同一份 renew 快照发出的另一次续期随后失败：token 相同，只能靠 seq 挡住。
+        let failed = service
+            .commit_renew_failure(
+                epoch,
+                &GatewayError::Status { status: 401 },
+                Utc::now(),
+                &renew,
+                "token-alice",
+            )
+            .await;
+        assert!(!failed, "晚到的失败结果必须作废");
+        let status = service.status().await;
+        assert_eq!(status.state, "authenticated");
+        assert!(status.credentials_valid);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 等待浏览器登录期间后台 tick 必须停机：不去用旧身份发 validate / 续期。
+    #[tokio::test]
+    async fn tick_skips_while_pending_login() {
+        let (service, dir) = temp_service();
+        seed_logged_in(&service, "alice", "token-alice").await;
+        service
+            .start_login("https://example.test")
+            .await
+            .expect("登录应可发起");
+
+        let update = service.tick("https://example.test").await;
+
+        assert!(update.is_none(), "pending 期间 tick 必须直接返回");
+        let status = service.status().await;
+        assert_eq!(
+            status.state, "pending",
+            "登录态不得被 tick 改回 authenticated"
+        );
+        assert!(
+            status.last_validated_at.is_none(),
+            "tick 不得刷新 last_validated_at"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

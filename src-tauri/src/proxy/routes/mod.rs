@@ -9,7 +9,9 @@
 //!
 //! 热路径约束（改动时请保持）：
 //! - 请求体只解析一趟（翻译路由由 `translate::anthropic_to_openai_request` 产出
-//!   upstream body 与 model/stream/token 估算；透传路由用 `forward::parse_envelope`）；
+//!   upstream body 与 model/stream/token 估算；透传路由用 `forward::parse_envelope`）。
+//!   唯一例外：直通 Chat 的流式请求会再解析一次以补 `stream_options.include_usage`
+//!   （`forward::with_stream_usage`），否则上游不会回 usage；只对这类请求生效；
 //! - 透传 chunk 直接复用 `Bytes`（`Outgoing::Passthrough`），只有翻译/合成才 `Vec`；
 //! - 落库走 `crate::db::blocking::run`，绝不阻塞 async worker。
 //!

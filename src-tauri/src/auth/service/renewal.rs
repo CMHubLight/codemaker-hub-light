@@ -83,17 +83,20 @@ impl AuthService {
         gateway: &AuthGateway,
         current: Credentials,
     ) -> RenewOutcome {
+        // 续期运行时快照（退避/静默期/提交序号）在发请求前取一次：
+        // 本次请求的提交必须基于这份快照，晚到的结果才不会被误当成"最新"。
+        let renew = { self.state.read().await.renew.clone() };
         // 取续期 key（每轮都取：服务端可能轮换，旧版本存的可能是错的那种凭据）。
         let stored_key = current.auth_key.clone();
         let fresh_key = self.fetch_renew_key(gateway, &current).await;
         let Some(primary_key) = fresh_key.or_else(|| stored_key.clone()) else {
             // 两处都没有 key：只能要求重新登录。
-            self.commit_missing_renew_key(epoch).await;
+            self.commit_missing_renew_key(epoch, current.access_token(), &renew)
+                .await;
             return RenewOutcome::NoKey;
         };
 
         // 发起续期（401/403 时用已存 key 重试一次）。
-        let renew = { self.state.read().await.renew.clone() };
         let (used_key, outcome) = self
             .attempt_renew(gateway, &current, &primary_key, stored_key.as_deref())
             .await;
@@ -106,12 +109,12 @@ impl AuthService {
                 if committed {
                     RenewOutcome::Renewed
                 } else {
-                    // 代次已变（注销/重新登录）：本次结果作废，按瞬时失败处理。
+                    // 代次已变 / 已被新登录或另一次续期取代：本次结果作废，按瞬时失败处理。
                     RenewOutcome::Transient
                 }
             }
             Err(err) => {
-                self.commit_renew_failure(epoch, &err, Utc::now(), &renew)
+                self.commit_renew_failure(epoch, &err, Utc::now(), &renew, current.access_token())
                     .await;
                 if err.is_forbidden() {
                     RenewOutcome::Rejected
@@ -123,8 +126,11 @@ impl AuthService {
     }
 
     /// 没有可用续期 key：只能要求重新登录（与续期失败区分，文案更具体）。
-    async fn commit_missing_renew_key(&self, epoch: u64) {
-        self.commit_if_current(epoch, |state| {
+    async fn commit_missing_renew_key(&self, epoch: u64, access_token: &str, renew: &RenewRuntime) {
+        self.commit_if_session(epoch, access_token, |state| {
+            if state.renew.seq != renew.seq {
+                return;
+            }
             state.phase = AuthPhase::ReauthRequired;
             state.credentials_valid = false;
             state.last_error = Some("缺少续期凭据（auth_key），请重新登录".to_string());
@@ -221,8 +227,8 @@ impl AuthService {
         (used_key, outcome)
     }
 
-    /// 续期成功：更新内存凭据、写盘、提交状态；返回是否真正提交（注销则 false）。
-    async fn commit_renew_success(
+    /// 续期成功：更新内存凭据、写盘、提交状态；返回是否真正提交（注销/被取代则 false）。
+    pub(super) async fn commit_renew_success(
         &self,
         epoch: u64,
         mut current: Credentials,
@@ -231,6 +237,8 @@ impl AuthService {
         now: DateTime<Utc>,
         renew: &RenewRuntime,
     ) -> bool {
+        // 先记下本次续期"基于哪一份凭据"，再改写本地副本：提交时用它判断身份是否还是同一个。
+        let based_on = current.access_token.clone();
         let issued_at = now.timestamp();
         let expires_at = renewed
             .expires_at
@@ -240,12 +248,15 @@ impl AuthService {
         current.expires_at = expires_at;
         // 记下"这次真正生效的续期 key"：老记录里的 SSO token 会被升级成 128 字符 key。
         current.auth_key = Some(used_key);
-        // 续期后写盘前再确认会话仍有效（注销会递增 epoch）。
-        if !self.still_current(epoch).await {
+        // 凭据写盘 + 提交的临界区：身份检查、写盘、提交三者必须原子，
+        // 否则"检查时还是 A、写盘时已变成 B"会让磁盘留下上一个身份。
+        let _write = self.credential_write.lock().await;
+        if !self.session_still(epoch, &based_on).await {
+            info!("续期结果所属的凭据已被替换，丢弃本次续期");
             return false;
         }
-        // 写盘还要过"代次大门"：`still_current` 与真正拿锁写盘之间有窗口
-        // （`save_async` 要排队进阻塞线程池），期间发生的注销必须让这次写盘作废。
+        // 写盘还要过"代次大门"：`session_still` 与真正拿锁写盘之间有窗口
+        // （`save_async_if` 要排队进阻塞线程池），期间发生的注销必须让这次写盘作废。
         // 不能改用"提交失败就删刚写的文件"：续期与"注销后重新登录"可并发，
         // 补删会误删新会话刚写出的凭据。
         let generation = self.store.credential_generation();
@@ -255,7 +266,11 @@ impl AuthService {
             Err(err) => warn!(error = %err, "续期后保存凭据失败（内存已更新）"),
         }
         let committed = self
-            .commit_if_current(epoch, |state| {
+            .commit_if_session(epoch, &based_on, |state| {
+                // 并发续期里晚到的那个不得覆盖先成功的结果。
+                if state.renew.seq != renew.seq {
+                    return false;
+                }
                 if let Some(profile) = state.profile.as_mut() {
                     profile.issued_at = Some(issued_at);
                     profile.expires_at = Some(expires_at);
@@ -268,6 +283,7 @@ impl AuthService {
                 state.renew.last_success_at = Some(now);
                 state.renew.last_attempt_at = Some(now);
                 state.renew.backoff_secs = 0;
+                state.renew.seq = renew.seq.wrapping_add(1);
                 info!("token 续期成功");
 
                 // 续期必须真的延长有效期；反复拿到同一个过期时间说明网关没在延长，
@@ -290,22 +306,28 @@ impl AuthService {
                         warn!(count, "续期成功但有效期未前进");
                     }
                 }
+                true
             })
             .await;
-        committed.is_some()
+        matches!(committed, Some(true))
     }
 
     /// 续期失败：60s → 120s → 240s → 300s 退避；401/403 直接要求重新登录。
-    async fn commit_renew_failure(
+    pub(super) async fn commit_renew_failure(
         &self,
         epoch: u64,
         err: &GatewayError,
         now: DateTime<Utc>,
         renew: &RenewRuntime,
+        access_token: &str,
     ) -> bool {
         let next_backoff = next_backoff(renew.backoff_secs);
         let committed = self
-            .commit_if_current(epoch, |state| {
+            .commit_if_session(epoch, access_token, |state| {
+                // 另一次续期已经成功提交过：晚到的失败不得把登录态改回 reauth。
+                if state.renew.seq != renew.seq {
+                    return false;
+                }
                 state.renew.last_attempt_at = Some(now);
                 state.renew.backoff_secs = next_backoff;
                 if err.is_forbidden() {
@@ -317,9 +339,10 @@ impl AuthService {
                     state.last_error = Some(format!("自动续期失败，{} 秒后重试", next_backoff));
                     warn!(error = %err, "自动续期失败，进入退避");
                 }
+                true
             })
             .await;
-        committed.is_some()
+        matches!(committed, Some(true))
     }
 }
 

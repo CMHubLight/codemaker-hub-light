@@ -148,6 +148,15 @@ pub(super) async fn forward_handler(
         },
         None => {
             let envelope = forward::parse_envelope(&body);
+            // OpenAI Chat 流式必须显式请求 usage，否则上游不回末帧 usage、本机账务
+            // 恒记 0。翻译路由在请求构造时已补，这里补上直通路由；其余路由不动。
+            let body = if envelope.stream && route.api_format == ApiFormat::OpenAiChat {
+                forward::with_stream_usage(&body)
+                    .map(Bytes::from)
+                    .unwrap_or(body)
+            } else {
+                body
+            };
             (body, envelope.model, envelope.stream, 0)
         }
     };

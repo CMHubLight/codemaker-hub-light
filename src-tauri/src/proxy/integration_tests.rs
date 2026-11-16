@@ -762,6 +762,88 @@ async fn sse_is_streamed_and_usage_cost_recorded() {
     proxy.shutdown().await;
 }
 
+/// 直通 `/v1/chat/completions` 的流式请求必须向上游请求 usage，否则末帧没有
+/// usage、本机账务恒记 0；顺带钉住这条路由（此前没有任何成功路径用例）的落库。
+#[tokio::test]
+async fn passthrough_streaming_chat_requests_usage() {
+    let (upstream, capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_credentials(),
+        &upstream,
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header("user-agent", "openai-python/1.0")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("直通 SSE 转发应完成");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("SSE 正文应可读");
+    assert!(body.contains("\"content\":\"Hello\""));
+    assert!(body.contains("[DONE]"), "直通路由必须原样透传 SSE");
+
+    let sent: Value = serde_json::from_str(&capture.last().body).expect("上游收到的应是 JSON");
+    assert_eq!(
+        sent["stream_options"]["include_usage"], true,
+        "直通 Chat 流式必须请求 usage"
+    );
+    assert_eq!(sent["model"], "gpt-4o", "其余字段不得被改写");
+
+    wait_for_requests(&proxy.db, 1).await;
+    assert_eq!(
+        count(&proxy.db, "SELECT input_tokens FROM proxy_session_requests"),
+        90,
+        "直通流式也必须把 usage 落库（prompt 100 - cached 10）"
+    );
+    assert_eq!(
+        count(
+            &proxy.db,
+            "SELECT output_tokens FROM proxy_session_requests"
+        ),
+        42
+    );
+
+    // 非流式不得注入 stream_options。
+    let _ = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("非流式转发应完成");
+    let sent: Value = serde_json::from_str(&capture.last().body).expect("上游收到的应是 JSON");
+    assert!(sent.get("stream_options").is_none(), "非流式请求不得被改写");
+
+    // `/v1/responses` 的 usage 在 response.completed 里，不需要（也不该）注入。
+    let _ = http()
+        .post(format!("{}/v1/responses", proxy.base_url))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .expect("Responses 转发应完成");
+    let sent: Value = serde_json::from_str(&capture.last().body).expect("上游收到的应是 JSON");
+    assert!(
+        sent.get("stream_options").is_none(),
+        "Responses 路由不得注入 stream_options"
+    );
+
+    proxy.shutdown().await;
+}
+
 #[tokio::test]
 async fn client_disconnect_records_abort() {
     let (upstream, _capture, _handle) = start_upstream().await;

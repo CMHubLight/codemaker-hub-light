@@ -9,6 +9,7 @@
 use axum::http::{header, header::HeaderName, HeaderMap, HeaderValue};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::auth::CredentialsSnapshot;
 
@@ -336,6 +337,38 @@ pub fn parse_envelope(body: &[u8]) -> RequestEnvelope {
     }
 }
 
+/// 直通 Chat 流式请求补 `stream_options.include_usage = true`。
+///
+/// OpenAI Chat 语义：`stream: true` 且未声明 `include_usage` 时上游不会在末帧回
+/// `usage`，代理只能把它记成 0 token。翻译路由（`/v1/messages`）在请求构造时已
+/// 显式补过；直通路由原本原样转发，这里做同样的最小改写。
+///
+/// 返回 `None` 表示无需改写：非流式、客户端已显式声明 `include_usage`（尊重其选择，
+/// 包括显式 `false`）、`stream_options` 存在但不是对象、或请求体不是合法 JSON。
+pub fn with_stream_usage(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object_mut()?;
+    if object.get("stream").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if let Some(options) = object.get_mut("stream_options") {
+        let Value::Object(options) = options else {
+            // 形状异常：不改写，保持与今天一致（宁可不加，也不破坏客户端字段）。
+            return None;
+        };
+        if options.contains_key("include_usage") {
+            return None;
+        }
+        options.insert("include_usage".to_string(), Value::Bool(true));
+    } else {
+        object.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
+    }
+    serde_json::to_vec(&value).ok()
+}
+
 /// 翻译路由的上游请求头：去掉 Anthropic 专属头，声明 JSON/SSE 期望。
 ///
 /// `accept-encoding: identity` 由 [`build_upstream_headers`] 对所有路由统一注入，
@@ -499,6 +532,51 @@ mod tests {
         headers.insert("x-session-id", HeaderValue::from_static("abc"));
         assert_eq!(external_session_id(&headers, "codex"), "abc");
         assert!(external_session_id(&HeaderMap::new(), "codex").starts_with("anon:codex:"));
+    }
+
+    #[test]
+    fn stream_usage_is_requested_for_passthrough_chat() {
+        let body =
+            br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let rewritten = with_stream_usage(body).expect("流式 Chat 应被改写");
+        let value: Value = serde_json::from_slice(&rewritten).expect("改写后应是合法 JSON");
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        // 其余字段必须原样保留。
+        assert_eq!(value["model"], "gpt-4o");
+        assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn stream_usage_keeps_existing_options_and_explicit_choice() {
+        // 已有其它 stream_options 键：保留，并补上 include_usage。
+        let body = br#"{"stream":true,"stream_options":{"include_obfuscation":false}}"#;
+        let value: Value =
+            serde_json::from_slice(&with_stream_usage(body).expect("应被改写")).expect("JSON");
+        assert_eq!(value["stream_options"]["include_obfuscation"], false);
+        assert_eq!(value["stream_options"]["include_usage"], true);
+
+        // 客户端显式声明 include_usage（true 或 false）一律不改写。
+        for body in [
+            br#"{"stream":true,"stream_options":{"include_usage":false}}"# as &[u8],
+            br#"{"stream":true,"stream_options":{"include_usage":true}}"# as &[u8],
+        ] {
+            assert!(with_stream_usage(body).is_none(), "显式声明时不得改写");
+        }
+    }
+
+    #[test]
+    fn stream_usage_leaves_non_stream_and_malformed_bodies_alone() {
+        assert!(
+            with_stream_usage(br#"{"stream":false}"#).is_none(),
+            "非流式不得改写"
+        );
+        assert!(with_stream_usage(br#"{"stream":true}"#).is_some());
+        assert!(with_stream_usage(b"not json").is_none());
+        assert!(
+            with_stream_usage(br#"{"stream":true,"stream_options":null}"#).is_none(),
+            "非对象 stream_options 保持原样"
+        );
+        assert!(with_stream_usage(b"[]").is_none());
     }
 
     #[test]

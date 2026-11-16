@@ -205,11 +205,13 @@ impl AuthService {
     pub(super) async fn store_quota(
         &self,
         epoch: u64,
+        access_token: &str,
         profile_id: Option<i64>,
         data: &QuotaData,
     ) -> Result<QuotaInfo, AuthError> {
-        // 注销后不再写额度快照，也不更新内存时间戳。
-        if !self.still_current(epoch).await {
+        // 注销或已被换成另一份凭据（新登录 / 续期）后，不再写额度快照、
+        // 也不更新内存时间戳：否则会把上一个身份的额度挂到新会话的档案上。
+        if !self.session_still(epoch, access_token).await {
             return Err(AuthError::SessionEnded);
         }
         let raw = serde_json::to_string(&data.raw)
@@ -232,8 +234,10 @@ impl AuthService {
                 return Err(AuthError::Internal(format!("写入额度快照失败：{err}")));
             }
         }
-        self.commit_if_current(epoch, |state| state.last_quota_at = Some(Utc::now()))
-            .await;
+        self.commit_if_session(epoch, access_token, |state| {
+            state.last_quota_at = Some(Utc::now())
+        })
+        .await;
         Ok(data.to_quota_info())
     }
 }
