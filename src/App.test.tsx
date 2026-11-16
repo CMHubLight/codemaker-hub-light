@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { invokeCmd } from './lib/ipc'
@@ -86,6 +86,9 @@ describe('App auth refresh', () => {
 
     await waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument())
     expect(screen.queryByText('无法连接本地后端')).toBeNull()
+    // `waitFor` 只保证 DOM 已提交；`authRef` 由 useEffect 同步，先 flush 一轮被动副作用。
+    // 否则紧接着触发的事件回调可能读到尚未更新的 ref，误判成"启动失败"（CI 上偶发）。
+    await act(async () => {})
 
     eventHandlers.map['app://second-instance']?.({})
 
