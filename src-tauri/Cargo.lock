@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "codemaker-hub-light"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes-gcm",
  "axum",
