@@ -1,8 +1,8 @@
 //! 用量查询的性能与"查询计划"回归测试。
 //!
-//! - `usage_queries_use_index_scan`：**普通测试**，只断言 `EXPLAIN QUERY PLAN`
-//!   的结构（命中索引、无全表扫描、无临时排序 B 树）。结构断言与机器快慢无关，
-//!   所以放在默认 `cargo test` 里跑。
+//! - `usage_queries_use_index_scan`：**普通测试**，先种少量行再断言
+//!   `EXPLAIN QUERY PLAN` 的结构（命中索引、无全表扫描、无临时排序 B 树）。
+//!   结构断言与机器快慢无关，所以放在默认 `cargo test` 里跑。
 //! - `list_requests_latency_100k`：`#[ignore]`，灌 10 万行后跑 20 次列表查询，
 //!   **只打印** p50/p95 与查询计划，不做时间断言（避免 CI 抖动误报）。
 //!   手动运行：`cargo test --test perf_usage -- --ignored --nocapture`
@@ -51,13 +51,19 @@ fn list_query() -> sql::RequestQuery<'static> {
     }
 }
 
-/// 列表与计数都必须走索引区间扫描。这条断言挡住"把索引改坏/把 WHERE 写成
-/// 可选过滤"导致的性能回退——只改 SQL 就会让它失败，与数据量无关。
+/// 列表、计数与用量聚合都必须走索引。这条断言挡住"把索引改坏/把 WHERE 写成
+/// 可选过滤"导致的性能回退。
+///
+/// 先种少量行再取计划：空表上"碰巧"选对索引不能证明真实数据分布下也选对。
 #[test]
 fn usage_queries_use_index_scan() {
     let db = test_db();
+    seed_requests(&db, 50);
+    seed_usage_daily(&db, 40);
+    seed_quota_snapshots(&db, 20);
     let conn = db.conn().expect("应能取连接");
 
+    // 1) 列表：keyset 索引 + 区间扫描，排序由索引满足（无临时 B 树）。
     let (list_sql, list_params) = sql::list_requests(&list_query());
     let list_plan = plan_rows(&conn, &list_sql, list_params);
     assert!(
@@ -73,12 +79,122 @@ fn usage_queries_use_index_scan() {
         "排序必须由索引满足：\n{list_plan}"
     );
 
+    // 2) 计数同样不得退化成全表扫描。
     let (count_sql, count_params) = sql::count_requests(&list_query());
     let count_plan = plan_rows(&conn, &count_sql, count_params);
     assert!(
         !count_plan.contains("SCAN proxy_session_requests"),
         "计数不得全表扫描：\n{count_plan}"
     );
+
+    // 3) 状态筛选 + 游标：等值列打头的复合索引必须同时满足筛选、日区间与排序。
+    let cursor = sql::Cursor {
+        day_local: "2026-10-20".to_string(),
+        started_at: "2026-10-20T01:00:00Z".to_string(),
+        id: 1,
+    };
+    let (status_sql, status_params) = sql::list_requests(&sql::RequestQuery {
+        status: Some("success"),
+        after: Some(&cursor),
+        ..list_query()
+    });
+    let status_plan = plan_rows(&conn, &status_sql, status_params);
+    assert!(
+        status_plan.contains("ix_psr_status_day_started"),
+        "状态筛选 + 游标应命中 (status_kind, day_local, started_at, id) 索引，实际计划：\n{status_plan}"
+    );
+    assert!(
+        !status_plan.contains("SCAN proxy_session_requests"),
+        "状态筛选不得全表扫描：\n{status_plan}"
+    );
+    assert!(
+        !status_plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "状态筛选的排序必须由索引满足：\n{status_plan}"
+    );
+
+    // 4) 日区间总量 / 按日聚合：覆盖索引（index-only，不回表）。
+    let (totals_sql, totals_params) = (sql::usage_totals(), day_params("2026-08-01", "2026-10-31"));
+    let totals_plan = plan_rows(&conn, &totals_sql, totals_params);
+    assert!(
+        totals_plan.contains("ix_usage_daily_day_cover"),
+        "日区间汇总应命中覆盖索引，实际计划：\n{totals_plan}"
+    );
+
+    let (by_day_sql, by_day_params) = (sql::usage_by_day(), day_params("2026-08-01", "2026-10-31"));
+    let by_day_plan = plan_rows(&conn, &by_day_sql, by_day_params);
+    assert!(
+        by_day_plan.contains("ix_usage_daily_day_cover"),
+        "按日聚合应命中覆盖索引，实际计划：\n{by_day_plan}"
+    );
+    assert!(
+        !by_day_plan.contains("USE TEMP B-TREE"),
+        "按日分组/排序应由覆盖索引顺序满足：\n{by_day_plan}"
+    );
+
+    // 5) 最新成功额度快照：部分索引（status = 'ok'）。
+    let quota_plan = plan_rows(
+        &conn,
+        &sql::latest_quota_snapshot(),
+        vec![
+            rusqlite::types::Value::Text("global".to_string()),
+            rusqlite::types::Value::Null,
+        ],
+    );
+    assert!(
+        quota_plan.contains("ix_quota_snapshots_ok_latest"),
+        "最新成功快照应命中部分索引，实际计划：\n{quota_plan}"
+    );
+}
+
+fn day_params(from: &str, to: &str) -> Vec<rusqlite::types::Value> {
+    vec![
+        rusqlite::types::Value::Text(from.to_string()),
+        rusqlite::types::Value::Text(to.to_string()),
+    ]
+}
+
+/// 种少量 `usage_daily` 行（每天一行，供覆盖索引的计划断言使用）。
+fn seed_usage_daily(db: &Db, rows: i64) {
+    let mut conn = db.conn().expect("应能取连接");
+    let tx = conn.transaction().expect("应能开事务");
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR REPLACE INTO usage_daily \
+                   (day, api_format, model, client, request_count, error_count, input_tokens, \
+                    output_tokens, cache_read_tokens, cache_write_tokens, cost_yuan, \
+                    total_duration_ms, updated_at) \
+                 VALUES (?1, 'anthropic', 'claude-sonnet-4', 'claude-code', 1, 0, 10, 5, 2, 1, \
+                         0.01, 100, '2026-10-01T00:00:00Z')",
+            )
+            .expect("应能准备插入");
+        for index in 0..rows {
+            let day = format!("2026-{:02}-{:02}", 8 + index / 28, 1 + index % 28);
+            stmt.execute(rusqlite::params![day])
+                .expect("插入日聚合应成功");
+        }
+    }
+    tx.commit().expect("提交应成功");
+}
+
+/// 种少量额度快照（全部成功，供部分索引的计划断言使用）。
+fn seed_quota_snapshots(db: &Db, rows: i64) {
+    let mut conn = db.conn().expect("应能取连接");
+    let tx = conn.transaction().expect("应能开事务");
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO quota_snapshots (quota_type, status, monthly_quota, fetched_at) \
+                 VALUES ('global', 'ok', ?1, ?2)",
+            )
+            .expect("应能准备插入");
+        for index in 0..rows {
+            let fetched_at = format!("2026-10-{:02}T00:00:00Z", 1 + index % 28);
+            stmt.execute(rusqlite::params![index as f64, fetched_at])
+                .expect("插入额度快照应成功");
+        }
+    }
+    tx.commit().expect("提交应成功");
 }
 
 /// 单事务灌 `rows` 行请求（每行一个不同 id；同一天内 started_at 相同，

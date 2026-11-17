@@ -88,6 +88,19 @@ const MIGRATIONS: &[Migration] = &[
             ),
         }],
     },
+    Migration {
+        version: 5,
+        name: "0005_backfill_repair",
+        // **刻意不设 probe**：探测只能回答"列在不在"，回答不了"列里还有没有 NULL
+        // 行"。0003 在"ALTER 已提交、回填未跑"的窗口崩溃后，重跑时探测命中列、
+        // 整条语句被跳过，历史行的 day_local/status_kind 就永久是 NULL。这里用
+        // 不带探测的幂等回填（`WHERE ... IS NULL`），版本行缺失就无条件补跑一遍，
+        // 重复执行零副作用。
+        steps: &[Step {
+            sql: include_str!("../../migrations/0005_backfill_repair.sql"),
+            probe: None,
+        }],
+    },
 ];
 
 /// 最新版本号（迁移列表的最后一个）。
@@ -411,6 +424,10 @@ mod tests {
 
     /// 0004 的数据语句（去重）与 DDL（唯一索引）必须可整批重跑：先回退成
     /// "未建唯一索引 + 已存在重复费用行"，重跑后保留 MAX(id) 并重建唯一索引。
+    ///
+    /// 版本行必须从 4 起**全删**（含之后新增的 5…）：`run_migrations` 的快路径用
+    /// `MAX(version)` 判断"是否已是最新"，只删 4 而留下 5 会直接走快路径返回，
+    /// 0004 根本不会重跑。
     #[test]
     fn migration_0004_partial_retry_heals() {
         let db = Db::open_in_memory().expect("内存库应可打开");
@@ -422,7 +439,7 @@ mod tests {
                  DROP INDEX IF EXISTS ix_quota_snapshots_ok_latest; \
                  DROP INDEX IF EXISTS ix_psr_day_started_id; \
                  DROP INDEX IF EXISTS ix_psr_status_day_started; \
-                 DELETE FROM schema_migrations WHERE version = 4;",
+                 DELETE FROM schema_migrations WHERE version >= 4;",
             )
             .expect("回退 0004 应成功");
             conn.execute_batch(
@@ -512,5 +529,166 @@ mod tests {
             .expect("回填后的列应可读");
         assert_eq!(day_local, expected_day, "day_local 应按本地时区回填");
         assert_eq!(status_kind, "success");
+    }
+
+    /// 直接插一行"0003 回填被跳过"的历史行：两列都是 NULL。
+    fn insert_legacy_row(
+        conn: &rusqlite::Connection,
+        started_at: &str,
+        status_code: Option<i64>,
+        error_kind: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO proxy_session_requests \
+               (method, request_path, api_format, status_code, error_kind, started_at) \
+             VALUES ('POST', '/v1/messages', 'anthropic', ?1, ?2, ?3)",
+            rusqlite::params![status_code, error_kind, started_at],
+        )
+        .expect("插入历史行应成功");
+    }
+
+    fn null_backfill_counts(conn: &rusqlite::Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT SUM(day_local IS NULL), SUM(status_kind IS NULL) \
+             FROM proxy_session_requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("统计 NULL 行应成功")
+    }
+
+    /// 0005：版本 4 的库里存在 `day_local`/`status_kind` 为 NULL 的历史行（0003 的
+    /// 回填在崩溃窗口里被跳过），`run_migrations` 必须补齐；已有值的行不得被改写；
+    /// 再次运行零变更。
+    #[test]
+    fn migration_0005_backfills_null_columns() {
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        run_migrations_until(&db, Some(4)).expect("0004 应可应用");
+        {
+            let conn = db.conn().expect("应能取连接");
+            // 覆盖回填 CASE 的四个分支。
+            insert_legacy_row(&conn, "2026-10-21T16:30:00Z", Some(200), None);
+            insert_legacy_row(
+                &conn,
+                "2026-10-22T01:00:00Z",
+                Some(502),
+                Some("upstream_error"),
+            );
+            insert_legacy_row(&conn, "2026-10-23T02:00:00Z", None, Some("client_aborted"));
+            insert_legacy_row(&conn, "2026-10-24T03:00:00Z", None, None);
+            // 已回填过的行：0005 不得覆盖（回填语句带 WHERE ... IS NULL）。
+            conn.execute(
+                "INSERT INTO proxy_session_requests \
+                   (method, request_path, api_format, status_code, started_at, day_local, status_kind) \
+                 VALUES ('POST', '/v1/messages', 'anthropic', 200, '2026-10-20T00:00:00Z', \
+                         '2026-10-19', 'cancelled')",
+                [],
+            )
+            .expect("插入已回填行应成功");
+        }
+
+        run_migrations(&db).expect("0005 应可应用");
+
+        let conn = db.conn().expect("应能取连接");
+        assert_eq!(
+            null_backfill_counts(&conn),
+            (0, 0),
+            "0005 后不得再有 day_local/status_kind 为 NULL 的行"
+        );
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT day_local, status_kind FROM proxy_session_requests ORDER BY id ASC")
+            .expect("准备查询应成功")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("查询应成功")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("收集行应成功");
+        // day_local 的口径是"本地日"（与 usage::local_day / 0003 一致），
+        // 因此期望值按运行测试机器的时区计算，不能硬编码 UTC 日期。
+        let expected_day = |started_at: &str| {
+            crate::usage::local_day(
+                started_at
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .expect("时间应可解析"),
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (expected_day("2026-10-21T16:30:00Z"), "success".to_string()),
+                (expected_day("2026-10-22T01:00:00Z"), "error".to_string()),
+                (
+                    expected_day("2026-10-23T02:00:00Z"),
+                    "cancelled".to_string()
+                ),
+                (expected_day("2026-10-24T03:00:00Z"), "unknown".to_string()),
+                // 已有值原样保留。
+                ("2026-10-19".to_string(), "cancelled".to_string()),
+            ],
+            "回填口径必须与 usage::local_day 一致"
+        );
+        assert_eq!(
+            repo::schema_version(&conn).expect("读取版本应成功"),
+            latest_version()
+        );
+        drop(conn);
+
+        // 再次运行：快路径直接返回，任何行都不许被改动。
+        let snapshot = |db: &Db| -> Vec<(i64, Option<String>, Option<String>)> {
+            let conn = db.conn().expect("应能取连接");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, day_local, status_kind FROM proxy_session_requests ORDER BY id",
+                )
+                .expect("准备查询应成功");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("查询应成功")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("收集行应成功");
+            rows
+        };
+        let before = snapshot(&db);
+        run_migrations(&db).expect("再次迁移应成功");
+        assert_eq!(snapshot(&db), before, "重复运行 0005 不得有任何副作用");
+        let version_rows: i64 = {
+            let conn = db.conn().expect("应能取连接");
+            conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("计数应成功")
+        };
+        assert_eq!(version_rows, MIGRATIONS.len() as i64);
+    }
+
+    /// 0005 不设 probe 的理由：即使 `day_local`/`status_kind` **列已存在**，只要
+    /// 版本行缺失（0003 崩溃窗口 / 手工删版本行），重跑也必须补做回填。
+    #[test]
+    fn migration_0005_rebackfills_when_version_row_missing() {
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        run_migrations(&db).expect("首次迁移应成功");
+        insert_legacy_row(
+            &db.conn().expect("应能取连接"),
+            "2026-10-25T01:00:00Z",
+            Some(500),
+            None,
+        );
+        {
+            let conn = db.conn().expect("应能取连接");
+            conn.execute_batch("DELETE FROM schema_migrations WHERE version = 5;")
+                .expect("删版本行应成功");
+        }
+
+        run_migrations(&db).expect("版本行缺失时应重跑 0005");
+
+        let conn = db.conn().expect("应能取连接");
+        let (day_local, status_kind): (String, String) = conn
+            .query_row(
+                "SELECT day_local, status_kind FROM proxy_session_requests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("回填后的列应可读");
+        assert_eq!(day_local, "2026-10-25");
+        assert_eq!(status_kind, "error");
     }
 }

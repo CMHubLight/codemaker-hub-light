@@ -37,6 +37,22 @@ fn day_prefix(value: &str) -> Option<String> {
     Some(candidate.to_string())
 }
 
+/// 解析日期筛选：字段缺省（`None`）用默认值；**出现但解析失败时报错**。
+///
+/// 旧实现 `and_then(day_prefix).unwrap_or(默认)` 把非法值静默放宽成"不过滤"，
+/// 用户选了一个坏日期会看到全量数据却以为筛选生效（与 protocol/status 的口径
+/// 也不一致——那两处早已返回 `InvalidArgument`）。
+fn parse_day_filter(field: &str, value: Option<&str>, default: &str) -> Result<String, DbError> {
+    match value {
+        None => Ok(default.to_string()),
+        Some(raw) => day_prefix(raw).ok_or_else(|| {
+            DbError::InvalidArgument(format!(
+                "无效的日期筛选 {field}：{raw}（应为 YYYY-MM-DD 或 ISO 日期时间）"
+            ))
+        }),
+    }
+}
+
 fn normalize_protocol(value: &str) -> Option<&'static str> {
     match value.trim() {
         "anthropic" | "anthropic_messages" => Some("anthropic"),
@@ -163,16 +179,8 @@ pub fn cost_trend_local(db: &Db, days: i64, credit_to_yuan: f64) -> Result<CostT
 /// `count` 与 `list` 在同一个读事务里执行，保证 `total` 与 `items` 一致。
 pub fn requests(db: &Db, filter: &RequestFilter) -> Result<RequestPage, DbError> {
     let today_string = day_string(today());
-    let from_day = filter
-        .from
-        .as_deref()
-        .and_then(day_prefix)
-        .unwrap_or_else(|| EPOCH_DAY.to_string());
-    let to_day = filter
-        .to
-        .as_deref()
-        .and_then(day_prefix)
-        .unwrap_or(today_string);
+    let from_day = parse_day_filter("from", filter.from.as_deref(), EPOCH_DAY)?;
+    let to_day = parse_day_filter("to", filter.to.as_deref(), &today_string)?;
 
     let model = filter
         .model
@@ -370,6 +378,61 @@ mod tests {
             },
         )
         .expect("空串表示未选择，不应报错");
+        assert_eq!(page.total, 0);
+    }
+
+    /// `from`/`to` 出现但解析失败必须报错（不能静默放宽成"不过滤"）；字段缺省
+    /// 仍用默认区间。ISO 日期时间（带时间与时区）仍按前 10 位接受。
+    #[test]
+    fn invalid_from_to_are_rejected_not_widened() {
+        let db = empty_db();
+        for (field, value) in [
+            ("from", "2026-13-40"),
+            ("to", "not-a-date"),
+            ("from", "2026/10/01"),
+            ("to", ""),
+        ] {
+            let filter = if field == "from" {
+                RequestFilter {
+                    from: Some(value.to_string()),
+                    ..Default::default()
+                }
+            } else {
+                RequestFilter {
+                    to: Some(value.to_string()),
+                    ..Default::default()
+                }
+            };
+            let error = requests(&db, &filter).expect_err("非法日期筛选应被拒绝，而不是放宽");
+            match error {
+                DbError::InvalidArgument(message) => {
+                    assert!(
+                        message.contains("无效的日期筛选"),
+                        "错误信息应说明是日期筛选：{message}"
+                    );
+                    assert!(
+                        message.contains(field),
+                        "错误信息应指明字段 {field}：{message}"
+                    );
+                }
+                other => panic!("错误类型应为参数无效：{other}"),
+            }
+        }
+
+        // 两个字段都缺省：默认区间，不报错。
+        let page = requests(&db, &RequestFilter::default()).expect("缺省日期应成功");
+        assert_eq!(page.total, 0);
+
+        // ISO 日期时间（含时区）仍合法：只取前 10 位。
+        let page = requests(
+            &db,
+            &RequestFilter {
+                from: Some("2026-10-01T00:00:00+08:00".to_string()),
+                to: Some("2026-10-20T23:59:59Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("ISO 日期时间应被接受");
         assert_eq!(page.total, 0);
     }
 

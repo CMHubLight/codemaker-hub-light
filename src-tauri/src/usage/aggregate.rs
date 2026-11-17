@@ -16,11 +16,17 @@ pub fn round4(value: f64) -> f64 {
 }
 
 /// 比率（0..=1），分母为 0 时返回 None（前端据此显示“—”而非 0）。
+///
+/// 分子理论上不应超过分母，但异常/历史数据（重试重复计数、手工修库、聚合口径
+/// 不一致）可能给出 >100% 或负数；统一 clamp 到 0..=1，避免 UI 出现 "120%"
+/// 命中率或负比率。
 pub fn ratio(numerator: i64, denominator: i64) -> Option<f64> {
     if denominator <= 0 {
         return None;
     }
-    Some(round4(numerator as f64 / denominator as f64))
+    Some(round4(
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0),
+    ))
 }
 
 /// 总量行 → 前端 `UsageTotals`。
@@ -167,6 +173,19 @@ mod tests {
         assert_eq!(totals.cache_hit_rate, None);
         assert_eq!(totals.error_rate, None);
         assert_eq!(totals.avg_latency_ms, None);
+    }
+
+    /// 比率必须落在 0..=1：分子超过分母（异常数据）clamp 到 1，负数 clamp 到 0；
+    /// 分母 <= 0 仍是 None（"无数据"不能用 0 表示）。
+    #[test]
+    fn ratio_is_clamped_to_unit_interval() {
+        assert_eq!(ratio(1, 2), Some(0.5));
+        assert_eq!(ratio(0, 5), Some(0.0));
+        assert_eq!(ratio(3, 2), Some(1.0), "超过 100% 的比率应 clamp 到 1");
+        assert_eq!(ratio(-1, 2), Some(0.0), "负比率应 clamp 到 0");
+        assert_eq!(ratio(i64::MAX, 1), Some(1.0));
+        assert_eq!(ratio(0, 0), None, "分母为 0 表示无数据");
+        assert_eq!(ratio(1, -2), None, "分母为负同样表示无数据");
     }
 
     #[test]

@@ -131,12 +131,7 @@ pub fn latest_quota_snapshot(
     quota_type: &str,
     profile_id: Option<i64>,
 ) -> Result<Option<QuotaSnapshotRow>, DbError> {
-    let sql = format!(
-        "SELECT {} FROM quota_snapshots \
-         WHERE quota_type = ?1 AND status = 'ok' AND (?2 IS NULL OR profile_id = ?2) \
-         ORDER BY fetched_at DESC, id DESC LIMIT 1",
-        sql::QUOTA_SNAPSHOT_COLUMNS
-    );
+    let sql = sql::latest_quota_snapshot();
     Ok(conn
         .query_row(
             &sql,
