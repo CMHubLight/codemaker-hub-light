@@ -310,7 +310,7 @@ mod tests {
             .expect("统计应成功");
         assert_eq!(non_ok, 0, "过期失败快照应被删除");
 
-        let latest = repo::latest_quota_snapshot(&conn, "global")
+        let latest = repo::latest_quota_snapshot(&conn, "global", None)
             .expect("读取最新快照应成功")
             .expect("清理后仍应有成功快照");
         assert_eq!(latest.monthly_quota, Some(204.0), "保留的是最新一条");

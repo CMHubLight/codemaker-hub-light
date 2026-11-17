@@ -228,12 +228,13 @@ pub async fn quota_get(
 ) -> Result<Option<QuotaInfo>, String> {
     let force = force.unwrap_or(false);
     let gateway_url = state.settings.read().await.gateway_url.clone();
-    let quota = state
+    let (quota, updated) = state
         .auth
         .refresh_quota(&gateway_url, force)
         .await
         .map_err(|err| err.to_string())?;
-    if force {
+    // 只有数值真的变化才广播：后台每 5 分钟写库成功不再触发前端整页重取。
+    if force && updated {
         if let Some(quota) = &quota {
             let _ = app.emit("quota://updated", quota);
         }

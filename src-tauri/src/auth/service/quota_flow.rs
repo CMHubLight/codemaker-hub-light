@@ -4,10 +4,16 @@ use super::*;
 
 impl AuthService {
     /// 读取最近一次成功快照（不触发网络）。
+    ///
+    /// 只读**当前激活档案**的快照：换号后旧账号的行仍在库里，但不能再被当成
+    /// 当前账号的额度展示（`QuotaInfo` 没有账号标识，UI 无从区分）。
     pub async fn latest_quota(&self) -> Result<Option<QuotaInfo>, AuthError> {
-        let snapshot = blocking::run(&self.db, |db| {
+        let Some(profile_id) = self.active_profile_id().await else {
+            return Ok(None);
+        };
+        let snapshot = blocking::run(&self.db, move |db| {
             let conn = db.conn()?;
-            let snapshot = repo::latest_quota_snapshot(&conn, "global")?;
+            let snapshot = repo::latest_quota_snapshot(&conn, "global", Some(profile_id))?;
             Ok(snapshot)
         })
         .await
@@ -47,13 +53,15 @@ impl AuthService {
     }
 
     /// 额度刷新；`force = false` 时只读本地快照。
+    ///
+    /// 返回 `(额度, 数值是否变化)`：只有变化时调用方才广播 `quota://updated`。
     pub async fn refresh_quota(
         &self,
         gateway_url: &str,
         force: bool,
-    ) -> Result<Option<QuotaInfo>, AuthError> {
+    ) -> Result<(Option<QuotaInfo>, bool), AuthError> {
         if !force {
-            return self.latest_quota().await;
+            return Ok((self.latest_quota().await?, false));
         }
 
         self.ensure_loaded().await;
@@ -67,10 +75,19 @@ impl AuthService {
         match self.fetch_quota(&gateway, credentials.access_token()).await {
             Ok(data) => {
                 let profile_id = self.active_profile_id().await;
-                Ok(Some(
-                    self.store_quota(epoch, credentials.access_token(), profile_id, &data)
-                        .await?,
-                ))
+                match self
+                    .store_quota(epoch, credentials.access_token(), profile_id, &data)
+                    .await
+                {
+                    Ok((info, changed)) => Ok((Some(info), changed)),
+                    // 刷新期间登录态被换掉：这次快照不属于当前会话，静默作废，
+                    // 不要把内部代次错误暴露成「登录会话已结束」。
+                    Err(AuthError::SessionEnded) => {
+                        warn!("额度刷新期间登录态已变化，本次结果作废");
+                        Ok((None, false))
+                    }
+                    Err(err) => Err(err),
+                }
             }
             Err(QuotaFailure::Forbidden) => Err(AuthError::Rejected(
                 "无权限访问用量信息（HTTP 403）".to_string(),
@@ -128,7 +145,7 @@ impl AuthService {
             .store_quota(epoch, access_token, profile_id, &data)
             .await
         {
-            Ok(info) => (Some(info), true),
+            Ok((info, changed)) => (Some(info), changed),
             Err(err) => {
                 warn!(error = %err, context, "额度快照写入失败");
                 (None, false)

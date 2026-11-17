@@ -636,15 +636,46 @@ mod tests {
             })
             .await
             .expect("代次未变应可写");
-        let info = service
-            .store_quota(epoch, &access_token, None, &data)
+        let profile = AuthProfile {
+            user: "alice".to_string(),
+            display_name: None,
+            dept: None,
+            server_url: "https://api.example.test".to_string(),
+            issued_at: Some(1),
+            expires_at: Some(2),
+        };
+        let profile_id = service
+            .persist_profile(epoch, &profile, &[], None)
+            .await
+            .expect("账号档案应写入");
+        let (info, changed) = service
+            .store_quota(epoch, &access_token, Some(profile_id), &data)
             .await
             .expect("额度写入应成功");
         assert_eq!(info.remaining, Some(750.0));
         assert!(info.is_active);
+        assert!(changed, "首次写入应视为额度更新");
 
         let latest = service.latest_quota().await.expect("读取应成功");
-        assert_eq!(latest.map(|quota| quota.remaining), Some(Some(750.0)));
+        assert_eq!(
+            latest.map(|quota| quota.remaining),
+            Some(Some(750.0)),
+            "读取应返回当前档案的快照"
+        );
+
+        // 数值没变：不再广播（否则每 5 分钟把请求页打回第一页）。
+        let (_, unchanged) = service
+            .store_quota(epoch, &access_token, Some(profile_id), &data)
+            .await
+            .expect("重复写入应成功");
+        assert!(!unchanged, "相同数字不应判定为额度更新");
+
+        let other = quota::parse_quota(&serde_json::json!({ "remaining": 700.0 }));
+        let (_, changed) = service
+            .store_quota(epoch, &access_token, Some(profile_id), &other)
+            .await
+            .expect("新数值写入应成功");
+        assert!(changed, "数字变化应判定为额度更新");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1449,6 +1480,80 @@ mod tests {
             service.latest_quota().await.expect("读取应成功").is_none(),
             "不得留下旧身份的额度快照"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 额度读取按激活档案隔离：换号后旧账号的快照不得当成当前账号的。
+    #[tokio::test]
+    async fn latest_quota_is_scoped_to_active_profile() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        let alice_profile = service
+            .persist_profile(
+                epoch,
+                &AuthProfile {
+                    user: "alice".to_string(),
+                    display_name: None,
+                    dept: None,
+                    server_url: "https://api.example.test".to_string(),
+                    issued_at: Some(1),
+                    expires_at: Some(2),
+                },
+                &[],
+                None,
+            )
+            .await
+            .expect("alice 档案应写入");
+        service
+            .store_quota(
+                epoch,
+                "token-alice",
+                Some(alice_profile),
+                &quota::parse_quota(&serde_json::json!({ "remaining": 100.0 })),
+            )
+            .await
+            .expect("alice 额度应写入");
+
+        seed_logged_in(&service, "bob", "token-bob").await;
+        let bob_profile = service
+            .persist_profile(
+                epoch,
+                &AuthProfile {
+                    user: "bob".to_string(),
+                    display_name: None,
+                    dept: None,
+                    server_url: "https://api.example.test".to_string(),
+                    issued_at: Some(1),
+                    expires_at: Some(2),
+                },
+                &[],
+                None,
+            )
+            .await
+            .expect("bob 档案应写入");
+
+        assert!(
+            service.latest_quota().await.expect("读取应成功").is_none(),
+            "bob 还没有额度快照时不得显示 alice 的"
+        );
+
+        service
+            .store_quota(
+                epoch,
+                "token-bob",
+                Some(bob_profile),
+                &quota::parse_quota(&serde_json::json!({ "remaining": 200.0 })),
+            )
+            .await
+            .expect("bob 额度应写入");
+        let latest = service
+            .latest_quota()
+            .await
+            .expect("读取应成功")
+            .expect("应返回当前账号额度");
+        assert_eq!(latest.remaining, Some(200.0));
 
         let _ = fs::remove_dir_all(&dir);
     }

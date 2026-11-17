@@ -112,7 +112,7 @@ usage_request_detail
 | `usage_requests` | `filter?: RequestFilter` | `RequestPage` | 10s | `读取请求列表失败：…`（含 `未知的协议筛选值` / `未知的状态筛选值`） |
 | `usage_request_detail` | `id: number` | `RequestDetail \| null` | 10s | `读取请求详情失败：…` |
 
-- `usage_summary` 在一个读事务里跑 5 个查询（今日、本月、近 30 天、本月模型分布、最近 10 条请求），保证页面内数字同快照。
+- `usage_summary` 在一个读事务里跑 2 个查询（今日、最近 10 条请求）；云端「本月 Token/消耗/模型分布」来自 `quota_get`，30 天/24 小时曲线来自 `cost_trend_get`，它们不是同一快照，界面分别标注来源。
 - `cost_trend_get("24h")` 打上游小时费用接口，返回积分（`source = cloud`、`unit = points`）；`"30d"` 读本机 `usage_daily`，返回人民币（`source = local`、`unit = cny`），缺失日期补 0。
 - `usage_requests` 默认 `limit = 50`（上限 200），`offset` 上限 100000；优先用 `after` 游标（keyset），`include_total = false` 时跳过 `COUNT` 并让 `total = -1`。排序键是 `(day_local, started_at, id)`，游标原样传回即可翻页。
 - `usage_request_detail` 返回正文、费用明细等；正文默认未记录时为 `null`。该命令目前界面未使用。
@@ -127,7 +127,7 @@ usage_request_detail
 | `AuthLoginStart`（前端 `LoginSession`） | `login_url`、`poll_uuid`、`redirect_uri`、`poll_interval_secs`、`timeout_secs`、`opened_browser`、`hint` |
 | `QuotaInfo` | 额度金额与百分比、`reset_day`、`reset_at`、`period_start`、`is_active`、`usage_cost`、`fetched_at`、`status`，以及云端月度分布 `total_tokens`、`app_tokens`、`app_costs`、`model_tokens`、`model_costs` |
 | `ProxyStatus` | `running`、`host`、`port`、`base_url`、`gateway_url`、`last_error`、`started_at`、`uptime_secs`、`request_count`、`error_count`、`port_file`、`health_url` |
-| `UsageSummary` | `today` / `month`（`UsageTotals`）、`daily`（近 30 天）、`models`、`recent`（最近 10 条）、`generated_at` |
+| `UsageSummary` | `today`（`UsageTotals`）、`recent`（最近 10 条）、`generated_at` |
 | `UsageTotals` | `requests`、四类 token、`total_tokens`、`cost_yuan`、`cache_hit_rate`、`avg_latency_ms`、`error_rate`（无数据为 `null`） |
 | `RecentRequest` | `id`、`created_at`、`model`、`protocol`、`client`、`status`、`latency_ms`、`first_byte_ms`（首个上游响应字节，仅流式请求有值）、`input_tokens`、`output_tokens`、`cost_yuan` |
 | `RequestPage` | `total`（`-1` 表示未统计）、`items`、`next_cursor`、`prev_cursor` |

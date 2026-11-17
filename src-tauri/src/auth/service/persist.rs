@@ -202,13 +202,18 @@ impl AuthService {
         }
     }
 
+    /// 写入一条额度快照，返回 `(最新额度, 数值是否变化)`。
+    ///
+    /// 只有"用户可见的额度数字"变化才把 `changed` 置真；后台每 5 分钟写库成功
+    /// 不再等于"额度更新"，避免 `quota://updated` 把请求页反复打回第一页、
+    /// 并顺带多打一次云端 24h 曲线接口。
     pub(super) async fn store_quota(
         &self,
         epoch: u64,
         access_token: &str,
         profile_id: Option<i64>,
         data: &QuotaData,
-    ) -> Result<QuotaInfo, AuthError> {
+    ) -> Result<(QuotaInfo, bool), AuthError> {
         // 注销或已被换成另一份凭据（新登录 / 续期）后，不再写额度快照、
         // 也不更新内存时间戳：否则会把上一个身份的额度挂到新会话的档案上。
         if !self.session_still(epoch, access_token).await {
@@ -218,26 +223,46 @@ impl AuthService {
             .map_err(|err| AuthError::Internal(format!("额度 JSON 序列化失败：{err}")))?;
         // `NewQuotaSnapshot` 借用了 `data` 的字段；闭包必须是 'static，克隆一份进去。
         let owned = data.clone();
-        let persisted = blocking::run(&self.db, move |db| {
+        let changed = blocking::run(&self.db, move |db| {
             let conn = db.conn()?;
+            let previous = repo::latest_quota_snapshot(&conn, "global", profile_id)?;
             let snapshot = owned.to_snapshot(profile_id, &raw);
+            let changed = previous
+                .as_ref()
+                .is_none_or(|previous| quota_numbers_changed(previous, &snapshot));
             repo::insert_quota_snapshot(&conn, &snapshot)?;
-            Ok(())
+            Ok(changed)
         })
         .await;
-        match persisted {
-            Ok(()) => {}
+        let changed = match changed {
+            Ok(changed) => changed,
             Err(err @ DbError::Pool(_)) => {
                 return Err(AuthError::Internal(format!("打开数据库失败：{err}")));
             }
             Err(err) => {
                 return Err(AuthError::Internal(format!("写入额度快照失败：{err}")));
             }
-        }
+        };
         self.commit_if_session(epoch, access_token, |state| {
             state.last_quota_at = Some(Utc::now())
         })
         .await;
-        Ok(data.to_quota_info())
+        Ok((data.to_quota_info(), changed))
     }
+}
+
+/// 两次快照的"用户可见数字"是否不同（时间戳/原始 JSON 不参与比较）。
+fn quota_numbers_changed(
+    previous: &repo::QuotaSnapshotRow,
+    next: &repo::NewQuotaSnapshot<'_>,
+) -> bool {
+    previous.monthly_quota != next.monthly_quota
+        || previous.used != next.used
+        || previous.remaining != next.remaining
+        || previous.percentage != next.percentage
+        || previous.reset_day != next.reset_day
+        || previous.period_start.as_deref() != next.period_start
+        || previous.reset_at.as_deref() != next.reset_at
+        || previous.timezone.as_deref() != next.timezone
+        || previous.is_active != next.is_active
 }

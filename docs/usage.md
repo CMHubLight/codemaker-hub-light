@@ -23,7 +23,7 @@
 | `proxy_request_costs` | 一条请求一行 | `cost_yuan`、`cost_source`、`currency`、`total_credit`、`trace_id`、`detail_json` |
 | `usage_daily` | 日 × 协议 × 模型 × 客户端 | `request_count`、`error_count`、四个 token、`cost_yuan`、`total_duration_ms` |
 
-会话标识优先取客户端会话头，没有则用 `anon:{client}:{本地日期}`；客户端类型由 User-Agent 识别（claude / codex / opencode / kimi，其余 `unknown`）。`proxy_sessions` 与 `usage_daily` 都用单条 UPSERT 累加，避免并发首请求撞唯一索引导致整条事务回滚。
+会话标识优先取客户端会话头，没有则用 `anon:{client}:{本地日期}`；客户端类型由 User-Agent 识别（`claude-code` / `codex` / `opencode` / `kimi`，其余 `unknown`）。`proxy_sessions` 与 `usage_daily` 都用单条 UPSERT 累加，避免并发首请求撞唯一索引导致整条事务回滚。
 
 ## 2. token 四元组归一
 
@@ -115,7 +115,7 @@ UPDATE proxy_session_requests
 
 ## 6. 聚合与保留
 
-`usage_daily` 是唯一的日聚合表，维度是 `(day, api_format, model, client)`，累加 `request_count`、`error_count`、四个 token、`cost_yuan`、`total_duration_ms`。概览页的五个查询（今日、本月、最近 30 天趋势、本月模型分布、最近 10 条请求）在**同一个读事务**里执行，否则并发写入时仪表盘内部数字会互相对不上。
+`usage_daily` 是唯一的日聚合表，维度是 `(day, api_format, model, client)`，累加 `request_count`、`error_count`、四个 token、`cost_yuan`、`total_duration_ms`。概览页的 `usage_summary` 只在**同一个读事务**里跑两个查询（今日 + 最近 10 条请求）；「本月 Token/消耗/模型分布」来自云端 `quota_get`，30 天/24 小时曲线来自 `cost_trend_get`，三者不是同一个快照（见 §5 的口径说明）。
 
 保留策略由设置键 `retention_days` 控制，默认 90 天，允许 1–3650。清理在启动后立即跑一次，之后每 24 小时一次（`MAINTENANCE_INTERVAL`，`MissedTickBehavior::Delay`，机器休眠恢复后最多补一次）；`retention_days` 每轮从设置读取，改完下一轮生效。
 

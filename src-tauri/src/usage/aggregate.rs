@@ -3,8 +3,8 @@
 use chrono::{SecondsFormat, Utc};
 
 use crate::{
-    db::repo::{RequestRow, UsageDayRow, UsageDimRow, UsageTotalsRow},
-    usage::{DailyUsage, ModelUsage, RecentRequest, UsageSummary, UsageTotals},
+    db::repo::{RequestRow, UsageTotalsRow},
+    usage::{RecentRequest, UsageSummary, UsageTotals},
 };
 
 /// 统一保留 4 位小数（UI 展示精度）。
@@ -48,40 +48,6 @@ pub fn totals_from_row(row: &UsageTotalsRow) -> UsageTotals {
         },
         error_rate: ratio(row.error_count, row.request_count),
     }
-}
-
-/// 按日聚合行 → 前端趋势点。
-pub fn daily_from_rows(rows: Vec<UsageDayRow>) -> Vec<DailyUsage> {
-    rows.into_iter()
-        .map(|row| DailyUsage {
-            date: row.day,
-            requests: row.totals.request_count,
-            tokens: row.totals.input_tokens
-                + row.totals.output_tokens
-                + row.totals.cache_read_tokens
-                + row.totals.cache_write_tokens,
-            cost_yuan: round4(row.totals.cost_yuan),
-        })
-        .collect()
-}
-
-/// 维度聚合行 → 前端模型分布。
-pub fn models_from_rows(rows: Vec<UsageDimRow>) -> Vec<ModelUsage> {
-    rows.into_iter()
-        .map(|row| ModelUsage {
-            model: if row.key.is_empty() {
-                "unknown".to_string()
-            } else {
-                row.key
-            },
-            requests: row.totals.request_count,
-            tokens: row.totals.input_tokens
-                + row.totals.output_tokens
-                + row.totals.cache_read_tokens
-                + row.totals.cache_write_tokens,
-            cost_yuan: round4(row.totals.cost_yuan),
-        })
-        .collect()
 }
 
 /// 请求状态的**唯一定义**：落库列 `status_kind`、界面标签、筛选条件都用它。
@@ -136,18 +102,9 @@ pub fn recent_from_rows(rows: &[RequestRow]) -> Vec<RecentRequest> {
 }
 
 /// 组装概览汇总。
-pub fn build_summary(
-    today: UsageTotals,
-    month: UsageTotals,
-    daily: Vec<DailyUsage>,
-    models: Vec<ModelUsage>,
-    recent: Vec<RecentRequest>,
-) -> UsageSummary {
+pub fn build_summary(today: UsageTotals, recent: Vec<RecentRequest>) -> UsageSummary {
     UsageSummary {
         today,
-        month,
-        daily,
-        models,
         recent,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     }
