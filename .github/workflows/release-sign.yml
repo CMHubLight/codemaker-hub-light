@@ -67,9 +67,7 @@ jobs:
           fi
           echo "已确认 tag ${sha} 的 CI 通过"
 
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
-        with:
-          version: 11
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6（版本由 packageManager 决定）
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
