@@ -212,7 +212,7 @@ const MOCK_LOGIN_SESSION: LoginSession = {
 
 const MOCK_APP_INFO: AppInfo = {
   name: 'CodeMaker Hub Light',
-  version: '0.2.3',
+  version: '0.2.4',
   tauri_version: null,
   platform: 'browser-preview',
   data_dir: null,

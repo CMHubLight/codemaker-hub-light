@@ -117,8 +117,8 @@ const FORBIDDEN = [
   ...localTerms().map((term) => ['本地词表', new RegExp(escapeRegExp(term), 'i')])
 ]
 
-/** 允许出现关键字的文件：本脚本自身（它必须写出这些规则）。 */
-const SCAN_EXEMPT = new Set([SELF])
+/** 允许出现关键字的文件：本脚本自身与其负向测试（必须写出坏样本）。 */
+const SCAN_EXEMPT = new Set([SELF, 'scripts/check-public-repo.test.mjs'])
 
 // ---------------------------------------------------------------- 主流程
 

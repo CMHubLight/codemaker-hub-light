@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-17
+
 ### 修复
 
 - **登录轮询的失败分支不受 pending 约束**：超时、`Rejected`、连续网络错误三类分支改走 `commit_poll`（写锁内校验 `poll_uuid`），旧轮询不再清掉刚新建的 pending、也不再把网络错误计数累加到新 pending。
@@ -142,6 +144,7 @@
 
 首个公开版本：浏览器登录 + 深链回调、凭据加密存储、回环本地代理（Anthropic / OpenAI 转发与鉴权注入）、逐请求用量与费用统计、托盘常驻；附带 NSIS 安装包（未签名）。
 
+[0.2.4]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.4
 [0.2.3]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.3
 [0.2.2]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.2
 [0.2.1]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.1

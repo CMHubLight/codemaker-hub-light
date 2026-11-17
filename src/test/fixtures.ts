@@ -76,7 +76,7 @@ export const PROXY: ProxyStatus = {
 
 export const APP_INFO: AppInfo = {
   name: 'CodeMaker Hub Light',
-  version: '0.2.3',
+  version: '0.2.4',
   tauri_version: '2.9.0',
   platform: 'windows',
   data_dir: 'C:\\data',
