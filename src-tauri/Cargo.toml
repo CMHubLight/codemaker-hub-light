@@ -53,7 +53,7 @@ tracing-appender = "0.2"
 
 # --- P1 认证：加密存储 / 系统凭据库 / 文件锁 / 随机数 ---
 aes-gcm = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 fs2 = "0.4"
 keyring = { version = "3", features = ["windows-native"] }
 
