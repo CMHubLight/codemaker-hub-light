@@ -57,7 +57,7 @@
 | [data-model.md](data-model.md) | `db-tables` | `src-tauri/migrations/*.sql` |
 | [proxy.md](proxy.md) | `proxy-routes` | `src-tauri/src/proxy/routes/mod.rs` |
 
-同一个脚本还会扫描敏感信息（内网地址、公司/部门名、个人账号、本机绝对路径、来源说明用语）并校验 Markdown 相对链接。
+同一个脚本还会扫描敏感信息（本机绝对路径/UNC/`/home`、企业与内网域名、个人邮箱域名、凭据形状、组织字样、归档文件）并校验 Markdown 相对链接；同名清单块重复、对账源文件缺失、显式指定但读不到的 `REDACTION_TERMS_FILE` 都会直接失败。负向用例在 `scripts/check-public-repo.test.mjs`（`pnpm test:scripts`）。
 
 ## 修改文档的规矩
 

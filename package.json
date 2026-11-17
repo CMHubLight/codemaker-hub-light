@@ -1,6 +1,7 @@
 {
   "name": "codemaker-hub-light",
   "private": true,
+  "packageManager": "pnpm@11.7.0",
   "version": "0.2.3",
   "type": "module",
   "description": "账号登录 / 本地代理 / 用量统计的 Windows 桌面应用（Tauri + React）",
@@ -31,7 +32,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:scripts": "node --test scripts/ensure-app-closed.test.mjs",
+    "test:scripts": "node --test scripts/ensure-app-closed.test.mjs scripts/check-public-repo.test.mjs",
     "test:watch": "vitest",
     "docs:check": "node scripts/check-public-repo.mjs",
     "verify": "pnpm typecheck && pnpm lint && pnpm test && pnpm test:scripts && pnpm build && pnpm docs:check",

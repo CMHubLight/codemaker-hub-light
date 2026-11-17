@@ -34,6 +34,10 @@ OpenAI SDK  ─┘     (injects account credentials, records usage)
 - A reachable **compatible gateway** (see [gateway contract](docs/gateway-contract.md))
 - To build from source: Node.js ≥ 20.19, pnpm, Rust stable (MSVC), Visual Studio Build Tools + Windows SDK, WebView2 Runtime
 
+## Download
+
+Prebuilt Windows installers are attached to [GitHub Releases](https://github.com/CMHubLight/codemaker-hub-light/releases/latest) (`CodeMaker-Hub-Light_<version>_x64-setup.exe`, NSIS, per-user install). Releases are currently **unsigned** — verify the SHA-256 published with the release, or build from the matching tag source zip.
+
 ## Build and run
 
 ```powershell

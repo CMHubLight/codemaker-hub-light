@@ -37,7 +37,7 @@ OpenAI SDK  ─┘     （本地代理：注入账号凭据、转发、记录用
 
 ### 1. 获取应用
 
-- **从源码构建**（当前唯一分发方式）：见文末「从源码构建」。
+- **从 GitHub Release 下载安装包**（当前未签名）：到 [Releases](https://github.com/CMHubLight/codemaker-hub-light/releases/latest) 下载 `CodeMaker-Hub-Light_<版本>_x64-setup.exe`，用 Release 说明里的 SHA-256 校验；也可以从对应 tag 的源码包自行构建（见文末「从源码构建」），或直接 clone 本仓库构建。
 - 首次启动会在 `%USERPROFILE%\.codemaker-hub-light\` 下创建数据目录、SQLite 数据库和日志目录；代理启动后写入 `proxy.port`；登录成功后生成加密凭据 `auth.bin`；修改设置后才写入 `settings.json`。
 
 ### 2. 配置网关（必须先做）
@@ -277,7 +277,7 @@ src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.3_x64-setup.exe
 其他门禁命令：
 
 ```powershell
-pnpm verify                                    # 类型检查 + lint + 测试 + 构建 + 文档门禁
+pnpm verify                                    # typecheck + lint + 前端/脚本测试 + build + docs:check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo fmt --manifest-path src-tauri/Cargo.toml --check

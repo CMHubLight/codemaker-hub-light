@@ -17,17 +17,17 @@
 
 | 项 | 行为 | 依据 |
 | --- | --- | --- |
-| 绑定地址 | 设置项 `proxy_bind`，默认 `127.0.0.1`；只接受 `127.0.0.1` / `localhost` / `::1`，其它值启动时直接报 `NonLoopback` | `proxy/server.rs`、`settings.rs` |
+| 绑定地址 | 设置项 `proxy_bind`，默认 `127.0.0.1`；只接受 `127.0.0.1` / `localhost` / `::1`，其它值直接报 `NonLoopback`；启动时归一（`localhost` → `127.0.0.1`） | `proxy/server.rs`、`settings.rs` |
 | 首选端口 | 设置项 `proxy_port`，默认 `15721`，校验要求 ≥ 1024 | `settings.rs` |
-| 回退区间 | 首选端口被占用时依次尝试 `首选+1 ..= 15800`（`PROXY_PORT_FALLBACK_END`） | `proxy/server.rs` |
+| 回退区间 | 首选端口被占用时从首选值开始依次尝试到 `15800`（`PROXY_PORT_FALLBACK_END`） | `proxy/server.rs` |
 | 最终兜底 | 区间内全失败则向系统要一个临时端口（`port = 0`） | `proxy/server.rs` |
 | 首选端口 > 15800 | 不再回退区间，只用首选端口，再退到系统分配 | `proxy/server.rs` |
-| 端口文件 | `~/.codemaker-hub-light/proxy.port`，内容是**实际**监听端口的纯文本，供外部 CLI 发现 | `settings::write_proxy_port` |
-| 停止 | 发 oneshot 触发 graceful shutdown，最多等 5 秒（`STOP_TIMEOUT`），幂等 | `proxy/server.rs` |
+| 端口文件 | `~/.codemaker-hub-light/proxy.port`，内容是**实际**监听端口的纯文本，供外部 CLI 发现；代理停止时删除 | `settings::{write,remove}_proxy_port` |
+| 停止 | 发 oneshot 触发 graceful shutdown，最多等 5 秒（`STOP_TIMEOUT`），超时 `abort` 并等待任务结束；幂等 | `proxy/server.rs` |
 
 `proxy.port` 与 `settings.json` 一样走「临时文件 + `fsync` + `rename`」的原子写；写失败只记 warn，不影响代理继续服务。
 
-代理启动成功后状态经 `proxy://status` 事件推给前端，字段为 `running` / `host` / `port` / `base_url` / `gateway_url` / `last_error` / `started_at` / `uptime_secs` / `request_count` / `error_count` / `port_file` / `health_url`。
+代理启动成功后状态经 `proxy://status` 事件推给前端，字段为 `running` / `host` / `port` / `base_url` / `gateway_url` / `last_error` / `started_at` / `uptime_secs` / `request_count` / `error_count` / `port_file` / `health_url`。`base_url` 对 IPv6 会加方括号（`http://[::1]:15721`）。重启失败时旧配置会尽力回滚，成功/失败都会广播状态。
 
 ## 路由表
 

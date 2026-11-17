@@ -8,8 +8,8 @@
 |---|---|
 | 系统 | Windows 10/11 x64（当前唯一验证平台；macOS / Linux 未验证） |
 | Node.js | ≥ 20.19（CI 用 24） |
-| pnpm | 11（`packageManager` 未固定，CI 用 `pnpm/action-setup` 的 11） |
-| Rust | stable，MSVC 工具链 |
+| pnpm | `packageManager` 固定为 `pnpm@11.7.0`；CI 用 `pnpm/action-setup` 的 11 |
+| Rust | `rust-toolchain.toml` 固定 `1.99.1`（含 rustfmt/clippy），MSVC 工具链 |
 | C++ 工具链 | Visual Studio Build Tools + Windows SDK（Tauri 链接需要） |
 | WebView2 Runtime | Windows 10/11 通常随 Edge 预装 |
 
@@ -24,8 +24,8 @@
 | `pnpm tauri dev` | 开发模式：前端 5173 + Rust 后端 + 真实窗口 |
 | `pnpm typecheck` | `tsc --noEmit`（含 vite/vitest 配置） |
 | `pnpm lint` | ESLint 9 flat config |
-| `pnpm test` | Vitest（jsdom + Testing Library） |
-| `pnpm test:scripts` | 构建/门禁脚本单测（`node:test`，如构建占用防呆的路径判定） |
+| `pnpm test` | Vitest（默认 node 环境；组件测试在文件头用 `@vitest-environment jsdom` 声明） |
+| `pnpm test:scripts` | 构建/门禁脚本单测（`node:test`：构建占用防呆 + 公开仓库门禁负向用例） |
 | `pnpm docs:check` | 公开仓库门禁：脱敏扫描、链接检查、文档与代码对账 |
 | `pnpm verify` | typecheck → lint → test → test:scripts → build → docs:check |
 | `pnpm tauri build` | 产出 NSIS 安装包（内含内嵌前端的 exe）；构建前检查发布版实例占用（见 §5.4） |
@@ -44,27 +44,28 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 | 门禁 | 命令 | CI 位置 |
 |---|---|---|
-| 前端类型 / lint / 测试 / 构建 | `pnpm typecheck && pnpm lint && pnpm test && pnpm test:scripts && pnpm build` | `frontend` job（ubuntu-latest） |
-| Rust 格式 / lint / 测试 | `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test` | `rust` job（windows-latest） |
+| 前端类型 / lint / 测试 / 构建 / 审计 | `pnpm typecheck && pnpm lint && pnpm test && pnpm test:scripts && pnpm build && pnpm audit --prod --audit-level high` | `frontend` job（ubuntu-latest） |
+| Rust 格式 / 锁文件 / lint / 测试 / 审计 | `cargo fmt --check`、`cargo metadata --locked`、`cargo clippy --locked -D warnings`、`cargo test --locked`、`cargo audit` | `rust` job（windows-latest） |
+| 打包链路 | `pnpm tauri build --no-bundle` + 上传 exe | `package` job（windows-latest） |
 | 脱敏 / 链接 / 文档一致性 | `node scripts/check-public-repo.mjs` | `docs` job（ubuntu-latest） |
 
 `docs` job 检查四件事：
 
-1. **敏感信息**：本机用户目录的绝对路径、企业/内网域名形状、个人邮箱域名、常见凭据形状（`sk-`、`ghp_`、私钥块）、组织/业务单元类标识字样。**具体厂商与个人词表不入库**：维护者可在本地用 `REDACTION_TERMS_FILE=<gitignored 文件>` 指向一份逐行词表做更严格的扫描，CI 只跑通用规则。
+1. **敏感信息**：本机绝对路径（盘符 + 用户/开发目录、UNC、`/home/<user>/`）、企业/内网域名形状、个人邮箱域名、常见凭据形状（`sk-`/`sk-ant-`/`sk-proj-`/`ghp_`/`github_pat_`/`AKIA`/JWT/私钥块）、组织/业务单元类标识字样、归档文件（必须先解包）。**具体厂商与个人词表不入库**：维护者可在本地用 `REDACTION_TERMS_FILE=<gitignored 文件>` 指向一份逐行词表做更严格的扫描，CI 只跑通用规则；显式指定但文件不存在会直接失败。
 2. **禁止入库的路径**：不随仓库分发的外部材料与旧版产品文档。
 3. **链接**：所有 Markdown 相对链接必须指向**已纳入版本库**的文件。
-4. **文档与代码一致**：`docs/ipc-api.md`、`docs/settings.md`、`docs/data-model.md`、`docs/proxy.md` 里的清单块必须与代码逐项相等。
+4. **文档与代码一致**：`docs/ipc-api.md`、`docs/settings.md`、`docs/data-model.md`、`docs/proxy.md` 里的清单块必须与代码逐项相等；同名清单块重复、对账源文件缺失都会直接失败。
 
 ## 4. 测试布局
 
 | 层 | 位置 | 说明 |
 |---|---|---|
 | Rust 单元测试 | 各模块 `#[cfg(test)]` | 解析、校验、状态机、SQL 行为 |
-| Rust 集成测试 | `src-tauri/src/proxy/integration_tests.rs`、`src-tauri/src/auth/service/test_support.rs` | 起真实 Axum 服务 + 假上游，覆盖路由/SSE/落库 |
+| Rust 集成测试 | 各模块内的 `#[cfg(test)]`（如 `proxy/integration_tests.rs`）；`auth/service/test_support.rs` 只放夹具 | 起真实 Axum 服务 + 假上游，覆盖路由/SSE/落库 |
 | Rust 性能采样 | `src-tauri/tests/perf_usage.rs`、`src-tauri/src/proxy/perf_tests.rs` | 默认 `#[ignore]`，手动 `--ignored --nocapture` 才跑 |
 | 前端组件测试 | `src/**/*.test.tsx` | jsdom + Testing Library |
 | 前端纯函数测试 | `src/lib/*.test.ts` | 格式化、IPC 封装、样式约定 |
-| 构建脚本单测 | `scripts/*.test.mjs` | `node:test`，构建占用防呆的路径判定与提示文案 |
+| 构建脚本单测 | `scripts/*.test.mjs` | `node:test`：构建占用防呆的路径判定与提示文案、公开仓库门禁的负向用例 |
 
 > **不要给测试加 `--release`。** release 配置是 `panic = "abort"`，Rust 测试线程依赖 unwind，`cargo test --release` 会被 cargo 直接拒绝。release 产物只能"构建后启动冒烟"。
 
@@ -85,7 +86,9 @@ src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.3_x64-setup.exe
 
 release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不及 flush。因此崩溃现场由 `panic_log` 直接 `append + sync_all` 写到 `logs/panic.log`，而不是走 `tracing` 的非阻塞通道。落盘顺序是硬约束：**先写最小现场**（时间/线程/位置/消息），之后才尝试回溯与 `tracing`——日志订阅者、回溯符号化（dbghelp）本身也可能在 dying process 里失败或卡住，反过来的顺序会让 panic 什么都不留下。
 
-强杀与原生崩溃不经过 panic hook，现场由启动埋点兜底：启动写 `logs/session.marker`，正常退出写 `logs/exit.log` 并删除 marker；下次启动发现上次未正常退出会在主日志记 WARN。判别方法见 [排障手册 §4.1](troubleshooting.md)。
+强杀与原生崩溃不经过 panic hook，现场由启动埋点兜底：启动写 `logs/session.marker`，正常退出由 `RunEvent::Exit` 统一写 `logs/exit.log`、删除 marker 并 **flush 日志写入器**（`logging::flush()`）；托盘「退出」先删 `proxy.port`、异步停代理再 `app.exit(0)`，不再提前写退出记录。下次启动发现上次未正常退出会在主日志记 WARN。判别方法见 [排障手册 §4.1](troubleshooting.md)。
+
+> `profile.release` 同时开了 `strip = true`：`panic.log` 里的回溯可能只有地址、没有符号（未符号化不代表没写现场）。需要可读回溯时用 dev 构建复现。
 
 ### 5.3 `LNK4217: locally defined symbol memmove … groupConcatInverse`
 
@@ -172,11 +175,12 @@ release 关闭 unwind 后，panic 不会跑 `Drop`，日志写入器可能来不
 
 ### 9.2 每次发布
 
-1. 打 annotated tag（中性维护者身份）；
+1. 打 annotated tag（中性维护者身份），等该 commit 的 **CI** 全绿（含 `package` job 的打包冒烟）；
 2. Actions → **Release signing** → Run workflow，输入 tag；
-3. 工作流在 `windows-latest` 构建安装包并提交 SignPath，等待维护者在 SignPath 控制台**人工批准**；
-4. 批准后工作流下载已签名产物、`Get-AuthenticodeSignature` 校验、上传/覆盖 Release 附件；
-5. 更新 Release 说明里的文件名与 SHA-256。
+3. 工作流先校验该 tag 的 CI conclusion 为 success，并在同一源码上跑 `pnpm verify` + `cargo test --locked`；
+4. 工作流在 `windows-latest` 构建安装包并提交 SignPath，等待维护者在 SignPath 控制台**人工批准**；
+5. 批准后工作流下载已签名产物、`Get-AuthenticodeSignature` 校验、上传/覆盖 Release 附件，并同时上传 `signed-sha256.txt`；
+6. 更新 Release 说明里的文件名与 SHA-256（与 `signed-sha256.txt` 一致）。
 
 约束：签名前的构建必须全部跑在 GitHub 托管 runner 上（SignPath 的 OSS 要求）；每个版本都要人工批准一次。
 
@@ -192,7 +196,7 @@ Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.3_x64-setup.exe | Format-Lis
 
 ### 9.4 未签名版本的构建、烟雾测试与发布
 
-SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.1.1` 起执行）：
+SignPath 未配置时，发布未签名包也必须走完以下流程（`v0.1.1` 起执行）。CI 的 `package` job 只做「`pnpm tauri build --no-bundle` + 上传 exe」的链路冒烟，NSIS 安装包仍需按下面步骤在本地/发布机上构建：
 
 1. **干净构建**：确认 `git status` 干净、从合并后的 `main` 构建；先用**托盘「退出」**关闭正在运行的旧实例（否则 Windows 会锁住 exe）。不要用任务管理器 / `taskkill /F` / `Stop-Process` 强杀：强杀会留下 `logs/session.marker`，下次启动会报"上次运行未正常退出"，也给排查制造假崩溃现场。构建入口会先做占用检查并在命中时快速失败（§5.4），无需也不应强杀实例。
    ```powershell

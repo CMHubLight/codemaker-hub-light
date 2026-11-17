@@ -81,7 +81,7 @@ cost_yuan = round(total_credit × credit_to_yuan, 8)
 | 覆盖范围 | 该账号在上游网关的全部用量（含不经本机代理的客户端） | 只覆盖经本机代理转发的请求 |
 | 时间窗 | 月度额度由服务端 `period_start` / `reset_day` 决定；小时费用是最近 24 小时快照 | 今天 / 本地月 1 号起 / 最近 30 天，全部按**本地日** |
 | 单位 | 积分（额度、已用、剩余、本月消耗、模型分布、24h 曲线） | 元（今日费用、30 天曲线、请求明细） |
-| 存储 | `quota_snapshots` 只存快照（含 `raw_json`），不参与本地聚合 | `usage_daily` 是唯一聚合源 |
+| 存储 | `quota_snapshots` 只存快照（含 `raw_json`），不参与本地聚合；读取时按**当前激活账号档案**过滤，换号后不会显示上一个账号的额度 | `usage_daily` 是唯一聚合源 |
 | 能否相加 | 不能 | 不能 |
 
 三个不能互相验证的原因：
@@ -111,7 +111,7 @@ UPDATE proxy_session_requests
  WHERE day_local IS NULL;
 ```
 
-即按**升级当时的机器时区**回填；时间戳解析失败（`date()` 返回 NULL）时退回 UTC 日期前缀，避免整行消失。同一批迁移 `0003_request_status_kind.sql` 用相同的 CASE 判定回填历史行的 `status_kind`。
+即按**升级当时的机器时区**回填；时间戳解析失败（`date()` 返回 NULL）时退回 UTC 日期前缀，避免整行消失。同一批迁移 `0003_request_status_kind.sql` 用相同的 CASE 判定回填历史行的 `status_kind`。迁移 `0005_backfill_repair.sql` 再做一次无 probe 的幂等兜底：如果 0003 的回填在崩溃窗口里被跳过（列在、数据 NULL、版本行缺失），它会把 `day_local` / `status_kind` 的 NULL 行补齐，口径与 0003 一致。
 
 ## 6. 聚合与保留
 
@@ -127,7 +127,9 @@ UPDATE proxy_session_requests
 | `usage_daily` | `day < cutoff` | 每批 5000 行 |
 | `quota_snapshots` | 先删 `status <> 'ok'` 且超过 7 天的；再按每个 `quota_type` 只留最近 200 条 | 删非 ok 单条语句 + 按 `quota_type` 循环裁剪 |
 
-`cutoff = 今天 - (retention_days - 1)`，即保留期包含当天；`day_local IS NULL` 的异常行一律保留。有删除时最后执行一次 `ANALYZE`，否则大删除后查询计划会继续按旧估算选索引。
+`cutoff = 今天 - (retention_days - 1)`，即保留期包含当天；`day_local IS NULL` 的异常行一律保留。会话清理的 cutoff 会换算成本地 0 点对应的 UTC 瞬间再比较 `last_active_at`（该列是 UTC RFC3339）。有删除时最后执行一次 `ANALYZE`，否则大删除后查询计划会继续按旧估算选索引。
+
+删除是 SQL `DELETE` + 连接级 `PRAGMA secure_delete = ON`（被删页会被覆盖），但不是 `VACUUM` 级物理擦除；从未开启 `record_body` 的用户不会有正文落库。`from` / `to` 筛选出现但日期非法时返回明确错误（`无效的日期筛选`），不再静默放宽成全历史。
 
 ## 7. 请求页分页：keyset
 
@@ -141,7 +143,7 @@ UPDATE proxy_session_requests
 | `total` 统计 | 与列表同事务；`include_total=false` 时跳过 `COUNT(*)` 并返回 `-1` |
 | 页大小 | 前端 `PAGE_SIZE`=50；后端默认 50，钳在 1–200 |
 | `offset` 上限 | 钳到 100000（深 offset 是线性扫描） |
-| `next_cursor` | 只有本页满页（`rows.len() == limit`）才给出 |
+| `next_cursor` | 后端多取一行做前瞻：只有确实还有下一行时才给出，满页整数倍不会产生空页 |
 
 并发写入下的稳定性：游标是快照语义，新请求插入到头部时不会让已翻过的页重复出现；但中途被保留期清理或手工删掉的行会形成页间空档，`total` 也可能与翻页累计条数不一致（`total` 只在第一页统计一次）。前端把游标存成栈，上一页只回退下标；收到事件刷新（新请求写入）后直接回到第一页重取。
 

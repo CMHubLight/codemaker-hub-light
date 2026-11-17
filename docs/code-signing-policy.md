@@ -6,7 +6,7 @@
 
 | 版本 | 安装包状态 | 说明 |
 |---|---|---|
-| `v0.1.0`（2026-10-27） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
+| `v0.1.0`（2026-10-28） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | `v0.1.1`（2026-10-30） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | `v0.2.0`（2026-11-06） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | `v0.2.1`（2026-11-11） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
@@ -52,12 +52,13 @@ GitHub 与 SignPath 两端均需启用双因素认证（MFA）；申请前请按
 
 ## 5. 发布与签名流程
 
-1. 在 `main` 上打 tag（annotated tag，中性维护者身份）；
+1. 在 `main` 上打 tag（annotated tag，中性维护者身份），并等该 commit 的 **CI** 跑绿；
 2. 触发 **Release signing** 工作流（`.github/workflows/release-sign.yml`），输入 tag；
-3. 工作流在 GitHub 托管的 `windows-latest` 上构建安装包，并把未签名产物上传为 workflow artifact；
-4. 工作流把 artifact 提交给 SignPath，等待维护者在 SignPath 控制台**人工批准**；
-5. 签名完成后下载已签名产物，用 `signtool verify /pa` 校验，再上传/替换 GitHub Release 附件；
-6. 在 Release 说明里更新文件名与 SHA-256。
+3. 工作流先校验该 tag 的 CI 结论为 success，并在同一 tag 源码上跑 `pnpm verify` 与 `cargo test --locked`；
+4. 工作流在 GitHub 托管的 `windows-latest` 上构建安装包，并把未签名产物上传为 workflow artifact；
+5. 工作流把 artifact 提交给 SignPath，等待维护者在 SignPath 控制台**人工批准**；
+6. 签名完成后下载已签名产物，用 `signtool verify /pa` 校验，自动上传/替换 GitHub Release 附件并同时上传 `signed-sha256.txt`；
+7. 在 Release 说明里更新文件名与 SHA-256。
 
 约束：所有签名前的构建步骤都必须跑在 GitHub 托管 runner 上（SignPath 的 OSS 要求），不要改成自托管或本地签名后补传。
 
@@ -115,7 +116,7 @@ This program will not transfer any information to other networked systems unless
 |---|---|
 | 安装 | NSIS 安装包，按当前用户安装（不需要管理员权限的机器级服务） |
 | 新增文件 | 安装目录；数据目录 `%USERPROFILE%\.codemaker-hub-light\`（数据库、日志、设置、凭据密文） |
-| 注册表 | 仅 `HKCU\Software\Classes\codemakerhub-light`（深链回调 scheme），启动时写入 |
+| 注册表 | `HKCU\Software\Classes\codemakerhub-light`（深链回调 scheme，启动时写入）；NSIS 安装/卸载项 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\...`（由安装包写入，卸载时移除） |
 | 服务/驱动/计划任务 | 无 |
 | 随系统启动 | 无（应用不会把自己加入开机启动） |
 | 卸载 | 设置 → 应用 → 已安装的应用 → 卸载；安装目录被移除 |
@@ -146,7 +147,7 @@ Get-FileHash .\CodeMaker-Hub-Light_0.2.3_x64-setup.exe -Algorithm SHA256
 | OSI 许可证 | ✅ | GPL-3.0-only |
 | 无专有组件 | ✅ | 全部自研，依赖均为开源 |
 | 项目已发布 | ✅ | `v0.1.0`、`v0.1.1`、`v0.2.0`、`v0.2.1`、`v0.2.2`、`v0.2.3` Release 与 tag |
-| 有文档 | ✅ | `docs/` 十篇 + README |
+| 有文档 | ✅ | `docs/` 12 个 tracked 文件（11 篇主题文档 + 索引）+ 根目录 README |
 | 代码签名政策页 | ✅ | 本文 + README 的 Code signing policy 段 |
 | 隐私政策 | ✅ | 本文第 7 节 |
 | 仓库公开 | ✅ | `CMHubLight/codemaker-hub-light` 已公开 |

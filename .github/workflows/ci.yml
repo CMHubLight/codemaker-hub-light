@@ -50,6 +50,9 @@ jobs:
       - name: 生产构建
         run: pnpm build
 
+      - name: 依赖审计（仅生产依赖，high 及以上阻断）
+        run: pnpm audit --prod --audit-level high
+
   rust:
     name: Rust（fmt / clippy / test）
     # Tauri 在 Windows 上的链接依赖 MSVC 与 WebView2，windows-latest 均自带。
@@ -62,7 +65,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支，2026-11-11
         with:
           # SHA 固定后不再跟随上游更新；显式声明 toolchain 避免默认值漂移。
-          toolchain: stable
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -72,11 +75,61 @@ jobs:
       - name: rustfmt
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
+      - name: 锁文件一致性
+        run: cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 > $null
+
       - name: clippy（warnings 视为错误）
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: 依赖审计（RustSec）
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file src-tauri/Cargo.lock
+
+  package:
+    name: 打包（Windows exe + 安装包冒烟）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
+        with:
+          version: 11
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支，2026-11-11
+        with:
+          toolchain: 1.99.1
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖（锁文件冻结）
+        run: pnpm install --frozen-lockfile
+
+      - name: 锁文件一致性
+        run: cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 > $null
+
+      - name: 构建可执行文件（验证打包链路）
+        run: pnpm tauri build --no-bundle
+
+      - name: 上传 exe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: codemaker-hub-light-exe
+          path: src-tauri/target/release/codemaker-hub-light.exe
+          if-no-files-found: error
+          retention-days: 7
 
   docs:
     name: 文档与脱敏门禁

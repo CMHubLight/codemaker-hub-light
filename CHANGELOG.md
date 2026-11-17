@@ -2,6 +2,42 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **登录轮询的失败分支不受 pending 约束**：超时、`Rejected`、连续网络错误三类分支改走 `commit_poll`（写锁内校验 `poll_uuid`），旧轮询不再清掉刚新建的 pending、也不再把网络错误计数累加到新 pending。
+- **取消等待只改前端**：新增 IPC `auth_cancel_login`，清后端 pending 并恢复发起登录前的相位；后台 `tick` 增加 pending 超时兜底，避免「无人轮询」后后台认证永久停摆。
+- **深链收尾失败销毁 pending**：失败改为保留 pending（复位一次性名额）并按 `poll_uuid` 限定归属，用户仍有轮询/重贴链接的兜底路径。
+- **凭据快照相位过宽**：`credentials_snapshot` 改白名单（`LoggedIn` / `OfflineGrace` / 旧凭据仍有效时的 `PendingLogin`），`Error`/`ReauthRequired` 不再把旧 token 交给代理。
+- **续期提交顺序**：写盘前先比对 `renew.seq`，写盘代次快照前移到身份检查之前；`renew_now` 尊重失败退避（手动「重新检测」可强制）。
+- **额度跨账号**：`latest_quota_snapshot` 按当前激活档案过滤，换号后不再显示上一个账号的额度；`quota://updated` 只在额度数字变化时发送。
+- **直通流式 usage 帧**：代理为直通 Chat 补 `include_usage` 后，会吞掉上游多发的 usage-only 帧（客户端未声明时才过滤）；请求体 >4 MiB 跳过注入并 warn。
+- **in-band error 记账**：200 + `{"error":…}`（流式/非流式/翻译层）统一落 `upstream_error`，`status_kind=error`；删除原先钉住「记 success」的断言。
+- **压缩响应**：翻译路由遇到非 `identity` 的 `content-encoding` 返回 502 `upstream_encoding_unsupported`，不再把压缩字节当 JSON/SSE 解析。
+- **SSE 帧扫描**：支持 LF/CR/CRLF 与混用，改为增量扫描（去掉每次 chunk 全量重扫的 O(n²)）。
+- **转发头**：按 `Connection` token 再剥一轮；`x-forwarded-*` / `via` / `referer` 不再转发；代理与认证客户端都显式 `no_proxy()`。
+- **代理绑定**：`localhost` 启动时归一为 `127.0.0.1`；IPv6 的 `base_url` 加方括号；`restart` 失败回滚旧配置并广播状态；`stop` 删除 `proxy.port`、超时中止旧任务。
+- **启动失败无声**：主窗口改为 setup 内创建（`create: false`），建窗/初始化/托盘失败统一弹窗 + `startup-error.log` + `exit(1)`；`run()` 返回非零退出码。
+- **设置手改被覆盖**：保存以磁盘当前文件为基线合并 patch，运行期手改的 `proxy_bind` / `credit_to_yuan` 不再被内存旧值覆盖；保存走阻塞线程池。
+- **网关 URL userinfo**：`gateway_url_is_acceptable` 拒绝 URL 内嵌凭据；启动日志只打印 `scheme://host:port`。
+- **退出与日志**：托盘退出先停代理、删端口文件再退出；`exit.log` 统一由 `RunEvent::Exit` 写并 flush 日志；滚动日志保留 30 份，诊断文件超限截尾。
+- **检索与分页**：`usage_requests` 多取一行做前瞻，满页整数倍不再出现空页；`from`/`to` 非法直接报错；模型关键字 `LIKE` 转义；`proxy_sessions` 时间列取 `MAX` 防乱序回退。
+- **迁移 0005**：无 probe 的幂等回填 `day_local` / `status_kind`，修复 0003 回填在崩溃窗口被跳过的旧库；保留期会话 cutoff 改为本地 0 点对应的 UTC 瞬间。
+- **前端**：登录页两种入口互斥、取消等待走后端；设置页不再误报「端口回退」；请求页事件刷新不再打回第一页；概览/最近请求区分加载与失败；事件订阅失败退避重试 + 兜底轮询；补齐键盘可取点的曲线、表格 caption/scope 等可访问性。
+
+### 安全
+
+- SQLite 连接启用 `PRAGMA secure_delete = ON`；凭据/正文的删除不再只是逻辑删除（仍非 `VACUUM` 级擦除）。
+- capability 收敛为 `core:default`（移除前端未使用的 `opener`/`deep-link` 权限）；生产 CSP 去除 dev 项并补 `base-uri`/`frame-ancestors`/`object-src`，dev 项移到 `devCsp`。
+
+### 工程
+
+- 新增迁移 0005 的回归测试、轮询/取消/身份守卫靶式用例、直通 SSE 过滤与 in-band error 集成用例、前端 27 个新用例、门禁负向测试。
+- CI 增加 `--locked`、`cargo audit`、`pnpm audit`、Windows 打包 job；签名工作流先校验 tag 的 CI，并在上传 Release 时附带 `signed-sha256.txt`。
+- 固定 `rust-toolchain.toml`、`packageManager`，新增 Dependabot 配置；`docs:check` 增加同名清单块/源文件缺失/归档/词表缺失等硬失败。
+- 文档同步：IPC 命令 20 个、UsageSummary 精简、额度按档案、迁移 0005、退出与日志路径、网关 userinfo、`pnpm verify` 组成、README 分发方式。
+
 ## [0.2.3] - 2026-11-16
 
 ### 修复
@@ -101,6 +137,10 @@
 - 请求页无详情弹层，「客户端」列固定为 `unknown`。
 - 账号级数字来自上游网关，可能包含其他设备的用量，不能与本机请求明细对账。
 - AuthKey 直登要求兼容网关实现 `POST /api/v2/tokens`；未实现的网关可在登录页改用浏览器登录。
+
+## [0.1.0] - 2026-10-28
+
+首个公开版本：浏览器登录 + 深链回调、凭据加密存储、回环本地代理（Anthropic / OpenAI 转发与鉴权注入）、逐请求用量与费用统计、托盘常驻；附带 NSIS 安装包（未签名）。
 
 [0.2.3]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.3
 [0.2.2]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.2
