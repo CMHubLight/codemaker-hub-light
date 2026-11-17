@@ -115,6 +115,7 @@ pub fn run() {
             commands::settings::settings_update,
             commands::auth::auth_status,
             commands::auth::auth_start_login,
+            commands::auth::auth_cancel_login,
             commands::auth::auth_login_with_auth_key,
             commands::auth::auth_poll_status,
             commands::auth::auth_logout,

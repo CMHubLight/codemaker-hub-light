@@ -121,7 +121,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 处理策略按「是否带凭据」与「是否已登录」分流：
 
 - 重复投递（Windows 上第二实例与插件可能各投一次）：`Consumed` 静默忽略，不提示用户；首次完成流程仍在跑，轮询也能用同一个 `poll_uuid` 兜底。
-- 已登录时收到迟到回调（`NoPending` 且 `is_logged_in()` 为真），或不带凭据的迟到回调：都静默忽略；后者仍会把 `deep_link_received` 置真，但不消耗一次性名额。
+- 已登录时收到迟到回调（`NoPending` 且 `is_logged_in()` 为真）：静默忽略。**不带凭据**的回调在监听路径上只发 `auth://callback` 事件后直接返回（不会置 `deep_link_received`）；只有手动粘贴 `auth_submit_deep_link` 才会走 `claim_deep_link` 的「到达确认」分支。
 - 其余被拒：把静态文案写进 `last_error` 并返回 `AuthError::InvalidDeepLink`，不写凭据、不切身份。文案：`NoPending` → 「回调链接不属于当前登录会话（可能已过期或已使用），请点击「登录」重新发起」；`Mismatch` → 「回调链接与当前登录会话不匹配，已忽略」；`Expired` → 「登录会话已超时，请重新点击「登录」」；`Consumed` → 「该回调链接已使用过，已忽略」。
 
 手动粘贴走同一条闸门：`auth_submit_deep_link` 只做解析与转交，token 不回传前端；登录页在提交后立刻清空输入框，链接不再留在前端状态里。
@@ -135,11 +135,12 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 代次只由注销推进，它挡不住"登录已经把身份换成另一份凭据"。因此所有**凭据类**提交（续期成功/失败、`/validate` 结果、额度快照）都改用 `commit_if_session(epoch, access_token, closure)`：在写锁内额外比对"内存凭据的 `access_token` 是否仍是本次操作基于的那一份"，不一致就静默作废（不写盘、不改状态、不写库）。配套不变量：
 
 - `finish_login` 与续期提交共用 `credential_write` 串行锁，把「身份检查 → 写盘 → 提交」合成一个临界区；没有它，一次早发的续期可以在登录写盘之后再把 `auth.bin` 覆盖回上一个身份。锁序固定为 `login_serial → credential_write`。
-- 后台 `tick` 在 `pending`（等待浏览器登录）期间直接跳过，不再用旧身份发起 validate / 续期 / 额度请求。
+- 后台 `tick` 在 `pending`（等待浏览器登录）期间直接跳过，不再用旧身份发起 validate / 续期 / 额度请求；但 tick 会先判 `pending.is_timed_out()`，过期就清掉 pending，避免"无人轮询"（关闭登录页/点取消）时后台循环永久停摆。
+- 「取消等待」是**后端动作**（`auth_cancel_login`）：清 pending 并恢复发起登录前的相位（`pre_login_phase`）；只改前端状态会让 pending 一直有效、后台三个循环全部停摆。
 - 同一账号续期换了 token 后，旧 token 的 `/validate` 结果也会被丢弃（按 token 严格比较）：下一次 tick 会用新 token 重新校验，档案刷新最多延后一个校验周期（10 分钟）。这是有意的 fail-closed 取舍。
 - `finish_login` 在 `gateway()` 之前先检查一次；写盘与提交在 `credential_write` 内走 `save_async_if`，代次已推进就直接 `SessionEnded`（不会重建主密钥）；`commit_login` 若返回 `None`（刚好注销），仍会 `delete_async()` 兜底，绝不复活凭据。
 - `persist_profile` 注销后不再落库；`store_quota` 先 `session_still`，注销或已换身份后的额度快照不再落库、也不刷 `last_quota_at`。
-- `record_failure` 也走 `commit_if_current`，注销后到达的失败不会把状态改回 `error`。
+- `record_failure` 也走 `commit_if_current`，注销后到达的失败不会把状态改回 `error`；带 `expected_poll` 时只对发起它的那次登录生效，且**保留 pending**（把 `credentials_consumed` 复位）以便轮询或重贴同一条链接兜底。
 - 深链完成流程捕获 `SessionEnded` 后保持「已登出」，不覆盖状态。
 
 注销时 `stop_loops` 先发取消信号，等 `LOOP_GRACEFUL_STOP_SECS`=1 秒，超时 `abort` 并仍然 `await` 任务结束；只有本函数返回后才允许删凭据，避免后台循环变成「删完文件又写回去」的游离写者。
@@ -193,7 +194,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 
 后台续期是按「每 60 秒检查一次 + 到期前 1 小时」触发的；如果 token 在两次检查之间被服务端提前失效（例如多端登录顶号、服务端轮换），下一次 `/validate` 会拿到 401/403。此时不再直接要求重新登录，而是走“先续期、再判失效”的分支：
 
-1. 用 `auth_key` 强制续期一次（`renew_now`：跳过"是否到期/静默期"判定，仍走 60s→300s 退避节流）；
+1. 用 `auth_key` 强制续期一次（`renew_now`：跳过"是否到期/静默期"判定，但**尊重** 60s→300s 失败退避——退避窗口内直接返回瞬时失败；设置页手动「重新检测/续期」传 `force`，跳过退避立刻重试）；
 2. 续期成功 → 用新 token **重新** `/validate` 一次：
    - 成功 → 回到正常登录态并刷新 `last_validated_at`；
    - 仍 401/403 → `ReauthRequired`（文案「续期后仍被服务端拒绝，请重新登录」）；
@@ -218,6 +219,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 | `credentials_valid` | validate 路径不改（沿用原值）；登录时降级则因 `!offline_grace` 写成 `false` | 置 `false` |
 | 提示文案 | 「网络异常，已按离线宽限继续」/「自动续期失败（网络异常），已按离线宽限继续」 | 「登录状态已失效，请重新登录」/「续期后仍被服务端拒绝，请重新登录」 |
 | 代理转发 | 继续用内存里的旧 token 转发 | `credentials_snapshot()` 返回 `None`，代理直接 401 |
+| `PendingLogin` | 仅当 `credentials_valid=true`（旧会话仍有效）才给代理凭据 | `credentials_valid=false` 或 `Error` 时返回 `None` |
 | 后台循环 | 下一轮继续重试 | tick 开头发现 `ReauthRequired` 直接返回，不做无意义重试 |
 | 恢复方式 | 任一后续 `/validate` 或续期成功即自动回 `LoggedIn` | 只能重新登录 |
 
@@ -236,7 +238,7 @@ codemakerhub-light://auth/callback?pollUuid=<uuid>?access_token=..&access_sso_to
 | `last_validated_at`、`last_quota_at`、续期运行时（退避/静默期/无进展计数） | `usage_daily`、请求明细、额度快照 |
 | 磁盘 `auth.bin` 与系统凭据库主密钥 | 设置文件、日志、代理端口文件 |
 
-代理的即时反应：`credentials_snapshot()` 在无凭据或 `ReauthRequired` 时返回 `None`，下一次请求走早期失败分支，返回 401 与协议对应的错误体，文案固定为「未登录或登录已失效，请先登录 CodeMaker Hub Light」，`error_kind` 记为 `unauthorized`（用量库里这一行会计入错误数）。
+代理的即时反应：`credentials_snapshot()` 只在 `LoggedIn`/`OfflineGrace`，或 `PendingLogin` 且 `credentials_valid=true` 时给凭据；无凭据、`ReauthRequired`、`Error` 都返回 `None`，下一次请求走早期失败分支，返回 401 与协议对应的错误体，文案固定为「未登录或登录已失效，请先登录 CodeMaker Hub Light」，`error_kind` 记为 `unauthorized`（用量库里这一行会计入错误数）。
 
 ## 10. 失败分类与用户可见提示
 

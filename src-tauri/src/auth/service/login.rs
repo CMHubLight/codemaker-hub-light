@@ -21,10 +21,39 @@ impl AuthService {
         };
 
         let mut state = self.state.write().await;
+        if state.pre_login_phase.is_none() {
+            state.pre_login_phase = Some(state.phase);
+        }
         state.pending = Some(pending.clone());
         state.phase = AuthPhase::PendingLogin;
         state.last_error = None;
         Ok(pending)
+    }
+
+    /// 取消等待：清掉后端 pending 并恢复发起登录前的相位。
+    ///
+    /// v0.2.3 之后后台 tick 在 `PendingLogin` 期间停机，若只在前端取消（旧实现），
+    /// pending 会一直有效、后台续期/校验/额度全部停摆。这里让取消成为后端动作。
+    pub async fn cancel_login(&self) -> AuthStatus {
+        let epoch = self.epoch().await;
+        self.commit_if_current(epoch, |state| {
+            if state.phase != AuthPhase::PendingLogin {
+                return;
+            }
+            state.pending = None;
+            state.phase = state.pre_login_phase.take().unwrap_or_else(|| {
+                if state.credentials_valid {
+                    AuthPhase::LoggedIn
+                } else if state.credentials.is_some() {
+                    AuthPhase::OfflineGrace
+                } else {
+                    AuthPhase::LoggedOut
+                }
+            });
+            state.last_error = None;
+        })
+        .await;
+        self.status().await
     }
 
     /// 前端每 2s 调用：轮询 `/vs_login_info/{uuid}`，成功后完成登录。
@@ -37,9 +66,12 @@ impl AuthService {
             return Ok(self.make_update(None, false).await);
         };
 
+        let poll_uuid = pending.poll_uuid;
+
         if pending.is_timed_out(Utc::now()) {
-            self.commit_if_current(epoch, |state| {
+            self.commit_poll(epoch, poll_uuid, |state| {
                 state.pending = None;
+                state.pre_login_phase = None;
                 state.phase = AuthPhase::Error;
                 state.last_error = Some(format!(
                     "登录超时（{} 秒），请重试",
@@ -53,7 +85,7 @@ impl AuthService {
         let gateway = self.gateway(gateway_url).await?;
         match gateway.poll_login(&pending.poll_uuid.to_string()).await {
             Ok(PollOutcome::Pending) => {
-                self.commit_if_current(epoch, |state| {
+                self.commit_poll(epoch, poll_uuid, |state| {
                     if let Some(current) = state.pending.as_mut() {
                         current.consecutive_network_errors = 0;
                     }
@@ -62,8 +94,9 @@ impl AuthService {
                 Ok(self.make_update(None, false).await)
             }
             Ok(PollOutcome::Rejected(message)) => {
-                self.commit_if_current(epoch, |state| {
+                self.commit_poll(epoch, poll_uuid, |state| {
                     state.pending = None;
+                    state.pre_login_phase = None;
                     state.phase = AuthPhase::Error;
                     state.last_error = Some(message);
                 })
@@ -72,11 +105,11 @@ impl AuthService {
             }
             Ok(PollOutcome::Success(tokens)) => {
                 // 收尾必须绑定本次轮询的 poll_uuid：旧轮询晚返回时不能覆盖新登录。
-                self.finish_login(epoch, gateway_url, tokens, Some(pending.poll_uuid))
+                self.finish_login(epoch, gateway_url, tokens, Some(poll_uuid))
                     .await
             }
             Err(err) => {
-                self.commit_if_current(epoch, |state| {
+                self.commit_poll(epoch, poll_uuid, |state| {
                     let consecutive_errors = if let Some(current) = state.pending.as_mut() {
                         current.consecutive_network_errors += 1;
                         current.consecutive_network_errors
@@ -87,6 +120,7 @@ impl AuthService {
                         GatewayError::Network(_) => {
                             if consecutive_errors >= MAX_CONSECUTIVE_NETWORK_ERRORS {
                                 state.pending = None;
+                                state.pre_login_phase = None;
                                 state.phase = AuthPhase::Error;
                                 state.last_error = Some(format!(
                                     "连续 {MAX_CONSECUTIVE_NETWORK_ERRORS} 次网络错误，登录失败"
@@ -184,7 +218,7 @@ impl AuthService {
             }
             Err(err) => {
                 warn!(error = %err, "深链登录失败");
-                self.record_failure(epoch, &err.to_string()).await;
+                self.record_failure(epoch, binding, &err.to_string()).await;
                 Ok(self.make_update(None, false).await)
             }
         }
@@ -470,6 +504,7 @@ impl AuthService {
                 state.profile = Some(profile);
                 state.models = models;
                 state.pending = None;
+                state.pre_login_phase = None;
                 state.offline_grace = offline_grace;
                 state.credentials_valid = !offline_grace;
                 state.phase = if offline_grace {

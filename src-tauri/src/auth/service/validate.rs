@@ -74,7 +74,13 @@ impl AuthService {
                         profile.server_url = server_url;
                     }
                 }
-                state.models = models;
+                state.models = if models.is_empty() && !state.models.is_empty() {
+                    // `/validate/models` 抖动返回空目录时保留上一次成功目录，
+                    // 否则 /v1/models 与重启后的模型列表会被一次网络失败清空。
+                    std::mem::take(&mut state.models)
+                } else {
+                    models
+                };
                 state.last_validated_at = Some(Utc::now());
                 state.credentials_valid = true;
                 state.offline_grace = false;
@@ -104,7 +110,7 @@ impl AuthService {
         access_token: &str,
     ) {
         warn!("/validate 返回 401/403：先尝试用 auth_key 自动续期");
-        match self.renew_now(epoch, gateway).await {
+        match self.renew_now(epoch, gateway, true).await {
             Some(RenewOutcome::Renewed) => {
                 let fresh = { self.state.read().await.credentials.clone() };
                 let Some(fresh) = fresh else {
@@ -588,7 +594,7 @@ mod tests {
         let gateway = AuthGateway::new(&base).expect("回环网关应可用");
 
         assert_eq!(
-            service.renew_now(epoch, &gateway).await,
+            service.renew_now(epoch, &gateway, true).await,
             Some(RenewOutcome::Renewed)
         );
         assert_eq!(

@@ -44,13 +44,27 @@ impl AuthService {
 
     /// 强制续期（跳过"是否到期/静默期"判定），供 `/validate` 401/403 与手动重试复用。
     ///
+    /// `respect_backoff`：自动路径必须尊重失败退避（否则 401/403 + 续期 5xx 会每轮
+    /// 重试一遍）；用户手动「重新检测」传 `false`，允许立刻重试一次。
+    ///
     /// 返回 `None` 表示当前没有可用的登录凭据；否则返回本次续期结果。
     pub(super) async fn renew_now(
         &self,
         epoch: u64,
         gateway: &AuthGateway,
+        respect_backoff: bool,
     ) -> Option<RenewOutcome> {
         let current = { self.state.read().await.credentials.clone() }?;
+        if respect_backoff {
+            let renew = { self.state.read().await.renew.clone() };
+            if let Some(last_attempt) = renew.last_attempt_at {
+                let wait = renew.backoff_secs.max(RENEW_BACKOFF_MIN_SECS);
+                if (Utc::now() - last_attempt).num_seconds() < wait {
+                    info!("续期仍在退避窗口内，本次跳过");
+                    return Some(RenewOutcome::Transient);
+                }
+            }
+        }
         Some(self.perform_renewal(epoch, gateway, current).await)
     }
 
@@ -64,7 +78,7 @@ impl AuthService {
             return Ok(self.make_update(None, false).await);
         }
         let gateway = self.gateway(gateway_url).await?;
-        if self.renew_now(epoch, &gateway).await == Some(RenewOutcome::Renewed) {
+        if self.renew_now(epoch, &gateway, false).await == Some(RenewOutcome::Renewed) {
             // 续期成功后旧 access_token 已被替换，补一次校验让 profile/models 跟上新身份。
             let fresh = { self.state.read().await.credentials.clone() };
             if let Some(fresh) = fresh {
@@ -251,6 +265,14 @@ impl AuthService {
         // 凭据写盘 + 提交的临界区：身份检查、写盘、提交三者必须原子，
         // 否则"检查时还是 A、写盘时已变成 B"会让磁盘留下上一个身份。
         let _write = self.credential_write.lock().await;
+        // 写盘代次要在任何检查之前取：这样"检查通过之后发生的注销"必然让
+        // save_if 代次失配（旧 P3-3 的窗口），而不是读到注销后的新代次。
+        let generation = self.store.credential_generation();
+        // 并发续期里输家不得把结果写进 auth.bin：seq 比对必须在写盘之前。
+        if { self.state.read().await.renew.seq } != renew.seq {
+            info!("续期结果已被另一次续期取代，丢弃本次写盘");
+            return false;
+        }
         if !self.session_still(epoch, &based_on).await {
             info!("续期结果所属的凭据已被替换，丢弃本次续期");
             return false;
@@ -259,7 +281,6 @@ impl AuthService {
         // （`save_async_if` 要排队进阻塞线程池），期间发生的注销必须让这次写盘作废。
         // 不能改用"提交失败就删刚写的文件"：续期与"注销后重新登录"可并发，
         // 补删会误删新会话刚写出的凭据。
-        let generation = self.store.credential_generation();
         match self.store.save_async_if(generation, &current).await {
             Ok(true) => {}
             Ok(false) => return false,

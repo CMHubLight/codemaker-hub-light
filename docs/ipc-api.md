@@ -1,6 +1,6 @@
 # IPC 命令与事件
 
-> 这篇讲前端能调用的 19 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
+> 这篇讲前端能调用的 20 个 Tauri 命令与 6 个后端事件：参数、返回类型、超时语义、典型错误、触发时机，以及浏览器预览时的 mock 行为；读者是改前端、写自动化或排查界面取数问题的人。
 
 ## 约定
 
@@ -37,6 +37,7 @@ settings_get
 settings_update
 auth_status
 auth_start_login
+auth_cancel_login
 auth_login_with_auth_key
 auth_poll_status
 auth_logout
@@ -52,7 +53,7 @@ usage_requests
 usage_request_detail
 ```
 
-命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前收录 18 个：`usage_request_detail` 已注册但未进入该类型、界面也未调用；`auth_refresh_validate` 在类型里但当前没有调用点（源码注释写明“预留给设置页检查登录状态”）。
+命令在 `src-tauri/src/lib.rs` 的 `generate_handler!` 中注册。前端 `CommandName` 联合类型目前收录 19 个：`usage_request_detail` 已注册但未进入该类型、界面也未调用；`auth_refresh_validate` 在类型里但当前没有调用点（源码注释写明“预留给设置页检查登录状态”）。
 
 ## 命令明细
 
@@ -74,6 +75,7 @@ usage_request_detail
 |---|---|---|---|---|
 | `auth_status` | 无 | `AuthStatus` | 10s | 一般无错误；懒加载凭据失败会体现在 `message` / `credentials_valid` |
 | `auth_start_login` | 无 | `AuthLoginStart` | 30s | `网关地址无效：…`、`认证网络请求失败：…` |
+| `auth_cancel_login` | 无 | `AuthStatus` | 10s | 无（清 pending 并恢复登录前相位；没有 pending 时是 no-op） |
 | `auth_login_with_auth_key` | `user: string`、`authKey: string` | `AuthStatus` | 60s | `账号名或 AuthKey 不正确。`、`登录请求被服务端拒绝（HTTP n）。`、网络错误 |
 | `auth_poll_status` | 无 | `AuthStatus` | 10s | `认证网络请求失败：…`、`登录会话已结束…` |
 | `auth_logout` | 无 | `AuthStatus` | 10s | 无（本地清理） |
@@ -84,6 +86,7 @@ usage_request_detail
 
 - `auth_status` 首次调用会懒加载 `auth.bin`（失败不抛错，只写状态），有凭据时确保后台循环已启动。
 - `auth_start_login` 让 Rust 侧生成待登录会话并用系统浏览器打开登录页；浏览器打开失败不算命令失败，用 `opened_browser: false` 让界面展示可复制的登录链接。返回里的 `poll_interval_secs = 2`、`timeout_secs = 300`。
+- `auth_cancel_login` 清掉后端 pending 并恢复发起登录前的相位（已登录会话不会被误打成未登录）；没有 pending 时是 no-op。v0.2.3 之后后台 tick 在等待登录期间会停机，因此取消必须走后端命令，不能只改前端状态。
 - `auth_login_with_auth_key` 是账号 + AuthKey 直登：单次 `POST /api/v2/tokens`，不打开浏览器、不轮询；成功后仍走 `/validate`、模型目录、`/get_auth_key` 与额度，失败不改变现有登录态。`authKey` 只在 IPC 参数与 Rust 侧加密文件中出现，不进日志/数据库/前端状态。
 - `auth_poll_status` 由登录页每 2s 调用；只有状态真的变化或额度更新时才广播事件，避免空转事件触发整页重取。连续失败 3 次才由界面判失败。
 - `auth_submit_deep_link` 是深链 scheme 未注册/浏览器未自动拉起时的兜底：前端只提交用户粘贴的 `codemakerhub-light://auth/callback?...`，解析、校验、保存凭据全在 Rust 侧，token 不回传前端。
@@ -182,7 +185,7 @@ mock 的关键行为：
 
 | 路径 | 用到的内容 |
 |---|---|
-| `src-tauri/src/lib.rs` | `generate_handler!` 的 19 个命令、单实例事件发射 |
+| `src-tauri/src/lib.rs` | `generate_handler!` 的 20 个命令、单实例事件发射 |
 | `src-tauri/src/commands/app.rs` | `app_info` / `app_open_logs` 的返回结构与错误 |
 | `src-tauri/src/commands/settings.rs` | `settings_get` / `settings_update` |
 | `src-tauri/src/commands/auth.rs` | 认证命令、`auth://state` 与 `quota://updated` 发射点 |

@@ -116,6 +116,8 @@ struct RenewRuntime {
 #[derive(Default)]
 pub(super) struct RuntimeState {
     phase: AuthPhase,
+    /// 发起登录前的相位：取消等待时原样恢复，避免把已登录会话误打成未登录。
+    pre_login_phase: Option<AuthPhase>,
     profile: Option<AuthProfile>,
     pending: Option<PendingLogin>,
     last_error: Option<String>,
@@ -289,10 +291,43 @@ impl AuthService {
         self.state.read().await.credentials.is_some()
     }
 
-    /// 代理转发用的最小凭据快照；`reauth_required` 时返回 `None`（让代理回 401）。
+    /// 在"代次未变且仍是当前 pending 的那次登录"时提交轮询结果。
+    ///
+    /// 轮询的失败/超时分支也必须绑定 `poll_uuid`：`start_login` 不推进 epoch，
+    /// 一条早发出、晚返回的旧轮询否则能清掉刚新建的 pending（幽灵错误）。
+    pub(super) async fn commit_poll<T>(
+        &self,
+        epoch: u64,
+        poll_uuid: uuid::Uuid,
+        action: impl FnOnce(&mut RuntimeState) -> T,
+    ) -> Option<T> {
+        let mut state = self.state.write().await;
+        if state.epoch != epoch {
+            return None;
+        }
+        if !state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.poll_uuid == poll_uuid)
+        {
+            return None;
+        }
+        Some(action(&mut state))
+    }
+
+    /// 代理转发用的最小凭据快照；只有"当前会话仍可信"的相位才给凭据。
+    ///
+    /// 白名单而不是黑名单：`PendingLogin`（重新登录中）只在旧凭据仍有效时允许，
+    /// `ReauthRequired` / `Error` 一律 `None`（让代理回本地 401，而不是拿失效 token
+    /// 去上游换一个不透明 401 并记成上游错误）。
     pub(crate) async fn credentials_snapshot(&self) -> Option<crate::auth::CredentialsSnapshot> {
         let state = self.state.read().await;
-        if state.phase == AuthPhase::ReauthRequired {
+        let allowed = match state.phase {
+            AuthPhase::LoggedIn | AuthPhase::OfflineGrace => true,
+            AuthPhase::PendingLogin => state.credentials_valid,
+            AuthPhase::LoggedOut | AuthPhase::ReauthRequired | AuthPhase::Error => false,
+        };
+        if !allowed {
             return None;
         }
         let credentials = state.credentials.as_ref()?;
@@ -345,11 +380,32 @@ impl AuthService {
         }
     }
 
-    pub(super) async fn record_failure(&self, epoch: u64, message: &str) {
+    /// 记录一次登录失败。
+    ///
+    /// 收尾失败不销毁 pending：轮询与「重新粘贴同一条回调链接」仍是兜底路径；
+    /// `expected_poll` 用来确保失败只作用于发起它的那次登录，而不是刚新建的一次。
+    pub(super) async fn record_failure(
+        &self,
+        epoch: u64,
+        expected_poll: Option<uuid::Uuid>,
+        message: &str,
+    ) {
         // 失败发生在注销之后时不要再把状态改回 error。
         self.commit_if_current(epoch, |state| {
+            if let Some(expected) = expected_poll {
+                let bound = state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.poll_uuid == expected);
+                if !bound {
+                    return;
+                }
+                if let Some(pending) = state.pending.as_mut() {
+                    pending.credentials_consumed = false;
+                }
+            }
+            state.pre_login_phase = None;
             state.phase = AuthPhase::Error;
-            state.pending = None;
             state.last_error = Some(message.to_string());
         })
         .await;
@@ -852,6 +908,8 @@ mod tests {
         };
         service
             .commit_if_current(epoch, |state| {
+                state.phase = AuthPhase::LoggedIn;
+                state.credentials_valid = true;
                 state.credentials = Some(sample_credentials());
                 state.profile = Some(profile);
             })
@@ -1459,6 +1517,203 @@ mod tests {
             status.last_validated_at.is_none(),
             "tick 不得刷新 last_validated_at"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 取消等待 / 轮询绑定 / 相位白名单
+    // -----------------------------------------------------------------------
+
+    async fn seed_pending(service: &AuthService, started_at: DateTime<Utc>) -> uuid::Uuid {
+        let epoch = service.epoch().await;
+        let poll_uuid = uuid::Uuid::new_v4();
+        let pending = PendingLogin {
+            poll_uuid,
+            login_url: String::new(),
+            redirect_uri: String::new(),
+            started_at,
+            consecutive_network_errors: 0,
+            deep_link_received: false,
+            credentials_consumed: false,
+        };
+        service
+            .commit_if_current(epoch, move |state| {
+                state.phase = AuthPhase::PendingLogin;
+                state.pending = Some(pending);
+            })
+            .await
+            .expect("代次未变应可写");
+        poll_uuid
+    }
+
+    /// 取消等待必须恢复发起登录前的相位，而不是把已登录会话打成未登录。
+    #[tokio::test]
+    async fn cancel_login_restores_previous_phase() {
+        let (service, dir) = temp_service();
+        seed_logged_in(&service, "alice", "token-alice").await;
+        service
+            .start_login("https://example.test")
+            .await
+            .expect("登录应可发起");
+        assert_eq!(service.status().await.state, "pending");
+
+        let status = service.cancel_login().await;
+
+        assert_eq!(status.state, "authenticated", "应恢复登录前相位");
+        assert!(
+            service.state.read().await.pending.is_none(),
+            "pending 必须清空"
+        );
+        assert!(
+            service.credentials_snapshot().await.is_some(),
+            "取消等待后代理应恢复可用"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_login_without_pending_is_noop() {
+        let (service, dir) = temp_service();
+        let before = service.status().await;
+
+        let status = service.cancel_login().await;
+
+        assert_eq!(status, before);
+        assert!(service.status().await.pending_login_started_at.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 旧轮询的失败/超时分支不得清掉或改写新 pending。
+    #[tokio::test]
+    async fn stale_poll_uuid_cannot_touch_new_pending() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        let current = seed_pending(&service, Utc::now()).await;
+
+        let stale = service
+            .commit_poll(epoch, uuid::Uuid::new_v4(), |state| {
+                state.pending = None;
+                state.phase = AuthPhase::Error;
+            })
+            .await;
+        assert!(stale.is_none(), "旧 poll_uuid 必须被拒绝");
+        assert_eq!(
+            service.status().await.state,
+            "pending",
+            "新 pending 不得被旧轮询清掉"
+        );
+
+        let fresh = service
+            .commit_poll(epoch, current, |state| {
+                state.pending = None;
+                state.phase = AuthPhase::LoggedOut;
+            })
+            .await;
+        assert!(fresh.is_some(), "当前 poll_uuid 应可提交");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 深链收尾失败要保留 pending（允许重贴同一条链接），但不许作用于另一条登录。
+    #[tokio::test]
+    async fn record_failure_keeps_pending_for_retry() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        let poll_uuid = seed_pending(&service, Utc::now()).await;
+        {
+            let mut state = service.state.write().await;
+            state
+                .pending
+                .as_mut()
+                .expect("应有 pending")
+                .credentials_consumed = true;
+        }
+
+        service.record_failure(epoch, Some(poll_uuid), "boom").await;
+
+        let status = service.status().await;
+        assert_eq!(status.state, "error");
+        let uuid_text = poll_uuid.to_string();
+        assert_eq!(
+            status.pending_poll_uuid.as_deref(),
+            Some(uuid_text.as_str()),
+            "失败不得销毁 pending"
+        );
+
+        service
+            .record_failure(epoch, Some(uuid::Uuid::new_v4()), "other")
+            .await;
+        let state = service.state.read().await;
+        assert!(
+            !state
+                .pending
+                .as_ref()
+                .expect("pending 仍在")
+                .credentials_consumed,
+            "同一链接应可重试"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Error` / `ReauthRequired` 相位不得再给代理旧 token。
+    #[tokio::test]
+    async fn snapshot_denied_in_error_phase() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        service
+            .commit_if_current(epoch, |state| state.phase = AuthPhase::Error)
+            .await;
+
+        assert!(
+            service.credentials_snapshot().await.is_none(),
+            "错误态不得把旧 token 交给代理"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `/validate` 403 触发的强制续期必须尊重失败退避（避免每轮重试）。
+    #[tokio::test]
+    async fn renew_now_respects_backoff() {
+        let (service, dir) = temp_service();
+        let epoch = service.epoch().await;
+        seed_logged_in(&service, "alice", "token-alice").await;
+        service
+            .commit_if_current(epoch, |state| {
+                state.renew.last_attempt_at = Some(Utc::now());
+                state.renew.backoff_secs = 60;
+            })
+            .await;
+        let gateway = AuthGateway::new("https://example.test").expect("网关应可构造");
+
+        let outcome = service.renew_now(epoch, &gateway, true).await;
+
+        assert!(
+            matches!(outcome, Some(super::renewal::RenewOutcome::Transient)),
+            "退避窗口内应直接返回 Transient"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 过期 pending 由 tick 兜底清理，避免后台认证永久停摆。
+    #[tokio::test]
+    async fn tick_clears_timed_out_pending() {
+        let (service, dir) = temp_service();
+        seed_logged_in(&service, "alice", "token-alice").await;
+        seed_pending(&service, Utc::now() - chrono::Duration::seconds(400)).await;
+
+        let update = service.tick("https://example.test").await;
+
+        assert!(update.is_none());
+        let state = service.state.read().await;
+        assert!(state.pending.is_none(), "过期 pending 必须被清掉");
+        assert_eq!(state.phase, AuthPhase::Error);
 
         let _ = fs::remove_dir_all(&dir);
     }
