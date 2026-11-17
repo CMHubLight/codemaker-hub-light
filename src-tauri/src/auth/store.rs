@@ -354,7 +354,7 @@ impl CredentialStore {
 
 fn random_key() -> Result<[u8; KEY_LEN], StoreError> {
     let mut key = [0u8; KEY_LEN];
-    getrandom::getrandom(&mut key)
+    getrandom::fill(&mut key)
         .map_err(|err| StoreError::Crypto(format!("无法生成主密钥：{err}")))?;
     Ok(key)
 }
@@ -389,7 +389,7 @@ fn cipher(key: &[u8; KEY_LEN]) -> Result<Aes256Gcm, StoreError> {
 
 fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes)
+    getrandom::fill(&mut nonce_bytes)
         .map_err(|err| StoreError::Crypto(format!("无法生成 nonce：{err}")))?;
 
     let header = [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION];
