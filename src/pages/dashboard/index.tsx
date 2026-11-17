@@ -113,12 +113,12 @@ export function Dashboard({ dataRevision = 0, quotaRevision = 0 }: DashboardProp
       <section className="stat-grid" aria-label="今日与本月用量">
         <StatCard
           label="今日 Token"
-          value={statValue(today, summary !== null, summaryError, 'tokens')}
+          value={statValue(today, summary, summaryResource.loading, summaryError, 'tokens')}
           accent
         />
         <StatCard
           label="今日费用"
-          value={statValue(today, summary !== null, summaryError, 'cost')}
+          value={statValue(today, summary, summaryResource.loading, summaryError, 'cost')}
         />
         <StatCard label="本月 Token" value={quotaLoading ? '…' : monthTokenValue} />
         <StatCard
@@ -192,8 +192,9 @@ export function Dashboard({ dataRevision = 0, quotaRevision = 0 }: DashboardProp
       <RecentRequests
         summary={summary}
         error={summaryError}
-        loading={summaryResource.loading}
+        loading={summaryResource.loading || summaryResource.refreshing}
         refreshing={summaryResource.refreshing}
+        onRetry={() => summaryResource.reload()}
       />
     </div>
   )
@@ -201,13 +202,18 @@ export function Dashboard({ dataRevision = 0, quotaRevision = 0 }: DashboardProp
 
 function statValue(
   totals: UsageTotals | undefined,
-  hasData: boolean,
+  summary: UsageSummary | null,
+  loading: boolean,
   error: CommandError | null,
   kind: 'tokens' | 'cost'
 ): string {
-  // 只有"还没有任何数据"时才显示占位；后台刷新继续显示旧值，不再闪成"…"。
-  if (!hasData) return '…'
-  if (error) return '—'
+  if (!summary) {
+    // 首屏失败：明确显示“—”，不能再挂着“…”假装还在加载（旧 P2-5）。
+    if (error) return '—'
+    // 只有 `summary == null && loading` 才是真正的首次加载态。
+    return loading ? '…' : '—'
+  }
+  // 已有数据时的后台刷新失败保留旧值（概览页顶部已有错误提示与重试）。
   if (!totals || totals.requests === 0) return '—'
   return kind === 'tokens' ? formatCompact(totals.total_tokens) : formatYuan(totals.cost_yuan)
 }

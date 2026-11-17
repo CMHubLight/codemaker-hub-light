@@ -24,6 +24,14 @@ const PAGES: PageMeta[] = [
   { key: 'settings', label: '设置', description: '代理、记录策略与客户端接入说明' }
 ]
 
+/**
+ * 登录态兜底轮询间隔。
+ *
+ * 事件订阅失败（权限/后端未就绪）时 `useTauriEvent` 只重试有限次；没有兜底轮询，
+ * 界面会永远停在启动那一刻的状态（N-P3-29）。
+ */
+const AUTH_STATUS_POLL_MS = 60_000
+
 const UNAUTHENTICATED: AuthStatus = {
   state: 'unauthenticated',
   user: null,
@@ -63,6 +71,13 @@ export default function App() {
   const [bootFailed, setBootFailed] = useState(false)
   /** 浏览器预览（无 Tauri 后端）时允许跳过登录查看界面；仅内存态。 */
   const [previewSignedIn, setPreviewSignedIn] = useState(false)
+  /**
+   * 代理启动失败的原因（`proxy://error` 的 message）。
+   * 旧实现把它丢掉，用户只能在设置页看到失败，概览/请求页只剩“没有数据”（N-P3-28）。
+   */
+  const [proxyError, setProxyError] = useState<string | null>(null)
+  /** 设置页是否有未保存修改：离开前要确认，否则编辑静默丢失（旧 P3-9）。 */
+  const [settingsDirty, setSettingsDirty] = useState(false)
   const authRef = useRef<AuthStatus | null>(null)
   const previewSignedInRef = useRef(false)
 
@@ -102,6 +117,30 @@ export default function App() {
     void loadAuth()
   }, [loadAuth])
 
+  // 事件订阅不是唯一真相来源：每 60s 兜底拉一次登录态，覆盖订阅失败/漏事件的情况。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadAuth()
+    }, AUTH_STATUS_POLL_MS)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [loadAuth])
+
+  // 设置页有未保存修改时，关闭/刷新窗口要让浏览器给出确认（App 内切页另有一套确认）。
+  useEffect(() => {
+    if (!settingsDirty) return
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      // 旧浏览器只认非空的 returnValue；现代浏览器用 preventDefault 即可。
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+    }
+  }, [settingsDirty])
+
   // 登录态事件：后端只在状态真的变化时广播，直接更新界面即可。
   // 用量/额度数据不在这里重取：账户变化时后端会补发 quota://updated，
   // 避免 validate 类事件带着概览/请求页整页重拉。
@@ -112,6 +151,7 @@ export default function App() {
     setBootFailed(false)
     if (status.state === 'unauthenticated') {
       setPreviewSignedIn(false)
+      setSettingsDirty(false)
       setPage('dashboard')
     }
   })
@@ -129,8 +169,16 @@ export default function App() {
   })
 
   // 代理启动/重启/端口回退：刷新设置页代理状态与本机请求计数。
-  useTauriEvent('proxy://status', bumpData)
-  useTauriEvent('proxy://error', bumpData)
+  // 运行态重新出现时清掉旧的启动错误，避免横幅长期挂着已经解决的问题。
+  useTauriEvent('proxy://status', (status) => {
+    if (status.running) setProxyError(null)
+    bumpData()
+  })
+  // 启动期代理失败：message 必须留到 shell 层展示（N-P3-28），否则用户只看到“零请求”。
+  useTauriEvent('proxy://error', (payload) => {
+    setProxyError(payload.message)
+    bumpData()
+  })
 
   // 重复启动（后端已聚焦窗口）：刷新登录态与全部数据，避免两个入口看到不同状态。
   useTauriEvent('app://second-instance', () => {
@@ -147,6 +195,20 @@ export default function App() {
     setAuthLoading(true)
     void loadAuth()
   }, [loadAuth])
+
+  /**
+   * 切页：设置页有未保存修改时先确认（App 侧没有路由库，离开即卸载，编辑会丢）。
+   * 确认后才把 `settingsDirty` 复位：Settings 卸载后没人再上报脏态。
+   */
+  function goToPage(next: PageKey) {
+    if (next === page) return
+    if (page === 'settings' && settingsDirty) {
+      const confirmed = window.confirm('设置页有未保存的修改，切换页面会丢失这些修改。仍要离开吗？')
+      if (!confirmed) return
+    }
+    if (page === 'settings') setSettingsDirty(false)
+    setPage(next)
+  }
 
   function openLogs() {
     void invokeCmd<unknown>('app_open_logs').catch(() => {
@@ -166,6 +228,7 @@ export default function App() {
           : null
     setPreviewSignedIn(false)
     setAuth({ ...UNAUTHENTICATED, message: warning })
+    setSettingsDirty(false)
     setPage('dashboard')
     bumpData()
     bumpQuota()
@@ -241,7 +304,7 @@ export default function App() {
               type="button"
               className={item.key === page ? 'nav-item is-active' : 'nav-item'}
               aria-current={item.key === page ? 'page' : undefined}
-              onClick={() => setPage(item.key)}
+              onClick={() => goToPage(item.key)}
             >
               <span className="nav-icon" aria-hidden="true">
                 <NavIcon page={item.key} />
@@ -269,9 +332,29 @@ export default function App() {
         </header>
 
         {authError ? (
-          <p className="inline-message inline-message--error" role="alert">
-            登录状态异常：{authError}
-          </p>
+          <div className="inline-message-row">
+            <p className="inline-message inline-message--error" role="alert">
+              登录状态异常：{authError}
+            </p>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={retryAuth}>
+              重试
+            </button>
+          </div>
+        ) : null}
+
+        {proxyError ? (
+          <div className="inline-message-row">
+            <p className="inline-message inline-message--error" role="alert">
+              本地代理启动失败：{proxyError}
+            </p>
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={() => goToPage('settings')}
+            >
+              打开设置
+            </button>
+          </div>
         ) : null}
 
         {page === 'dashboard' ? (
@@ -305,6 +388,7 @@ export default function App() {
               revision={dataRevision}
               onLogout={handleLogout}
               onAuthUpdated={setAuth}
+              onDirtyChange={setSettingsDirty}
             />
           </ErrorBoundary>
         ) : null}

@@ -27,6 +27,8 @@ interface SettingsProps {
   onLogout: () => Promise<void> | void
   /** 手动续期成功后的登录态更新（后端同时会发 auth://state，这里用于即时刷新面板）。 */
   onAuthUpdated?: (status: AuthStatus) => void
+  /** 把“有未保存修改”上报给 App：切页/关窗确认用（旧 P3-9）。 */
+  onDirtyChange?: (dirty: boolean) => void
 }
 
 /**
@@ -37,13 +39,26 @@ interface SettingsProps {
  * 未保存编辑），代理状态与应用信息按 `revision` 静默刷新。
  * 数字字段用编辑态字符串（`NumberDrafts`），失焦/提交才解析校验，清空不会立刻变 0。
  */
-export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: SettingsProps) {
+export function Settings({
+  auth,
+  revision = 0,
+  onLogout,
+  onAuthUpdated,
+  onDirtyChange
+}: SettingsProps) {
   const previewMode = !isTauri()
   const [form, setForm] = useState<AppSettings | null>(null)
   const [drafts, setDrafts] = useState<NumberDrafts | null>(null)
   const [savedForm, setSavedForm] = useState<AppSettings | null>(null)
   const [saveState, setSaveState] = useState<SaveState | null>(null)
   const [restartMessage, setRestartMessage] = useState<SaveState | null>(null)
+  /**
+   * 保存了新端口/网关、但代理还没重启。
+   *
+   * 运行中的 `proxy.port`/`gateway_url` 要等重启后才变，此时“配置端口 ≠ 运行端口”
+   * 是应用自己要求的状态，不能当成端口回退（N-P2-3）。
+   */
+  const [restartPending, setRestartPending] = useState(false)
   const [logsMessage, setLogsMessage] = useState<SaveState | null>(null)
   const [loggingOut, setLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState<string | null>(null)
@@ -90,6 +105,19 @@ export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: Settin
     : (form?.proxy_port ?? 15721)
   const savedPort = savedForm?.proxy_port ?? null
   const baseUrl = proxy?.running ? proxy.base_url : `http://127.0.0.1:${configuredPort}`
+
+  // 脏态上报给 App：离开设置页/关闭窗口前确认，避免未保存编辑静默丢失。
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
+
+  // 保存后等待重启期间，运行态还是旧端口/旧网关；一旦运行态追上已保存配置就复位。
+  useEffect(() => {
+    if (!restartPending || !savedForm || !proxy) return
+    if (proxy.port === savedForm.proxy_port && proxy.gateway_url === savedForm.gateway_url) {
+      setRestartPending(false)
+    }
+  }, [restartPending, proxy, savedForm])
 
   function changeGateway(value: string) {
     setForm((current) => (current ? { ...current, gateway_url: value } : current))
@@ -173,7 +201,11 @@ export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: Settin
             ? '设置已保存，并在下一次请求立即生效（无需重启代理）。'
             : '设置已保存。'
     })
-    if (needsRestart) proxyResource.reload()
+    if (needsRestart) {
+      // 配置已换、运行态未换：标记“待重启”，ProxyPanel 据此不再报端口回退。
+      setRestartPending(true)
+      proxyResource.reload()
+    }
   }
 
   async function handleRestartProxy() {
@@ -182,6 +214,8 @@ export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: Settin
     if (outcome.status === 'ok') {
       const next = outcome.data
       proxyResource.mutate(next)
+      // 重启已完成：挂起的“待重启”标记作废，之后的端口差异才是真回退。
+      setRestartPending(false)
       // 回退提示只和“已保存的配置端口”比较：未保存的编辑不应影响这里的判断。
       const fallback =
         savedPort != null && next.port !== savedPort
@@ -267,12 +301,14 @@ export function Settings({ auth, revision = 0, onLogout, onAuthUpdated }: Settin
         error={proxyError}
         restartMessage={restartMessage}
         savedPort={savedPort}
+        restartPending={restartPending}
         configuredPort={configuredPort}
         configuredBind={form?.proxy_bind ?? '127.0.0.1'}
         configuredGateway={form?.gateway_url ?? null}
         onRestart={() => void handleRestartProxy()}
+        onRetry={() => proxyResource.reload()}
         restarting={restarting}
-        loading={loading}
+        loading={loading || proxyResource.loading || proxyResource.refreshing}
       />
 
       <RecordingForm

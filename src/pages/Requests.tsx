@@ -75,8 +75,6 @@ export function Requests({ revision = 0 }: RequestsProps) {
    */
   const knownTotalRef = useRef<number | null>(null)
   const [reloadNonce, setReloadNonce] = useState(0)
-  /** 用户主动查询（改筛选/翻页/重试）时置位：只有它显示阻塞式“查询中…”。 */
-  const [querying, setQuerying] = useState(false)
   const revisionRef = useRef(revision)
 
   const currentCursor = cursors[pageIndex] ?? null
@@ -98,11 +96,12 @@ export function Requests({ revision = 0 }: RequestsProps) {
       filter: toRequestFilter(applied, currentCursor, includeTotal)
     })
   }))
-
-  // 用户查询的结果（成功或失败）落地后收起“查询中…”。
-  useEffect(() => {
-    setQuerying(false)
-  }, [pageResource.data, pageResource.error])
+  // “查询中”派生自资源状态，不再用 state + effect 维护：
+  // 当前 queryKey 还没有落地（成功或失败）的响应 = 用户刚改了筛选/翻页/重试；
+  // 旧实现在重试时会被上一个请求的 data/error 变化提前清掉，按钮在真正开始取数前
+  // 就恢复可点（P3-6）。`settledKey` 由 useAsyncResource 维护，失败也算落地。
+  const applyingFilter = pageResource.settledKey !== queryKey
+  const querying = pageResource.refreshing || applyingFilter
 
   // 第一页带回 total；后续页 total = -1 表示“未统计”，沿用已有总数。
   // 派生值优先用当前响应（同帧可见），ref 只作为后续页的兜底。
@@ -113,17 +112,24 @@ export function Requests({ revision = 0 }: RequestsProps) {
     if (pageTotal != null && pageTotal >= 0) knownTotalRef.current = pageTotal
   }, [pageTotal])
 
-  // 事件刷新：keyset 页是快照，停在旧页会看到过期内容——静默回到第一页重取。
+  // 事件刷新：本页是 keyset 快照，重取当前页即可。
+  // 旧实现每次都 setPageIndex(0) + setCursors([null])，一次额度 tick 会把正在翻页的
+  // 用户打回第 1 页（旧 P2-4）；只有停在第 1 页时才需要重置游标栈。
   useEffect(() => {
     if (revisionRef.current === revision) return
     revisionRef.current = revision
-    setPageIndex(0)
-    setCursors([null])
+    if (pageIndex === 0) {
+      // 第一页要重新统计 total（后台清理/新请求都可能改变总数）。
+      knownTotalRef.current = null
+      setCursors([null])
+    }
     setReloadNonce((value) => value + 1)
-  }, [revision])
+  }, [pageIndex, revision])
 
-  /** 筛选变化 / 重试 / 事件刷新：游标栈失效，回到第一页（含 total）重取。 */
+  /** 筛选变化 / 重试 / 回第一页：游标栈失效，总数作废后从第一页（含 total）重取。 */
   function resetToFirstPage() {
+    // 旧 total 属于上一个筛选条件：不清掉会让“共 N 条”和新列表一起显示（旧 P2-6）。
+    knownTotalRef.current = null
     setPageIndex(0)
     setCursors([null])
     setReloadNonce((value) => value + 1)
@@ -134,13 +140,11 @@ export function Requests({ revision = 0 }: RequestsProps) {
   }
 
   function applyFilters() {
-    setQuerying(true)
     setApplied({ ...draft })
     resetToFirstPage()
   }
 
   function resetFilters() {
-    setQuerying(true)
     setDraft(DEFAULT_FILTERS)
     setApplied(DEFAULT_FILTERS)
     resetToFirstPage()
@@ -150,49 +154,55 @@ export function Requests({ revision = 0 }: RequestsProps) {
     // 回退过的页游标还在栈里：前进优先复用，避免再依赖当前页的 next_cursor。
     const next = cursors[pageIndex + 1] ?? pageData?.next_cursor ?? null
     if (!next) return
-    setQuerying(true)
     setCursors((current) => [...current.slice(0, pageIndex + 1), next])
     setPageIndex(pageIndex + 1)
   }
 
   function prevPage() {
     if (pageIndex === 0) return
-    setQuerying(true)
     setPageIndex(pageIndex - 1)
   }
 
   function retry() {
-    setQuerying(true)
     resetToFirstPage()
   }
 
   const error = pageResource.error
   const loading = pageResource.loading || querying
-  const refreshing = pageResource.refreshing && !loading
   const items = pageData?.items ?? []
   const totalCount = total ?? 0
-  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
-  const canNext = pageIndex + 1 < cursors.length || pageData?.next_cursor != null
+  // `next_cursor` 是后端“还有没有下一页”的唯一权威（多取一行前瞻，满页不再等于有下一页）；
+  // total 只在第一页统计，用来补足总页数显示，不能反过来决定能不能翻页（旧 P2-6）。
+  const canNext = pageData?.next_cursor != null
+  const knownPages = total != null ? Math.ceil(Math.max(total, 0) / PAGE_SIZE) : 0
+  const totalPages = Math.max(knownPages, pageIndex + 1 + (canNext ? 1 : 0), 1)
   const filtersPending = !filtersEqual(draft, applied)
   const filterActive =
     applied.protocol !== '' ||
     applied.status !== '' ||
     applied.keyword.trim() !== '' ||
     applied.range !== DEFAULT_FILTERS.range
-  const emptyTitle = loading
-    ? '正在加载请求…'
-    : error
-      ? '请求列表加载失败'
-      : filterActive
-        ? '当前筛选条件下没有请求'
-        : '暂无请求记录'
-  const emptyText = loading
-    ? '正在从本地用量库读取 usage_requests。'
-    : error
-      ? `无法读取本地用量库：${error.raw}`
-      : filterActive
-        ? '可以放宽时间范围或清空筛选条件后重试。'
-        : '把 Claude Code / Codex / OpenAI SDK 指向本地代理后，请求会记录在这里。'
+  // 后端多取一行后，整数倍满页不会再给出空页；但数据被清理/并发删除时仍可能取到空页，
+  // 此时给出“本页暂无数据 + 回到第一页”，而不是让人以为筛选坏了（旧 P2-6）。
+  const emptyLaterPage = pageIndex > 0 && error == null && !loading
+  const emptyTitle = error
+    ? '请求列表加载失败'
+    : loading
+      ? '正在加载请求…'
+      : emptyLaterPage
+        ? '本页暂无数据'
+        : filterActive
+          ? '当前筛选条件下没有请求'
+          : '暂无请求记录'
+  const emptyText = error
+    ? `无法读取本地用量库：${error.raw}`
+    : loading
+      ? '正在从本地用量库读取 usage_requests。'
+      : emptyLaterPage
+        ? '这一页的请求可能已被清理；回到第一页可查看最新记录。'
+        : filterActive
+          ? '可以放宽时间范围或清空筛选条件后重试。'
+          : '把 Claude Code / Codex / OpenAI SDK 指向本地代理后，请求会记录在这里。'
 
   return (
     <div className="stack">
@@ -276,25 +286,24 @@ export function Requests({ revision = 0 }: RequestsProps) {
 
       <Panel>
         <PanelHeader title="请求明细" meta="逐请求 token 四元组、费用、首字节与总耗时">
-          <span className="panel-tag">
-            {loading ? '查询中…' : refreshing ? '刷新中…' : `共 ${totalCount} 条`}
-          </span>
+          <span className="panel-tag">{loading ? '查询中…' : `共 ${totalCount} 条`}</span>
         </PanelHeader>
 
         <div className="table-wrap">
           <table className="requests-table">
+            <caption className="visually-hidden">请求明细：按时间倒序，支持时间范围、协议、状态与模型关键字筛选</caption>
             <thead>
               <tr>
-                <th>时间</th>
-                <th>模型</th>
-                <th>协议</th>
-                <th>客户端</th>
-                <th className="num">输入</th>
-                <th className="num">输出</th>
-                <th className="num">费用</th>
-                <th className="num">首字节</th>
-                <th className="num">耗时</th>
-                <th>状态</th>
+                <th scope="col">时间</th>
+                <th scope="col">模型</th>
+                <th scope="col">协议</th>
+                <th scope="col">客户端</th>
+                <th scope="col" className="num">输入</th>
+                <th scope="col" className="num">输出</th>
+                <th scope="col" className="num">费用</th>
+                <th scope="col" className="num">首字节</th>
+                <th scope="col" className="num">耗时</th>
+                <th scope="col">状态</th>
               </tr>
             </thead>
             <tbody>
@@ -303,6 +312,13 @@ export function Requests({ revision = 0 }: RequestsProps) {
                   <td colSpan={10} className="empty-cell">
                     <p className="empty-state-title">{emptyTitle}</p>
                     <p className="empty-state-text">{emptyText}</p>
+                    {emptyLaterPage ? (
+                      <div className="empty-state-actions">
+                        <button type="button" className="btn btn--ghost btn--sm" onClick={retry}>
+                          回到第一页
+                        </button>
+                      </div>
+                    ) : null}
                   </td>
                 </tr>
               ) : (

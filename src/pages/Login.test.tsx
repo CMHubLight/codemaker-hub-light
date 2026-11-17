@@ -168,10 +168,62 @@ describe('Login AuthKey 直登', () => {
     const keyInput = screen.getByLabelText('AuthKey')
     expect(keyInput).toHaveAttribute('type', 'password')
 
-    fireEvent.click(screen.getByRole('button', { name: '显示' }))
+    const showButton = screen.getByRole('button', { name: '显示' })
+    expect(showButton).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(showButton)
     expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'text')
+    expect(screen.getByRole('button', { name: '隐藏' })).toHaveAttribute('aria-pressed', 'true')
     fireEvent.click(screen.getByRole('button', { name: '隐藏' }))
     expect(screen.getByLabelText('AuthKey')).toHaveAttribute('type', 'password')
+  })
+
+  it('pressing_enter_in_authkey_input_submits', async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_login_with_auth_key') return AUTH_OK
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    const { onAuthenticated } = renderAuthKeyPage()
+
+    fireEvent.change(screen.getByLabelText('账号名'), { target: { value: 'alice' } })
+    fireEvent.change(screen.getByLabelText('AuthKey'), { target: { value: 'secret-key' } })
+    fireEvent.keyDown(screen.getByLabelText('AuthKey'), { key: 'Enter' })
+    await flushMicrotasks()
+
+    expect(invokeMock).toHaveBeenCalledWith('auth_login_with_auth_key', {
+      user: 'alice',
+      authKey: 'secret-key'
+    })
+    expect(onAuthenticated).toHaveBeenCalledTimes(1)
+  })
+
+  it('authkey_login_disables_browser_login_button_while_in_flight', async () => {
+    let releaseAuthKey: (() => void) | undefined
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_login_with_auth_key') {
+        await new Promise<void>((resolve) => {
+          releaseAuthKey = resolve
+        })
+        return AUTH_OK
+      }
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    const { onAuthenticated } = renderAuthKeyPage()
+
+    fireEvent.change(screen.getByLabelText('账号名'), { target: { value: 'alice' } })
+    fireEvent.change(screen.getByLabelText('AuthKey'), { target: { value: 'secret-key' } })
+    fireEvent.click(screen.getByRole('button', { name: 'AuthKey 登录' }))
+    await flushMicrotasks()
+
+    // N-P2-4：AuthKey 在飞时主「登录」按钮必须禁用，避免两条登录流程竞争收尾。
+    const browserButton = screen.getByRole('button', { name: 'AuthKey 登录中…' })
+    expect(browserButton).toBeDisabled()
+    expect(screen.getByRole('button', { name: '登录中…' })).toBeDisabled()
+
+    await act(async () => {
+      releaseAuthKey?.()
+    })
+    await flushMicrotasks()
+    expect(onAuthenticated).toHaveBeenCalledTimes(1)
   })
 
   it('authkey_login_is_disabled_while_waiting_for_browser', async () => {
@@ -194,6 +246,82 @@ describe('Login AuthKey 直登', () => {
     await flushMicrotasks()
     expect(invokeMock).not.toHaveBeenCalledWith('auth_login_with_auth_key', expect.anything())
     expect(onAuthenticated).not.toHaveBeenCalled()
+  })
+})
+
+describe('Login 取消等待', () => {
+  function mockWaitingLogin() {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === 'auth_start_login') return LOGIN_SESSION
+      if (command === 'auth_poll_status') return AUTH_PENDING
+      if (command === 'auth_cancel_login') return AUTH_UNAUTHENTICATED
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+  }
+
+  function commandCalls(command: string): number {
+    return invokeMock.mock.calls.filter(([name]) => name === command).length
+  }
+
+  it('cancel_waiting_calls_backend_and_returns_to_idle', async () => {
+    mockWaitingLogin()
+    render(<Login previewMode={false} onAuthenticated={vi.fn()} onPreviewSignIn={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: '登录' }))
+    await flushMicrotasks()
+    expect(screen.getByRole('button', { name: '取消等待' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '取消等待' }))
+    await flushMicrotasks()
+
+    // N-P2-8：取消必须通知后端清 pending，不能只改本地 state。
+    expect(commandCalls('auth_cancel_login')).toBe(1)
+    expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消等待' })).toBeNull()
+  })
+
+  it('late_pending_event_after_cancel_does_not_restore_waiting', async () => {
+    mockWaitingLogin()
+    render(<Login previewMode={false} onAuthenticated={vi.fn()} onPreviewSignIn={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: '登录' }))
+    await flushMicrotasks()
+    fireEvent.click(screen.getByRole('button', { name: '取消等待' }))
+    await flushMicrotasks()
+
+    // 取消后迟到的 pending 广播不能把页面又拽回等待态（N-P3-30）。
+    act(() => {
+      eventHandlers.map['auth://state']?.({ ...AUTH_PENDING, state: 'pending' })
+    })
+    await flushMicrotasks()
+    expect(screen.getByRole('heading', { name: '登录以继续' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消等待' })).toBeNull()
+  })
+
+  it('waiting_times_out_from_backend_pending_started_at_without_session', async () => {
+    vi.useFakeTimers()
+    invokeMock.mockImplementation(async (command) => {
+      throw new Error(`未 mock 的命令：${String(command)}`)
+    })
+    // 应用重启后本地没有 session/startedAt：只有后端 pending 起点能算出已等待太久。
+    render(
+      <Login
+        previewMode={false}
+        initialStatus={{
+          ...AUTH_PENDING,
+          pending_login_started_at: new Date(Date.now() - 60 * 60 * 1000).toISOString()
+        }}
+        onAuthenticated={vi.fn()}
+        onPreviewSignIn={vi.fn()}
+      />
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+    await flushMicrotasks()
+    expect(screen.getByText(/登录超时/)).toBeInTheDocument()
+    expect(commandCalls('auth_poll_status')).toBe(0)
   })
 })
 

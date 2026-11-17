@@ -91,6 +91,14 @@ interface ResourceState<T> {
   error: CommandError | null
   loading: boolean
   refreshing: boolean
+  /**
+   * 最近一次**落地**（成功或失败）的请求 key。
+   *
+   * `data`/`error` 都不带 key，调用方无法区分“显示的是旧 key 的结果”和“当前 key 的
+   * 请求还没回来”。请求页的 `查询中` 就靠它派生：`settledKey !== queryKey` 即未落地，
+   * 不能用 effect 去清状态（重试时会提前把“查询中”清掉）。
+   */
+  settledKey: string | null
 }
 
 export interface AsyncResource<T> extends ResourceState<T> {
@@ -115,7 +123,8 @@ export function useAsyncResource<T>(key: string, load: () => Promise<T>): AsyncR
     error: null,
     // 初始即进入首次加载态：首帧不闪现“暂无数据”。
     loading: true,
-    refreshing: false
+    refreshing: false,
+    settledKey: null
   })
   const loadRef = useRef(load)
   /** 是否已经发起过至少一次请求；用来区分首次加载与后台刷新。 */
@@ -137,21 +146,25 @@ export function useAsyncResource<T>(key: string, load: () => Promise<T>): AsyncR
       data: current.data,
       error: null,
       loading: first,
-      refreshing: !first
+      refreshing: !first,
+      // 新请求还没有落地：settledKey 仍是上一次结果的 key。
+      settledKey: current.settledKey
     }))
 
     void (async () => {
       try {
         const data = await loadRef.current()
         if (cancelled) return
-        setState({ data, error: null, loading: false, refreshing: false })
+        setState({ data, error: null, loading: false, refreshing: false, settledKey: key })
       } catch (cause) {
         if (cancelled) return
         setState((current) => ({
           data: current.data,
           error: describeError(cause),
           loading: false,
-          refreshing: false
+          refreshing: false,
+          // 失败也算落地：调用方据此恢复“可重试”，而不是一直显示查询中。
+          settledKey: key
         }))
       }
     })()
@@ -164,9 +177,13 @@ export function useAsyncResource<T>(key: string, load: () => Promise<T>): AsyncR
 
   const reload = useCallback(() => setNonce((value) => value + 1), [])
 
-  const mutate = useCallback((next: T) => {
-    setState({ data: next, error: null, loading: false, refreshing: false })
-  }, [])
+  const mutate = useCallback(
+    (next: T) => {
+      // 命令是带着当前 key 的输入发起的：结果视为当前 key 已落地。
+      setState({ data: next, error: null, loading: false, refreshing: false, settledKey: key })
+    },
+    [key]
+  )
 
   return { ...state, reload, mutate }
 }

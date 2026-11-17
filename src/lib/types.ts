@@ -142,21 +142,6 @@ export interface UsageTotals {
   error_rate: number | null
 }
 
-export interface DailyUsage {
-  /** YYYY-MM-DD */
-  date: string
-  requests: number
-  tokens: number
-  cost_yuan: number
-}
-
-export interface ModelUsage {
-  model: string
-  requests: number
-  tokens: number
-  cost_yuan: number
-}
-
 export interface RecentRequest {
   id: string
   /** ISO 时间字符串。 */
@@ -178,12 +163,14 @@ export interface RecentRequest {
   cost_yuan: number
 }
 
+/**
+ * 概览页的用量汇总。
+ *
+ * 后端只返回 `today + recent`：`month` / `daily` / `models` 已删除（本轮 N-P3-18），
+ * 「本月」数据来自云端额度快照（`QuotaInfo`），不要再在这里造第二套口径。
+ */
 export interface UsageSummary {
   today: UsageTotals
-  month: UsageTotals
-  /** 最近 30 天，按日期升序。 */
-  daily: DailyUsage[]
-  models: ModelUsage[]
   recent: RecentRequest[]
   generated_at: string
 }
@@ -219,7 +206,10 @@ export interface RequestPage {
   /** 满足筛选的总条数；`include_total = false` 时后端返回 -1（未统计）。 */
   total: number
   items: RecentRequest[]
-  /** 满页时给出的下一页游标；没有更多数据为 null/缺省。 */
+  /**
+   * 下一页游标：后端多取一行做前瞻，**只有确实还有下一页时**才返回；
+   * 为 null/缺省表示没有更多数据，因此“满页”不再等于“一定有下一页”。
+   */
   next_cursor?: Cursor | null
   /** 本页所用游标（首页为 null）。 */
   prev_cursor?: Cursor | null
