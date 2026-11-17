@@ -87,24 +87,29 @@ impl CostInfo {
 }
 
 /// `total_credit` → 人民币元；保留 8 位小数避免浮点噪声。
+///
+/// 负数/非有限数按 0 处理：费用字段来自上游，但不允许污染本机账务。
 pub fn credit_to_yuan(total_credit: f64, credit_to_yuan_ratio: f64) -> f64 {
     if !total_credit.is_finite() || !credit_to_yuan_ratio.is_finite() {
         return 0.0;
     }
-    let value = total_credit * credit_to_yuan_ratio;
+    let value = (total_credit * credit_to_yuan_ratio).max(0.0);
     (value * 100_000_000.0).round() / 100_000_000.0
 }
 
-/// 从上游响应 JSON 中提取 `aigw.cost.total_credit`（兼容包裹在 `usage` 下、字符串数字）。
+/// 从上游响应 JSON 中提取 `aigw.cost.total_credit`。
+///
+/// 兼容三种嵌套：顶层 `aigw`、`usage.aigw`（Chat）、`response.aigw` /
+/// `response.usage.aigw`（Responses 的 `response.completed` 事件与整包响应）。
 pub fn extract_total_credit(payload: &serde_json::Value) -> Option<f64> {
-    payload
-        .pointer("/aigw/cost/total_credit")
-        .and_then(as_f64_lenient)
-        .or_else(|| {
-            payload
-                .pointer("/usage/aigw/cost/total_credit")
-                .and_then(as_f64_lenient)
-        })
+    [
+        "/aigw/cost/total_credit",
+        "/usage/aigw/cost/total_credit",
+        "/response/aigw/cost/total_credit",
+        "/response/usage/aigw/cost/total_credit",
+    ]
+    .iter()
+    .find_map(|pointer| payload.pointer(pointer).and_then(as_f64_lenient))
 }
 
 fn as_f64_lenient(value: &serde_json::Value) -> Option<f64> {
@@ -118,10 +123,11 @@ fn as_f64_lenient(value: &serde_json::Value) -> Option<f64> {
         .filter(|number| number.is_finite())
 }
 
+/// 非负整数：token 字段出现负数或超出 i64 的 u64 时钳到合法范围。
 fn as_i64_lenient(value: &serde_json::Value) -> i64 {
     value
         .as_i64()
-        .or_else(|| value.as_u64().map(|number| number as i64))
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
         .or_else(|| value.as_f64().map(|number| number as i64))
         .or_else(|| {
             value
@@ -129,6 +135,7 @@ fn as_i64_lenient(value: &serde_json::Value) -> i64 {
                 .and_then(|text| text.trim().parse::<i64>().ok())
         })
         .unwrap_or(0)
+        .max(0)
 }
 
 fn get_i64(payload: &serde_json::Value, key: &str) -> i64 {
@@ -140,18 +147,21 @@ fn split_cached_input(prompt_tokens: i64, cache_read_tokens: i64) -> i64 {
     (prompt_tokens - cache_read_tokens).max(0)
 }
 
-/// 从上游响应 JSON 中提取 `aigw.trace_id`。
+/// 从上游响应 JSON 中提取 `aigw.trace_id`（兼容 Responses 的 `response.*` 嵌套）。
 pub fn extract_trace_id(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .pointer("/aigw/trace_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            payload
-                .pointer("/usage/aigw/trace_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
+    [
+        "/aigw/trace_id",
+        "/usage/aigw/trace_id",
+        "/response/aigw/trace_id",
+        "/response/usage/aigw/trace_id",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// 解析 usage 四元组。

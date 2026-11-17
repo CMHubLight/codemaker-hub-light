@@ -22,5 +22,30 @@ pub use request::{anthropic_to_openai_request, estimate_input_tokens, PreparedRe
 pub use response::{message_json_to_sse, openai_to_anthropic_response};
 pub use stream::StreamTranslator;
 
+use serde_json::Value;
+
+/// 从 OpenAI 的 `content` 取纯文本：兼容字符串与 `[{"type":"text","text":…}]` 数组。
+///
+/// 数组形态常见于多模态/part 形式的网关响应；旧实现只认字符串，会把正文静默丢掉
+/// （token 照记、回答为空）。
+pub(super) fn content_text(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let parts = content.as_array()?;
+    let mut joined = String::new();
+    for part in parts {
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| part.as_str());
+        if let Some(text) = text {
+            joined.push_str(text);
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
 #[cfg(test)]
 mod tests;

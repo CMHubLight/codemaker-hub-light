@@ -50,6 +50,8 @@ pub enum ProxyError {
         port: u16,
         message: String,
     },
+    #[error("初始化转发 HTTP 客户端失败：{0}")]
+    HttpClient(#[from] reqwest::Error),
 }
 
 /// 代理状态（返回给前端与 `/status`）。
@@ -301,7 +303,7 @@ impl ProxyServer {
             self.db.clone(),
             self.provider.clone(),
             policy,
-        ));
+        )?);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let task_info = info.clone();

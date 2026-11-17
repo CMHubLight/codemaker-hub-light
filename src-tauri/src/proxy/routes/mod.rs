@@ -65,7 +65,7 @@ impl RoutesState {
         db: Db,
         provider: Arc<dyn CredentialProvider>,
         policy: Arc<PolicyCell>,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let http = match reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(
                 crate::proxy::policy::CONNECT_TIMEOUT_SECS,
@@ -74,22 +74,29 @@ impl RoutesState {
             // 不跟随重定向：注入的账号凭据是自定义头，reqwest 跨主机重定向只剥离
             // authorization/cookie 等标准头，自定义头会跟着跳到 Location 主机。
             .redirect(reqwest::redirect::Policy::none())
+            // 不用系统代理：token 只应发往用户配置的网关（http 回环网关时尤其重要）。
+            .no_proxy()
             .build()
         {
             Ok(client) => client,
             Err(err) => {
-                warn!(error = %err, "构建转发 HTTP 客户端失败，回退默认客户端");
-                reqwest::Client::new()
+                // 回退也必须保留安全策略：绝不退回会跟随重定向、会走系统代理的
+                // `Client::new()`。连最小客户端都建不出来时让代理启动失败。
+                warn!(error = %err, "构建转发 HTTP 客户端失败，使用最小安全配置重试");
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .no_proxy()
+                    .build()?
             }
         };
-        Self {
+        Ok(Self {
             info,
             db,
             provider,
             policy,
             http,
             version: env!("CARGO_PKG_VERSION"),
-        }
+        })
     }
 }
 

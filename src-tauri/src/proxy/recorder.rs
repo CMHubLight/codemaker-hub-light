@@ -160,6 +160,11 @@ pub fn record(
     //    （两个请求同时首次进入时，后写的会撞唯一索引；deferred 事务读升级写还会
     //    直接拿到 SQLITE_BUSY，busy_timeout 对升级不一定生效，整条事务一起回滚）。
     //    `ux_proxy_sessions_external` 是 partial index，冲突目标必须带同样的谓词。
+    //    时间列用 `MAX(旧值, excluded.…)` 而不是直接覆盖：请求完成顺序与开始顺序
+    //    无关（并发 + 重试会让后完成的请求先落库），直接覆盖会把会话的
+    //    `last_active_at`/`updated_at` 回退到更早的时刻，保留期清理与"最近活跃"
+    //    排序都会用到错的时间。RFC3339 秒精度 + Z 是定长格式，字典序即时序，
+    //    `MAX` 与时间比较等价。
     let session_id: i64 = transaction.query_row(
         "INSERT INTO proxy_sessions \
            (external_session_id, api_format, client, model, request_count, error_count, \
@@ -175,9 +180,9 @@ pub fn record(
            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
            cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, \
            accumulated_cost_yuan = accumulated_cost_yuan + excluded.accumulated_cost_yuan, \
-           last_active_at = excluded.last_active_at, \
+           last_active_at = MAX(last_active_at, excluded.last_active_at), \
            model = COALESCE(excluded.model, model), \
-           updated_at = excluded.updated_at \
+           updated_at = MAX(updated_at, excluded.updated_at) \
          RETURNING id",
         params![
             context.session_key,
@@ -421,6 +426,50 @@ mod tests {
             scalar_text(&db, "SELECT day FROM usage_daily").as_deref(),
             Some(expected_day.as_str()),
             "日聚合必须与请求行同一天"
+        );
+
+        drop(db);
+        crate::test_util::remove_dir_all_retry(&dir);
+    }
+
+    /// 乱序完成：先落库"较晚结束"的请求，再落库同一会话"较早结束"的请求，
+    /// 会话的 `last_active_at` / `updated_at` 不得被回退（UPSERT 用 MAX）。
+    #[test]
+    fn session_last_active_at_does_not_go_backwards() {
+        let (db, dir) = temp_db("last-active-max");
+        let at = |text: &str| {
+            DateTime::parse_from_rfc3339(text)
+                .expect("时间戳应可解析")
+                .with_timezone(&Utc)
+        };
+
+        let mut newer_ctx = context();
+        newer_ctx.started_at = at("2026-10-20T10:00:00Z");
+        let mut newer = completion(0.1);
+        newer.ended_at = at("2026-10-20T10:00:05Z");
+        record(&db, &newer_ctx, &newer).expect("较新请求落库应成功");
+
+        // 同一会话（context 的 session_key 固定）的另一个请求：开始、结束都更早。
+        let mut older_ctx = context();
+        older_ctx.started_at = at("2026-10-20T09:00:00Z");
+        let mut older = completion(0.2);
+        older.ended_at = at("2026-10-20T09:00:02Z");
+        record(&db, &older_ctx, &older).expect("乱序请求落库应成功");
+
+        assert_eq!(
+            scalar_i64(&db, "SELECT request_count FROM proxy_sessions"),
+            2,
+            "两次请求都必须计入会话"
+        );
+        assert_eq!(
+            scalar_text(&db, "SELECT last_active_at FROM proxy_sessions").as_deref(),
+            Some("2026-10-20T10:00:05Z"),
+            "last_active_at 不得被更早的结束时间回退"
+        );
+        assert_eq!(
+            scalar_text(&db, "SELECT updated_at FROM proxy_sessions").as_deref(),
+            Some("2026-10-20T10:00:05Z"),
+            "updated_at 不得被更早的结束时间回退"
         );
 
         drop(db);
