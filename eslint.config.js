@@ -23,6 +23,12 @@ export default tseslint.config(
     plugins: { 'react-hooks': reactHooks },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // eslint-plugin-react-hooks 7 的 recommended 新增了 React Compiler 规则。
+      // 本项目尚未接入编译器，也不打算为它重写既有状态同步写法（多处 setState
+      // in effect / ref 读取是有意的行为约定），因此降为 warn 保留可见性；
+      // 其余 hook 规则（依赖数组、条件调用等）仍按 error 拦截。
+      'react-hooks/set-state-in-effect': 'warn',
+      'react-hooks/refs': 'warn',
       // 允许以 _ 开头的占位参数/变量（测试 helper 常用）。
       '@typescript-eslint/no-unused-vars': [
         'warn',
