@@ -40,16 +40,16 @@ pub struct OpenLogsResult {
 #[tauri::command]
 pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
     let settings = state.settings.read().await.clone();
-    let schema_version = {
-        let conn = state
-            .db
-            .conn()
-            .map_err(|err| format!("打开数据库失败：{err}"))?;
-        repo::schema_version(&conn).map_err(|err| format!("读取 schema 版本失败：{err}"))?
-    };
+    // 取连接与查询都必须走阻塞线程池（db::blocking 的纪律）。
+    let schema_version = crate::db::blocking::run(&state.db, |db| {
+        let conn = db.conn()?;
+        repo::schema_version(&conn)
+    })
+    .await
+    .map_err(|err| format!("读取 schema 版本失败：{err}"))?;
 
     let logs_dir = state.logs_dir();
-    let log_path = logs_dir.join("hub-light.log");
+    let log_path = crate::logging::current_log_path(state.data_dir());
 
     Ok(AppInfo {
         name: "CodeMaker Hub Light".to_string(),

@@ -52,16 +52,26 @@ impl SettingsStore {
 
     /// 合并局部设置：校验 → 锁外落盘 → 内存替换 → 策略写回。
     ///
-    /// 失败（校验不过或落盘失败）时内存与策略都保持原值。
+    /// 基线取**磁盘上的当前内容**（而不是启动时的内存快照）：托盘常驻时用户经常
+    /// 手改 `settings.json`（`proxy_bind` / `credit_to_yuan` 没有设置页入口），
+    /// 旧实现会在下一次任意保存时把整份内存序列化落盘，静默覆盖手改内容。
+    /// 磁盘文件缺失/损坏时回退内存（启动期已做过自愈）。
     pub(crate) async fn update(&self, patch: SettingsPatch) -> Result<Settings, SettingsError> {
         let _writer = self.writer.lock().await;
-        let mut next = self.settings.read().await.clone();
+        let memory = self.settings.read().await.clone();
+        let mut next = Settings::read_existing(&self.data_dir).unwrap_or(memory);
         next.apply_patch(patch);
         next.normalize();
         next.validate()?;
 
         // 锁外磁盘 IO：设置读路径（auth 后台循环、深链、代理重启）不被 fsync 阻塞。
-        next.save(&self.data_dir)?;
+        let data_dir = self.data_dir.clone();
+        let to_save = next.clone();
+        tokio::task::spawn_blocking(move || to_save.save(&data_dir))
+            .await
+            .map_err(|err| {
+                SettingsError::Io(std::io::Error::other(format!("设置保存任务失败：{err}")))
+            })??;
 
         *self.settings.write().await = next.clone();
         self.policy.store(ProxyPolicy::from_settings(&next));
@@ -118,6 +128,37 @@ mod tests {
         assert!(settings_path(&dir).exists(), "成功路径应落盘");
         assert!(store.snapshot().await.record_body, "内存应同步");
         assert!(store.policy().load().record_body, "策略应同步写回");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 运行期手改 settings.json 后再从设置页保存其他项：手改内容必须保留。
+    #[tokio::test]
+    async fn update_merges_patch_over_disk_instead_of_stale_memory() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.clone(), Settings::default());
+
+        // 模拟用户直接编辑 settings.json（proxy_bind/credit_to_yuan 没有设置页入口）。
+        let manual = Settings {
+            proxy_bind: "::1".to_string(),
+            credit_to_yuan: 0.02,
+            ..Settings::default()
+        };
+        manual.save(&dir).expect("手改内容应可保存");
+
+        let saved = store
+            .update(SettingsPatch {
+                record_body: Some(true),
+                ..SettingsPatch::default()
+            })
+            .await
+            .expect("保存应成功");
+
+        assert_eq!(saved.proxy_bind, "::1", "手改的绑定地址不得被内存旧值覆盖");
+        assert_eq!(saved.credit_to_yuan, 0.02, "手改的换算比例不得丢失");
+        assert!(saved.record_body, "本次 patch 仍应生效");
+        let disk = Settings::load(&dir).expect("磁盘设置应可读");
+        assert_eq!(disk.proxy_bind, "::1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -33,15 +33,24 @@ pub(crate) mod tray;
 pub mod usage;
 mod window;
 
-use tauri::Emitter;
+use std::process::ExitCode;
+
+use tauri::{Emitter, WebviewWindowBuilder};
 
 const APP_NAME: &str = "CodeMaker Hub Light";
 
+/// 启动期致命失败：弹窗 + 落盘 + 以非零码退出（不再 `return Err` 触发 Tauri panic）。
+fn fatal_exit(app: &tauri::AppHandle, data_dir: &std::path::Path, stage: &str, detail: &str) {
+    startup::report(data_dir, stage, detail);
+    shutdown::record_exit(data_dir, "setup-failed");
+    app.exit(1);
+}
+
 /// 启动 Tauri 应用（被 `main.rs` 调用）。
-pub fn run() {
-    // 数据目录不可用时窗口尚未创建：弹窗 + 落盘后直接返回（进程退出）。
+pub fn run() -> ExitCode {
+    // 数据目录不可用时窗口尚未创建：弹窗 + 落盘后直接返回非零退出码。
     let Some(data_dir) = bootstrap::prepare_data_dir() else {
-        return;
+        return ExitCode::FAILURE;
     };
 
     logging::init(&data_dir);
@@ -83,20 +92,48 @@ pub fn run() {
             }
 
             if let Err(err) = bootstrap::init_state(app, &setup_dir, &mut timer) {
-                shutdown::record_exit(&setup_dir, "setup-failed");
-                return Err(err);
+                fatal_exit(app.handle(), &setup_dir, "初始化", &err.to_string());
+                return Ok(());
+            }
+
+            // 主窗口由我们自己创建（tauri.conf.json 里 `create: false`）：
+            // Tauri 默认在 setup 之前建窗，WebView2 缺失时会在我们的诊断代码之前
+            // panic；自己建窗才能把失败变成「弹窗 + startup-error.log + exit(1)」。
+            let Some(window_config) = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .cloned()
+            else {
+                fatal_exit(
+                    app.handle(),
+                    &setup_dir,
+                    "创建主窗口",
+                    "tauri.conf.json 缺少 label=main 的窗口配置",
+                );
+                return Ok(());
+            };
+            match WebviewWindowBuilder::from_config(app.handle(), &window_config)
+                .and_then(|builder| builder.build())
+            {
+                Ok(window) => {
+                    timer.lap("window");
+                    let _ = window;
+                }
+                Err(err) => {
+                    fatal_exit(app.handle(), &setup_dir, "创建主窗口", &err.to_string());
+                    return Ok(());
+                }
             }
 
             // 托盘：关闭窗口只隐藏；额度事件会刷新 tooltip。
-            // 必须在 setup 返回前装好：窗口由 Tauri 在 setup 之前创建，
-            // 没有托盘时关闭窗口将无法恢复。
             let tray_result = tray::install(app.handle());
             timer.lap("tray");
             if let Err(err) = tray_result {
-                tracing::error!(error = %err, "托盘初始化失败，退出以避免窗口无法恢复");
-                startup::report(&setup_dir, "初始化托盘", &err.to_string());
-                shutdown::record_exit(&setup_dir, "setup-failed");
-                return Err(err);
+                fatal_exit(app.handle(), &setup_dir, "初始化托盘", &err.to_string());
+                return Ok(());
             }
 
             // 深链监听必须在 manage(AppState) 之后；scheme 注册挪到线程池，
@@ -137,16 +174,16 @@ pub fn run() {
             tracing::error!(error = %err, "Tauri 应用构建失败");
             shutdown::record_exit(&data_dir, "build-failed");
             eprintln!("{APP_NAME} 启动失败：{err}");
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
-    // 事件循环退出时兜底记录正常退出；托盘「退出」已经先写过记录并删除 marker，
-    // 这里不会重复写。被 TerminateProcess / 任务管理器强杀时不会走到这里，
-    // 下次启动的「上次运行未正常退出」告警即由此而来。
+    // 事件循环退出时兜底记录正常退出并冲刷日志；托盘「退出」不再提前写记录。
     app.run(move |_app_handle, event| {
         if let tauri::RunEvent::Exit = event {
             shutdown::record_exit_if_running(&data_dir, "run-event-exit");
+            logging::flush();
         }
     });
+    ExitCode::SUCCESS
 }
