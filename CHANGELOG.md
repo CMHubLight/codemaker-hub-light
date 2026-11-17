@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-17
+
+### 变更
+
+- **依赖升级**（Dependabot 批量 PR，全部通过 CI 与本地门禁）：
+  - Rust：`tauri` 2.12.4 → 2.12.5、`tauri-build` 2.7.3 → 2.7.5、`tauri-plugin-opener` 2.7.2 → 2.7.3、`tauri-plugin-deep-link` 2.6.2 → 2.6.3、`tauri-plugin-single-instance` 2.5.4 → 2.5.5、`uuid` 1.28.0 → 1.29.2、`getrandom` 0.2.17 → 0.4.3（代码改用 `getrandom::fill`）、`aes-gcm` 0.10.3 → 0.11.1（`Nonce` 构造改用 `TryFrom`/数组）。
+  - 前端：`typescript` 6.0.3、`@types/node` 26.6.6、`jsdom` 31.0.1、`eslint-plugin-react-hooks` 7.1.1、`@tauri-apps/cli` 2.12.4、`@testing-library/user-event` 14.6.10、`globals` 17.14.0、`typescript-eslint` 8.72.2、`vitest` 5.1.0。
+- `eslint-plugin-react-hooks` 7 新增的 React Compiler 规则（`set-state-in-effect`、`refs`）降为 warn：项目未接入 React Compiler，既有的状态同步写法是有意约定；其余 hook 规则（依赖数组、条件调用等）仍按 error 拦截。
+- 无用户可见行为变更；`cargo audit` 仍为 0 漏洞（8 条 informational：unmaintained / yanked / Linux-only）。
+
 ## [0.2.4] - 2026-11-17
 
 ### 修复
@@ -144,6 +154,7 @@
 
 首个公开版本：浏览器登录 + 深链回调、凭据加密存储、回环本地代理（Anthropic / OpenAI 转发与鉴权注入）、逐请求用量与费用统计、托盘常驻；附带 NSIS 安装包（未签名）。
 
+[0.2.5]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.5
 [0.2.4]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.4
 [0.2.3]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.3
 [0.2.2]: https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.2
