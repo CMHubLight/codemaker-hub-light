@@ -5,8 +5,10 @@ import type {
   AppSettings,
   AuthStatus,
   CostTrend,
+  Cursor,
   LoginSession,
   ProxyStatus,
+  RecentRequest,
   RequestFilter,
   RequestPage,
   TrendRange,
@@ -24,6 +26,7 @@ import type {
  */
 export type CommandName =
   | 'auth_start_login'
+  | 'auth_cancel_login'
   | 'auth_login_with_auth_key'
   | 'auth_poll_status'
   | 'auth_status'
@@ -118,14 +121,17 @@ export async function withTimeout<T>(
 /**
  * 分类 Rust 命令返回的错误文本。后端错误是普通字符串，没有结构化 code，
  * 因此按 docs/gateway-contract.md 里出现的 403/404 语义做保守识别。
+ *
+ * 状态码用词边界匹配：早期写成 `/403|404/` 子串匹配，端口号 `14030`、请求 id
+ * `15404` 之类都会被误判成“权限/不存在”，把用户引向错误的排查方向（N-P3-27）。
  */
 export function describeError(cause: unknown): CommandError {
   if (cause instanceof CommandTimeoutError) {
     return { kind: 'timeout', raw: cause.message }
   }
   const raw = errorMessage(cause)
-  if (/403|无权限|forbidden/i.test(raw)) return { kind: 'forbidden', raw }
-  if (/404|不存在|not found/i.test(raw)) return { kind: 'not_found', raw }
+  if (/\b403\b|无权限|forbidden/i.test(raw)) return { kind: 'forbidden', raw }
+  if (/\b404\b|不存在|not found/i.test(raw)) return { kind: 'not_found', raw }
   if (/尚未登录|未登录|not\s*authenticated/i.test(raw)) return { kind: 'unauthenticated', raw }
   if (/网络|超时|连接|timeout|timed out|dns|tls|http|request failed|failed to/i.test(raw)) {
     return { kind: 'network', raw }
@@ -206,7 +212,7 @@ const MOCK_LOGIN_SESSION: LoginSession = {
 
 const MOCK_APP_INFO: AppInfo = {
   name: 'CodeMaker Hub Light',
-  version: '0.2.3',
+  version: '0.2.4',
   tauri_version: null,
   platform: 'browser-preview',
   data_dir: null,
@@ -269,9 +275,6 @@ function clone<T>(value: T): T {
 function emptyUsageSummary(): UsageSummary {
   return {
     today: { ...EMPTY_TOTALS },
-    month: { ...EMPTY_TOTALS },
-    daily: [],
-    models: [],
     recent: [],
     generated_at: new Date().toISOString()
   }
@@ -281,6 +284,90 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms)
   })
+}
+
+// ---------------------------------------------------------------------------
+// 预览 mock：请求明细
+//
+// 浏览器预览没有 Rust 侧 SQLite，“请求”页若永远返回空表就看不到筛选/分页行为。
+// 这里生成一份固定的假数据，并严格照后端语义过滤 + keyset 分页（多取一行前瞻：
+// 只有确实还有下一页时才有 next_cursor），方便在 pnpm dev 里核对翻页边界。
+// ---------------------------------------------------------------------------
+
+const MOCK_REQUEST_COUNT = 120
+const MOCK_REQUEST_PROTOCOLS = ['anthropic', 'openai_chat', 'openai_responses']
+const MOCK_REQUEST_MODELS = [
+  'claude-sonnet-4',
+  'gpt-5-codex',
+  'claude-opus-4',
+  'text-embedding-3'
+]
+const MOCK_REQUEST_STATUSES = ['success', 'success', 'success', 'error', 'cancelled']
+
+let mockRequests: RecentRequest[] | null = null
+
+function pad2(value: number): string {
+  return `${value}`.padStart(2, '0')
+}
+
+/** 本机日期（后端 `day_local` 同口径：按本地时区取日期，不是 UTC）。 */
+function localDay(date: Date): string {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+function mockRequestRows(): RecentRequest[] {
+  if (mockRequests) return mockRequests
+  const base = Date.now()
+  mockRequests = Array.from({ length: MOCK_REQUEST_COUNT }, (_, index) => {
+    const started = new Date(base - index * 37 * 60 * 1000)
+    return {
+      id: `${MOCK_REQUEST_COUNT - index}`,
+      created_at: started.toISOString(),
+      model: MOCK_REQUEST_MODELS[index % MOCK_REQUEST_MODELS.length],
+      protocol: MOCK_REQUEST_PROTOCOLS[index % MOCK_REQUEST_PROTOCOLS.length],
+      client: 'unknown',
+      status: MOCK_REQUEST_STATUSES[index % MOCK_REQUEST_STATUSES.length],
+      latency_ms: 120 + (index % 7) * 35,
+      first_byte_ms: 30 + (index % 5) * 12,
+      input_tokens: 400 + index * 13,
+      output_tokens: 120 + index * 7,
+      cost_yuan: Number((0.0012 * ((index % 9) + 1)).toFixed(4))
+    }
+  })
+  return mockRequests
+}
+
+function cursorOf(row: RecentRequest): Cursor {
+  return {
+    day_local: localDay(new Date(row.created_at)),
+    started_at: row.created_at,
+    id: Number(row.id)
+  }
+}
+
+/** 排序键 (day_local, started_at, id) 均倒序：行严格位于游标之后（更旧）。 */
+function isAfterCursor(row: RecentRequest, day: string, cursor: Cursor): boolean {
+  if (day !== cursor.day_local) return day < cursor.day_local
+  if (row.created_at !== cursor.started_at) return row.created_at < cursor.started_at
+  return Number(row.id) < cursor.id
+}
+
+function filterMockRequests(filter: RequestFilter): RecentRequest[] {
+  const keyword = filter.model?.trim().toLowerCase() ?? ''
+  const from = filter.from?.slice(0, 10)
+  const to = filter.to?.slice(0, 10)
+  return mockRequestRows()
+    .map((row) => ({ row, day: localDay(new Date(row.created_at)) }))
+    .filter(({ row, day }) => {
+      if (from && day < from) return false
+      if (to && day > to) return false
+      if (filter.protocol && row.protocol !== filter.protocol) return false
+      if (filter.status && row.status !== filter.status) return false
+      if (keyword && !row.model.toLowerCase().includes(keyword)) return false
+      if (filter.after && !isAfterCursor(row, day, filter.after)) return false
+      return true
+    })
+    .map(({ row }) => row)
 }
 
 async function mockInvoke(
@@ -300,21 +387,33 @@ async function mockInvoke(
     case 'auth_refresh_validate':
     case 'auth_retry_renewal':
     case 'auth_submit_deep_link':
+    case 'auth_cancel_login':
       return clone(MOCK_AUTH_STATUS)
     /** 浏览器预览没有真实快照，额度为空；页面按“暂无额度数据”处理。 */
     case 'quota_get':
       return null
     case 'proxy_status':
       return clone(mockProxy)
-    case 'proxy_restart':
+    case 'proxy_restart': {
+      // 预览的“重启”必须读取已保存设置里的端口/网关，否则改端口再重启还是旧地址，
+      // 会让人误以为后端没生效（与 Rust 侧 restart 的真实行为对齐）。
+      const port = mockSettings.proxy_port
+      const host = mockSettings.proxy_bind === 'localhost' ? '127.0.0.1' : mockSettings.proxy_bind
+      const baseUrl = `http://${host}:${port}`
       mockProxy = {
         ...mockProxy,
         running: true,
+        host,
+        port,
+        base_url: baseUrl,
+        gateway_url: mockSettings.gateway_url,
+        health_url: `${baseUrl}/health`,
         started_at: new Date().toISOString(),
         uptime_secs: 0,
         last_error: null
       }
       return clone(mockProxy)
+    }
     case 'usage_summary':
       return emptyUsageSummary()
     case 'cost_trend_get': {
@@ -333,8 +432,19 @@ async function mockInvoke(
       return trend
     }
     case 'usage_requests': {
-      void (args as { filter?: RequestFilter } | undefined)
-      const page: RequestPage = { total: 0, items: [] }
+      const filter = ((args as { filter?: RequestFilter } | undefined)?.filter ?? {}) as RequestFilter
+      const matched = filterMockRequests(filter)
+      const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200)
+      const items = matched.slice(0, limit)
+      const hasMore = matched.length > items.length
+      const last = items[items.length - 1]
+      const page: RequestPage = {
+        // 与后端一致：非首页不统计 COUNT（返回 -1），由前端沿用第一页的总数。
+        total: filter.include_total === false ? -1 : matched.length,
+        items: clone(items),
+        next_cursor: hasMore && last ? cursorOf(last) : null,
+        prev_cursor: filter.after ?? null
+      }
       return page
     }
     case 'settings_get':

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Datelike, Duration, Local, NaiveDate, SecondsFormat, Utc};
+use chrono::{Duration, Local, NaiveDate, SecondsFormat, Utc};
 
 use crate::{
     db::{repo, Db, DbError},
@@ -35,6 +35,22 @@ fn day_prefix(value: &str) -> Option<String> {
     let candidate = value.trim().get(..10)?;
     NaiveDate::parse_from_str(candidate, "%Y-%m-%d").ok()?;
     Some(candidate.to_string())
+}
+
+/// 解析日期筛选：字段缺省（`None`）用默认值；**出现但解析失败时报错**。
+///
+/// 旧实现 `and_then(day_prefix).unwrap_or(默认)` 把非法值静默放宽成"不过滤"，
+/// 用户选了一个坏日期会看到全量数据却以为筛选生效（与 protocol/status 的口径
+/// 也不一致——那两处早已返回 `InvalidArgument`）。
+fn parse_day_filter(field: &str, value: Option<&str>, default: &str) -> Result<String, DbError> {
+    match value {
+        None => Ok(default.to_string()),
+        Some(raw) => day_prefix(raw).ok_or_else(|| {
+            DbError::InvalidArgument(format!(
+                "无效的日期筛选 {field}：{raw}（应为 YYYY-MM-DD 或 ISO 日期时间）"
+            ))
+        }),
+    }
 }
 
 fn normalize_protocol(value: &str) -> Option<&'static str> {
@@ -78,29 +94,17 @@ fn parse_status(value: Option<&str>) -> Result<Option<&'static str>, DbError> {
     }
 }
 
-/// 概览汇总：今日、本月、最近 30 天趋势、本月模型分布、最近请求。
+/// 概览汇总：今日与最近请求。
 ///
-/// 5 个查询在**同一个读事务**里执行：否则并发写入时"今日/本月/趋势/最近"
-/// 分别来自不同快照，仪表盘内部数字会互相对不上。
+/// 云端"本月 Token/消耗/模型分布"来自 `quota_get`，本机 30 天曲线来自
+/// `cost_trend_get`，因此这里只保留两个真正被概览页消费的查询（同一个读事务）。
 pub fn summary(db: &Db) -> Result<UsageSummary, DbError> {
     let today_date = today();
     let today_string = day_string(today_date);
-    let month_start = day_string(
-        NaiveDate::from_ymd_opt(today_date.year(), today_date.month(), 1).unwrap_or(today_date),
-    );
-    let daily_from = day_string(today_date - Duration::days(SUMMARY_DAYS - 1));
 
     let conn = db.conn()?;
     let tx = conn.unchecked_transaction()?;
     let today_totals = repo::usage_totals(&tx, &today_string, &today_string)?;
-    let month_totals = repo::usage_totals(&tx, &month_start, &today_string)?;
-    let daily_rows = repo::usage_by_day(&tx, &daily_from, &today_string)?;
-    let model_rows = repo::usage_by_dimension(
-        &tx,
-        repo::UsageDimension::Model,
-        &month_start,
-        &today_string,
-    )?;
     let recent_rows = repo::list_requests(
         &tx,
         &repo::RequestQuery {
@@ -112,9 +116,6 @@ pub fn summary(db: &Db) -> Result<UsageSummary, DbError> {
 
     Ok(aggregate::build_summary(
         aggregate::totals_from_row(&today_totals),
-        aggregate::totals_from_row(&month_totals),
-        aggregate::daily_from_rows(daily_rows),
-        aggregate::models_from_rows(model_rows),
         aggregate::recent_from_rows(&recent_rows),
     ))
 }
@@ -178,16 +179,8 @@ pub fn cost_trend_local(db: &Db, days: i64, credit_to_yuan: f64) -> Result<CostT
 /// `count` 与 `list` 在同一个读事务里执行，保证 `total` 与 `items` 一致。
 pub fn requests(db: &Db, filter: &RequestFilter) -> Result<RequestPage, DbError> {
     let today_string = day_string(today());
-    let from_day = filter
-        .from
-        .as_deref()
-        .and_then(day_prefix)
-        .unwrap_or_else(|| EPOCH_DAY.to_string());
-    let to_day = filter
-        .to
-        .as_deref()
-        .and_then(day_prefix)
-        .unwrap_or(today_string);
+    let from_day = parse_day_filter("from", filter.from.as_deref(), EPOCH_DAY)?;
+    let to_day = parse_day_filter("to", filter.to.as_deref(), &today_string)?;
 
     let model = filter
         .model
@@ -211,7 +204,9 @@ pub fn requests(db: &Db, filter: &RequestFilter) -> Result<RequestPage, DbError>
         api_format: protocol,
         status,
         after: filter.after.as_ref(),
-        limit,
+        // 多取一行做前瞻：满页但恰好没有下一行时不再给出 cursor，
+        // 前端就不会出现"第 2 / 1 页"的空页。
+        limit: limit + 1,
         offset,
     };
 
@@ -223,11 +218,15 @@ pub fn requests(db: &Db, filter: &RequestFilter) -> Result<RequestPage, DbError>
     } else {
         -1
     };
-    let rows = repo::list_requests(&tx, &query)?;
+    let mut rows = repo::list_requests(&tx, &query)?;
     tx.commit()?;
 
-    // 满页才可能有下一页；游标取最后一行（排序键含 id，严格唯一）。
-    let next_cursor = if rows.len() == limit as usize {
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    // 只有确实还有下一行时才给游标；游标取本页最后一行（排序键含 id，严格唯一）。
+    let next_cursor = if has_more {
         rows.last().map(|row| Cursor {
             day_local: row.day_local.clone(),
             started_at: row.started_at.clone(),
@@ -298,9 +297,6 @@ mod tests {
         assert_eq!(summary.today.requests, 0);
         assert_eq!(summary.today.cache_hit_rate, None);
         assert_eq!(summary.today.error_rate, None);
-        assert_eq!(summary.month.cost_yuan, 0.0);
-        assert!(summary.daily.is_empty());
-        assert!(summary.models.is_empty());
         assert!(summary.recent.is_empty());
         assert!(!summary.generated_at.is_empty());
     }
@@ -382,6 +378,61 @@ mod tests {
             },
         )
         .expect("空串表示未选择，不应报错");
+        assert_eq!(page.total, 0);
+    }
+
+    /// `from`/`to` 出现但解析失败必须报错（不能静默放宽成"不过滤"）；字段缺省
+    /// 仍用默认区间。ISO 日期时间（带时间与时区）仍按前 10 位接受。
+    #[test]
+    fn invalid_from_to_are_rejected_not_widened() {
+        let db = empty_db();
+        for (field, value) in [
+            ("from", "2026-13-40"),
+            ("to", "not-a-date"),
+            ("from", "2026/10/01"),
+            ("to", ""),
+        ] {
+            let filter = if field == "from" {
+                RequestFilter {
+                    from: Some(value.to_string()),
+                    ..Default::default()
+                }
+            } else {
+                RequestFilter {
+                    to: Some(value.to_string()),
+                    ..Default::default()
+                }
+            };
+            let error = requests(&db, &filter).expect_err("非法日期筛选应被拒绝，而不是放宽");
+            match error {
+                DbError::InvalidArgument(message) => {
+                    assert!(
+                        message.contains("无效的日期筛选"),
+                        "错误信息应说明是日期筛选：{message}"
+                    );
+                    assert!(
+                        message.contains(field),
+                        "错误信息应指明字段 {field}：{message}"
+                    );
+                }
+                other => panic!("错误类型应为参数无效：{other}"),
+            }
+        }
+
+        // 两个字段都缺省：默认区间，不报错。
+        let page = requests(&db, &RequestFilter::default()).expect("缺省日期应成功");
+        assert_eq!(page.total, 0);
+
+        // ISO 日期时间（含时区）仍合法：只取前 10 位。
+        let page = requests(
+            &db,
+            &RequestFilter {
+                from: Some("2026-10-01T00:00:00+08:00".to_string()),
+                to: Some("2026-10-20T23:59:59Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("ISO 日期时间应被接受");
         assert_eq!(page.total, 0);
     }
 

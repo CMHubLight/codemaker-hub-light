@@ -22,10 +22,10 @@ pnpm tauri dev
 ## 3. 提交前必须过的门禁
 
 ```powershell
-pnpm verify                                    # typecheck + lint + test + build + docs:check
+pnpm verify                                    # typecheck + lint + 前端/脚本测试 + build + docs:check
 cargo fmt    --manifest-path src-tauri/Cargo.toml --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test   --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+cargo test   --manifest-path src-tauri/Cargo.toml --locked
 ```
 
 几个容易踩的点：

@@ -106,7 +106,7 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 
 按顺序看三处，先分清"正常退出"还是"被外部终止"：
 
-1. `logs\exit.log`：**追加式**记录，文件存在不代表本次正常退出——看**最后一条**记录的时间/pid 是否对应本次会话（`reason` 可能是托盘退出的 `tray-quit`，或事件循环兜底的 `run-event-exit`；启动失败会写 `setup-failed`/`build-failed`）。`logs\hub-light.log` 里本次启动若出现 `上次运行未正常退出（marker 未被清除）`，说明上次进程**没有走正常退出路径**——常见是被任务管理器结束、`taskkill` / `Stop-Process` 强杀，或原生崩溃。
+1. `logs\exit.log`：**追加式**记录，文件存在不代表本次正常退出——看**最后一条**记录的时间/pid 是否对应本次会话（托盘/关窗退出由 `RunEvent::Exit` 统一写 `run-event-exit`，启动失败会写 `setup-failed`/`build-failed`）。`logs\hub-light.log.<日期>` 里本次启动若出现 `上次运行未正常退出（marker 未被清除）`，说明上次进程**没有走正常退出路径**——常见是被任务管理器结束、`taskkill` / `Stop-Process` 强杀，或原生崩溃。
 2. `logs\panic.log`：存在的话里面是 panic 的 `文件:行:列`、消息与回溯（release 无控制台，默认 panic 不写主日志）。Rust panic 走 `panic = "abort"`，会留下这条记录。
 3. 事件查看器 → Windows 日志 → 应用程序里搜 `codemaker-hub-light` 的 `Application Error 1000`；`0xc0000409` 表示 Rust `panic = "abort"` 生效，其它异常码表示原生崩溃。
 
@@ -116,13 +116,13 @@ reg query HKCU\Software\Classes\codemakerhub-light /s
 
 ### 4.2 双击后窗口不出现，或提示「启动失败」
 
-启动期的致命错误（数据目录、SQLite 打开、数据库迁移、托盘初始化）会弹窗提示，并把现场写入 `logs\startup-error.log`。按弹窗里的路径取该文件。
+启动期的致命错误（数据目录、SQLite 打开、数据库迁移、主窗口/WebView2 创建、托盘初始化）会弹窗提示，并把现场写入 `logs\startup-error.log`，随后以非零码退出。按弹窗里的路径取该文件；若根本没弹窗，先看 `logs\panic.log`（WebView2 缺失等 Tauri 内部失败也会走这里）。
 
 若 `settings.json` 损坏或校验不通过（例如手改成 `credit_to_yuan: 0`、把网关改成非回环的 `http://`），应用会把它重命名为 `settings.json.bad-<时间戳>` 并回退默认值，不会卡在启动阶段——但这意味着你之前的设置需要重新填。
 
 ### 4.3 界面一直停在「正在连接 CodeMaker Hub Light…」，或整窗白屏
 
-「正在连接」最多持续 10 秒，超时会变成「无法连接本地后端」，并给出「重试连接」与「打开日志目录」两个入口。整窗白屏会被错误边界接住：页面级显示错误原因与「重试 / 打开日志目录」，根级异常显示「重新加载应用」。先看 `logs\hub-light.log` 与 `logs\startup-error.log`。
+「正在连接」最多持续 10 秒，超时会变成「无法连接本地后端」，并给出「重试连接」与「打开日志目录」两个入口。整窗白屏会被错误边界接住：页面级显示错误原因与「重试 / 打开日志目录」，根级异常显示「重新加载应用」。先看 `logs\hub-light.log.<日期>`（设置页「应用信息」里显示实际路径）与 `logs\startup-error.log`。
 
 ### 4.4 运行中日志文件在资源管理器里显示 0 字节
 

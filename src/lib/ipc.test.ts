@@ -56,5 +56,16 @@ describe('describeError', () => {
     expect(commandTimeoutMs('proxy_restart')).toBe(30_000)
     expect(commandTimeoutMs('app_open_logs')).toBe(15_000)
     expect(commandTimeoutMs('auth_status')).toBe(DEFAULT_COMMAND_TIMEOUT_MS)
+    // 取消等待只是清本地 pending + 恢复相位，10s 默认上限足够。
+    expect(commandTimeoutMs('auth_cancel_login')).toBe(DEFAULT_COMMAND_TIMEOUT_MS)
+  })
+
+  it('状态码匹配带词边界：端口/编号里的 403/404 不误判', () => {
+    // N-P3-27：子串匹配会把 14030 / 15404 当成权限/不存在，文案指向错误自救方向。
+    expect(describeError('端口 14030 被占用').kind).toBe('unknown')
+    expect(describeError('统计编号 15404 已归档').kind).toBe('unknown')
+    // 真正的状态码仍然要识别。
+    expect(describeError('gateway returned 403').kind).toBe('forbidden')
+    expect(describeError('gateway returned 404').kind).toBe('not_found')
   })
 })

@@ -104,7 +104,7 @@ async fn collect_tooltip_text(app: &AppHandle) -> String {
         None
     };
 
-    tooltip::format_tooltip(quota.as_ref())
+    tooltip::format_tooltip(quota.as_ref(), chrono::Utc::now())
 }
 
 /// 主线程部分：只在文本变化时写入托盘，并记录上次成功写入的文本。

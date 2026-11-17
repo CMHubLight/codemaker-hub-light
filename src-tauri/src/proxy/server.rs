@@ -50,6 +50,8 @@ pub enum ProxyError {
         port: u16,
         message: String,
     },
+    #[error("初始化转发 HTTP 客户端失败：{0}")]
+    HttpClient(#[from] reqwest::Error),
 }
 
 /// 代理状态（返回给前端与 `/status`）。
@@ -189,7 +191,11 @@ impl ProxyServer {
     ) -> Result<ProxyStatus, ProxyError> {
         let mut runtime = self.runtime.lock().await;
         if let Some(info) = runtime.info.clone() {
-            return Ok(self.status_from(Some(info), &runtime));
+            // 任务已退出（stopped）时不能把残留 info 当成"已在运行"。
+            if info.is_running() {
+                return Ok(self.status_from(Some(info), &runtime));
+            }
+            runtime.info = None;
         }
         match self
             .start_locked(&mut runtime, bind, preferred_port, gateway_url, policy)
@@ -209,10 +215,10 @@ impl ProxyServer {
     /// 停止代理（幂等）。
     pub async fn stop(&self) {
         let mut runtime = self.runtime.lock().await;
-        Self::stop_locked(&mut runtime).await;
+        self.stop_locked(&mut runtime).await;
     }
 
-    /// 重启代理：先停止旧任务，再用当前设置重新绑定。
+    /// 重启代理：先停止旧任务，再用当前设置重新绑定；新版起不来时回滚旧配置。
     pub async fn restart(
         &self,
         bind: &str,
@@ -221,9 +227,19 @@ impl ProxyServer {
         policy: Arc<PolicyCell>,
     ) -> Result<ProxyStatus, ProxyError> {
         let mut runtime = self.runtime.lock().await;
-        Self::stop_locked(&mut runtime).await;
+        let previous = runtime
+            .info
+            .as_ref()
+            .map(|info| (info.bind.clone(), info.port, info.gateway_url.clone()));
+        self.stop_locked(&mut runtime).await;
         match self
-            .start_locked(&mut runtime, bind, preferred_port, gateway_url, policy)
+            .start_locked(
+                &mut runtime,
+                bind,
+                preferred_port,
+                gateway_url,
+                Arc::clone(&policy),
+            )
             .await
         {
             Ok(()) => {
@@ -231,6 +247,16 @@ impl ProxyServer {
                 Ok(self.status_from(info, &runtime))
             }
             Err(err) => {
+                // 先停后起的窗口里失败会让代理永久下线：尽力用旧配置恢复一次。
+                if let Some((old_bind, old_port, old_gateway)) = previous {
+                    warn!(error = %err, "新配置启动失败，尝试回滚旧代理配置");
+                    if let Err(rollback_err) = self
+                        .start_locked(&mut runtime, &old_bind, old_port, &old_gateway, policy)
+                        .await
+                    {
+                        warn!(error = %rollback_err, "回滚旧代理配置也失败");
+                    }
+                }
                 runtime.last_error = Some(err.to_string());
                 Err(err)
             }
@@ -250,10 +276,11 @@ impl ProxyServer {
         }
         let last_error = runtime.last_error.clone();
         drop(runtime);
-        let base_url = format!("http://{fallback_bind}:{fallback_port}");
+        let bind = normalize_bind(fallback_bind);
+        let base_url = format_base_url(&bind, fallback_port);
         ProxyStatus {
             running: false,
-            host: fallback_bind.to_string(),
+            host: bind,
             port: fallback_port,
             base_url: base_url.clone(),
             gateway_url: fallback_gateway.to_string(),
@@ -275,24 +302,26 @@ impl ProxyServer {
         gateway_url: &str,
         policy: Arc<PolicyCell>,
     ) -> Result<(), ProxyError> {
+        // `localhost` 是设置层允许的写法，但 `IpAddr::parse` 不认：先归一。
+        let bind = normalize_bind(bind);
         let ip: IpAddr = bind.parse().map_err(|_| ProxyError::Bind {
-            bind: bind.to_string(),
+            bind: bind.clone(),
             port: preferred_port,
             message: "监听地址不是合法 IP".to_string(),
         })?;
         if !ip.is_loopback() {
-            return Err(ProxyError::NonLoopback(bind.to_string()));
+            return Err(ProxyError::NonLoopback(bind));
         }
 
-        let listener = bind_listener(ip, bind, preferred_port).await?;
+        let listener = bind_listener(ip, &bind, preferred_port).await?;
         let local_addr = listener.local_addr().map_err(|err| ProxyError::Bind {
-            bind: bind.to_string(),
+            bind: bind.clone(),
             port: preferred_port,
             message: err.to_string(),
         })?;
 
         let info = Arc::new(RuntimeInfo::new(
-            bind.to_string(),
+            bind.clone(),
             local_addr.port(),
             gateway_url.to_string(),
         ));
@@ -301,7 +330,7 @@ impl ProxyServer {
             self.db.clone(),
             self.provider.clone(),
             policy,
-        ));
+        )?);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let task_info = info.clone();
@@ -334,28 +363,36 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn stop_locked(runtime: &mut ProxyRuntime) {
+    async fn stop_locked(&self, runtime: &mut ProxyRuntime) {
         if let Some(shutdown) = runtime.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(task) = runtime.task.take() {
-            match tokio::time::timeout(STOP_TIMEOUT, task).await {
+        if let Some(mut task) = runtime.task.take() {
+            match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if !err.is_cancelled() => {
                     warn!(error = %err, "代理任务异常结束");
                 }
                 Ok(Err(_)) => {}
-                Err(_) => warn!("等待代理任务退出超时"),
+                Err(_) => {
+                    // 超时不能只丢 JoinHandle：旧任务会继续 drain 在飞请求，
+                    // 下一次 start/restart 可能看到两个任务同时持有旧状态。
+                    warn!("等待代理任务退出超时，强制中止");
+                    task.abort();
+                    let _ = task.await;
+                }
             }
         }
         runtime.info = None;
+        // 端口文件代表"有代理在跑"：停止后必须删掉，否则 CLI 会读到死端口。
+        settings::remove_proxy_port(&self.data_dir);
     }
 
     fn status_from(&self, info: Option<Arc<RuntimeInfo>>, runtime: &ProxyRuntime) -> ProxyStatus {
         let port_file = self.port_file().to_string_lossy().into_owned();
         match info {
             Some(info) => {
-                let base_url = format!("http://{}:{}", info.bind, info.port);
+                let base_url = format_base_url(&info.bind, info.port);
                 ProxyStatus {
                     running: info.is_running(),
                     host: info.bind.clone(),
@@ -375,7 +412,7 @@ impl ProxyServer {
                 }
             }
             None => {
-                let base_url = format!("http://127.0.0.1:{}", settings::DEFAULT_PROXY_PORT);
+                let base_url = format_base_url("127.0.0.1", settings::DEFAULT_PROXY_PORT);
                 ProxyStatus {
                     running: false,
                     host: "127.0.0.1".to_string(),
@@ -392,6 +429,23 @@ impl ProxyServer {
                 }
             }
         }
+    }
+}
+
+/// 归一绑定地址：`localhost` → `127.0.0.1`，其余保持（含 `::1`）。
+fn normalize_bind(bind: &str) -> String {
+    match bind.trim().to_ascii_lowercase().as_str() {
+        "localhost" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 拼客户端可用的 Base URL：IPv6 字面量必须加方括号（`http://[::1]:15721`）。
+fn format_base_url(bind: &str, port: u16) -> String {
+    if bind.contains(':') {
+        format!("http://[{bind}]:{port}")
+    } else {
+        format!("http://{bind}:{port}")
     }
 }
 

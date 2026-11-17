@@ -9,10 +9,15 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
 /// 每个连接建立时执行的 PRAGMA。
+///
+/// `secure_delete = ON`：删除/覆盖的行在页内用 0 填充，而不是仅从空闲列表摘下
+/// 指针。请求表里有 prompt/response 正文，保留期清理删掉的行若留在空闲页里，
+/// 任意能读到 db 文件的人仍可取回。这是**连接级**设置，必须每条连接都设。
 pub const CONNECTION_PRAGMAS: &str = "PRAGMA journal_mode = WAL; \
      PRAGMA foreign_keys = ON; \
      PRAGMA synchronous = NORMAL; \
-     PRAGMA busy_timeout = 5000;";
+     PRAGMA busy_timeout = 5000; \
+     PRAGMA secure_delete = ON;";
 
 const POOL_MAX_SIZE: u32 = 8;
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -147,5 +152,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
             .expect("表应仍然存在");
         assert_eq!(count, 0);
+    }
+
+    /// `secure_delete` 是**连接级** PRAGMA：池里每一条连接都必须打开它，否则
+    /// 从某条连接删掉的请求正文仍以残留字节留在空闲页里（能读到 db 文件就能取回）。
+    #[test]
+    fn every_pooled_connection_enables_secure_delete() {
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        // 同时持有连接，才能拿到池里不同的实例（归还后会被复用）。
+        let conns: Vec<_> = (0..MEMORY_POOL_MAX_SIZE)
+            .map(|_| db.conn().expect("应能取连接"))
+            .collect();
+        for (index, conn) in conns.iter().enumerate() {
+            let value: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .expect("读取 secure_delete 应成功");
+            assert_eq!(value, 1, "第 {index} 条连接未开启 secure_delete");
+        }
+    }
+
+    /// 含正文的请求删除后在同一连接上不可见，且删除路径处于 secure_delete 模式。
+    /// 空闲页是否真的被 0 覆写由 SQLite 保证，内存库上无法直接观测。
+    #[test]
+    fn deleted_request_body_is_gone_under_secure_delete() {
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        super::super::run_migrations(&db).expect("迁移应成功");
+        let conn = db.conn().expect("应能取连接");
+        conn.execute(
+            "INSERT INTO proxy_session_requests \
+               (method, request_path, api_format, request_body, response_body, started_at, \
+                day_local, status_kind) \
+             VALUES ('POST', '/v1/messages', 'anthropic', 'secret prompt', 'secret answer', \
+                     '2026-10-20T01:00:00Z', '2026-10-20', 'success')",
+            [],
+        )
+        .expect("插入请求行应成功");
+        conn.execute("DELETE FROM proxy_session_requests", [])
+            .expect("删除请求行应成功");
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM proxy_session_requests", [], |row| {
+                row.get(0)
+            })
+            .expect("计数应成功");
+        assert_eq!(rows, 0, "删除后不得再查到该行");
+        let secure_delete: i64 = conn
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+            .expect("读取 secure_delete 应成功");
+        assert_eq!(secure_delete, 1);
     }
 }

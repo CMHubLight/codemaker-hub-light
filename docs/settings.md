@@ -9,7 +9,7 @@
 | 数据目录 | `~/.codemaker-hub-light`（Windows 为 `%USERPROFILE%\.codemaker-hub-light`） |
 | 设置文件 | `<数据目录>/settings.json` |
 | 端口文件 | `<数据目录>/proxy.port` |
-| 日志目录 | `<数据目录>/logs/`（`hub-light.log` 按日滚动） |
+| 日志目录 | `<数据目录>/logs/`（`hub-light.log.<date>` 按日滚动，保留 30 份） |
 
 数据目录由 `settings::default_data_dir()` 定位：优先环境变量 `USERPROFILE`，其次 `HOME`，都取不到时返回 `SettingsError::HomeDirUnavailable` 并弹窗退出（窗口还没创建）。目录用 `create_dir_all` 幂等创建。
 
@@ -33,10 +33,12 @@
 进程内唯一的写入口是 `SettingsStore::update`（IPC 命令 `settings_update`）。顺序固定为：
 
 1. 取写者异步 `Mutex`（并发保存串行化，后到者覆盖前者而不是交叉写）；
-2. 读取当前设置克隆一份，`apply_patch` 合并前端提交的局部字段，`normalize`，`validate`；
-3. **锁外**落盘（`save`）；
+2. 以**磁盘上的当前文件**为基线（`Settings::read_existing`），`apply_patch` 合并前端提交的局部字段，`normalize`，`validate`；
+3. **锁外**落盘（`spawn_blocking` 里的 `save`）；
 4. 成功后替换内存设置；
 5. 把新设置投影到运行期代理策略 `PolicyCell`。
+
+基线取磁盘而不是启动时的内存快照，是为了保留运行期手改：`proxy_bind` / `credit_to_yuan` 没有设置页入口，用户通常直接编辑文件；旧实现会用旧内存整文件覆盖，手改内容静默丢失。磁盘文件缺失/损坏时回退内存（启动期已做自愈）。
 
 设置读锁不跨 `to_vec_pretty` / `fsync` / `rename`，因此保存设置不会阻塞认证后台循环、深链处理或代理读配置。任一步失败（校验不过或落盘失败）时，内存与运行期策略都保持旧值，代理下一次请求读到的仍是旧策略。
 
@@ -59,12 +61,12 @@ credit_to_yuan
 |---|---|
 | 类型 | `String` |
 | 默认值 | `https://api.example.com`（占位地址，需在设置里改成可访问的兼容网关） |
-| 校验 | `https://` 允许任意主机；`http://` 只允许 `127.0.0.1` / `localhost` / `::1`（可带端口，兼容 `[::1]:8080` 写法）；其他协议或无协议前缀一律拒绝 |
+| 校验 | `https://` 允许任意主机；`http://` 只允许 `127.0.0.1` / `localhost` / `::1`（可带端口，兼容 `[::1]:8080` 写法）；**URL 内嵌 userinfo（`user:pass@host`）一律拒绝**；其他协议或无协议前缀一律拒绝 |
 | 规范化 | 保存与启动时 `trim`，并去掉末尾一个或多个 `/` |
 | 生效方式 | 登录、轮询、`/validate`、额度、24h 云端曲线在每次命令中读取当前值，**即时生效**；本地代理的转发目标在启动时固化，**需重启代理** |
 | 设置页 | 可编辑 |
 
-校验源码是 `gateway_url_is_acceptable`。明文 `http://` 只对本机回环放行，因为账号凭据以请求头形式发往网关。
+校验源码是 `gateway_url_is_acceptable`。明文 `http://` 只对本机回环放行，因为账号凭据以请求头形式发往网关；userinfo 被拒绝是因为 `reqwest` 会把它转成 Basic auth，并可能被写进日志。启动日志里只打印 `scheme://host:port`（`redact_gateway_url`）。
 
 ### `proxy_bind`
 
@@ -76,7 +78,7 @@ credit_to_yuan
 | 生效方式 | 仅在新监听时读取，**需重启代理** |
 | 设置页 | 无编辑入口，只读展示；需要改动时手工编辑文件 |
 
-注意两层校验并不一致：设置层接受 `localhost`，而代理启动时还要把绑定地址解析成 `IpAddr`（`ProxyServer::start_locked`），`localhost` 不是 IP 字面量，会在重启代理时报“监听地址不是合法 IP”。也就是说该值写 `localhost` 能通过保存，但代理起不来；实际可用值是 `127.0.0.1` 或 `::1`。
+注意绑定地址在启动时会归一：`localhost` → `127.0.0.1`（`IpAddr::parse` 不认主机名）；`::1` 启动后客户端 Base URL 会写成带方括号的 `http://[::1]:port`。三种写法都可以正常启动。
 
 ### `proxy_port`
 
@@ -113,7 +115,7 @@ credit_to_yuan
 | 生效方式 | **下一轮维护**：启动后立即跑一次，之后每 24h 一次；每轮从设置快照读取该值（无需重启）。维护内部还会再 `clamp(1, 3650)` |
 | 设置页 | 可编辑 |
 
-只影响本机 SQLite 的请求明细、会话、日聚合与额度快照。
+只影响本机 SQLite 的请求明细、会话、日聚合与额度快照。删除是 SQL `DELETE` + 连接级 `PRAGMA secure_delete = ON`（删除的页会被覆盖），但不是 `VACUUM` 级物理擦除；正文是否曾落库仍由 `record_body` 决定。运行期手改 `settings.json` 的保留期不会立即生效，下一轮维护读取内存态（保存过设置后即以磁盘合并结果为准）。
 
 ### `credit_to_yuan`
 

@@ -43,25 +43,6 @@ pub struct UsageTotals {
     pub error_rate: Option<f64>,
 }
 
-/// 按日趋势（前端 `DailyUsage`）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DailyUsage {
-    /// YYYY-MM-DD
-    pub date: String,
-    pub requests: i64,
-    pub tokens: i64,
-    pub cost_yuan: f64,
-}
-
-/// 模型分布（前端 `ModelUsage`）。
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelUsage {
-    pub model: String,
-    pub requests: i64,
-    pub tokens: i64,
-    pub cost_yuan: f64,
-}
-
 /// 请求列表项（前端 `RecentRequest`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct RecentRequest {
@@ -83,13 +64,13 @@ pub struct RecentRequest {
 }
 
 /// 概览页汇总（前端 `UsageSummary`）。
+///
+/// 只含本机数据：云端"本月 Token/消耗/模型分布"来自 `quota_get`，24h 曲线来自
+/// `cost_trend_get("24h")`。此前 `month/daily/models` 三个字段没有任何前端消费者，
+/// 却让每次概览刷新多跑 3 条 SQL，已删除。
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageSummary {
     pub today: UsageTotals,
-    pub month: UsageTotals,
-    /// 最近 30 天，按日期升序。
-    pub daily: Vec<DailyUsage>,
-    pub models: Vec<ModelUsage>,
     pub recent: Vec<RecentRequest>,
     pub generated_at: String,
 }

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { Requests } from './Requests'
@@ -42,8 +42,53 @@ function filterOf(args: unknown): RequestFilter {
 }
 
 describe('Requests 分页（keyset 游标）', () => {
-  it('pager_resets_to_first_page_when_total_shrinks：事件刷新后回第一页，不出现越界页码', async () => {
+  it('event_refresh_on_later_page_refetches_current_page_without_resetting_cursor', async () => {
     const user = userEvent.setup()
+    const filters: RequestFilter[] = []
+    /** 第二页每次返回的内容：事件刷新后应看到新内容，证明重取的是当前页。 */
+    let secondPageModel = 'model-1'
+
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== 'usage_requests') throw new Error(`未 mock 的命令：${String(command)}`)
+      const filter = filterOf(args)
+      filters.push(filter)
+      if (filter.after == null) {
+        return {
+          total: 120,
+          items: [request('3', 'model-3')],
+          next_cursor: PAGE_ONE_CURSOR,
+          prev_cursor: null
+        }
+      }
+      return {
+        total: -1,
+        items: [request('1', secondPageModel)],
+        next_cursor: null,
+        prev_cursor: filter.after
+      }
+    })
+
+    const { rerender } = render(<Requests revision={0} />)
+    await waitFor(() => expect(screen.getByText('第 1 / 3 页')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: '下一页' }))
+    await waitFor(() => expect(screen.getByText('第 2 / 3 页')).toBeInTheDocument())
+    expect(screen.getByText('model-1')).toBeInTheDocument()
+
+    // 后台额度/用量事件刷新：停在第 2 页时只重取第 2 页（同一游标），
+    // 旧实现会 setPageIndex(0) 把用户打回第一页（旧 P2-4）。
+    secondPageModel = 'model-1-refreshed'
+    rerender(<Requests revision={1} />)
+
+    await waitFor(() => expect(screen.getByText('model-1-refreshed')).toBeInTheDocument())
+    expect(screen.getByText('第 2 / 3 页')).toBeInTheDocument()
+    expect(screen.queryByText('model-3')).toBeNull()
+    // 第 2 页的第三次请求仍是同一游标，且不统计 total。
+    expect(filters[2]?.after).toEqual(PAGE_ONE_CURSOR)
+    expect(filters[2]?.include_total).toBe(false)
+  })
+
+  it('first_page_event_refresh_clears_stale_total', async () => {
     let firstPageTotal = 120
 
     invokeMock.mockImplementation(async (command, args) => {
@@ -63,16 +108,100 @@ describe('Requests 分页（keyset 游标）', () => {
     const { rerender } = render(<Requests revision={0} />)
     await waitFor(() => expect(screen.getByText('第 1 / 3 页')).toBeInTheDocument())
 
-    await user.click(screen.getByRole('button', { name: '下一页' }))
-    await waitFor(() => expect(screen.getByText('第 2 / 3 页')).toBeInTheDocument())
-
-    // 后台清理让总数缩到 60（2 页）：事件刷新会静默回到第一页重取 total，
-    // 因此不会出现“第 3 / 2 页”的空表（keyset 下 total 只在第一页统计）。
+    // 后台清理让总数缩到 60（2 页）：第一页的事件刷新必须重算 total，
+    // 不能残留旧的 120（旧 P2-6）。
     firstPageTotal = 60
     rerender(<Requests revision={1} />)
 
     await waitFor(() => expect(screen.getByText('第 1 / 2 页')).toBeInTheDocument())
     expect(screen.queryByText(/第 \d+ \/ 3 页/)).toBeNull()
+  })
+
+  it('filter_change_clears_previous_total', async () => {
+    const user = userEvent.setup()
+    let filterCalls = 0
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== 'usage_requests') throw new Error(`未 mock 的命令：${String(command)}`)
+      filterCalls += 1
+      const filter = filterOf(args)
+      if (filter.status === 'error') return { total: 10, items: [], next_cursor: null }
+      return {
+        total: 120,
+        items: [request('3', 'model-3')],
+        next_cursor: PAGE_ONE_CURSOR,
+        prev_cursor: null
+      }
+    })
+
+    render(<Requests revision={0} />)
+    await waitFor(() => expect(screen.getByText(/共 120 条 · 每页 50 条/)).toBeInTheDocument())
+
+    // 换筛选条件后总数必须重新统计：旧 total 属于上一条件，不能沿用。
+    await user.selectOptions(screen.getByLabelText('状态'), 'error')
+    await user.click(screen.getByRole('button', { name: '查询' }))
+
+    await waitFor(() => expect(screen.getByText(/共 10 条 · 每页 50 条/)).toBeInTheDocument())
+    expect(screen.getByText('第 1 / 1 页')).toBeInTheDocument()
+    expect(filterCalls).toBe(2)
+  })
+
+  it('empty_later_page_shows_guidance_and_returns_to_first_page', async () => {
+    const user = userEvent.setup()
+    const filters: RequestFilter[] = []
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== 'usage_requests') throw new Error(`未 mock 的命令：${String(command)}`)
+      const filter = filterOf(args)
+      filters.push(filter)
+      if (filter.after == null) {
+        return {
+          total: 120,
+          items: [request('3', 'model-3')],
+          next_cursor: PAGE_ONE_CURSOR,
+          prev_cursor: null
+        }
+      }
+      // 后端多取一行后不再产生“整数倍满页空页”，但数据被清理时仍可能拿到空页。
+      return { total: -1, items: [], next_cursor: null, prev_cursor: filter.after }
+    })
+
+    render(<Requests revision={0} />)
+    await waitFor(() => expect(screen.getByText('第 1 / 3 页')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: '下一页' }))
+    await waitFor(() => expect(screen.getByText('本页暂无数据')).toBeInTheDocument())
+
+    // 空页不能只留一句“加载失败”，要给明确的回退入口（旧 P2-6）。
+    const backButton = screen.getByRole('button', { name: '回到第一页' })
+    await user.click(backButton)
+
+    await waitFor(() => expect(screen.getByText('第 1 / 3 页')).toBeInTheDocument())
+    expect(screen.getByText('model-3')).toBeInTheDocument()
+    expect(filters.at(-1)?.after).toBeUndefined()
+  })
+
+  it('retry_keeps_querying_state_until_request_settles', async () => {
+    let releaseRetry: (() => void) | undefined
+    let calls = 0
+    invokeMock.mockImplementation(async (command) => {
+      if (command !== 'usage_requests') throw new Error(`未 mock 的命令：${String(command)}`)
+      calls += 1
+      if (calls === 1) throw new Error('db busy')
+      await new Promise<void>((resolve) => {
+        releaseRetry = resolve
+      })
+      return { total: 50, items: [request('3', 'model-3')], next_cursor: null }
+    })
+
+    render(<Requests revision={0} />)
+    await waitFor(() => expect(screen.getByText(/读取请求列表失败：db busy/)).toBeInTheDocument())
+
+    // 点击重试后，新请求真正开始前也不能提前恢复“查询”按钮（旧 P3-6）。
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(screen.getByRole('button', { name: '查询中…' })).toBeDisabled()
+
+    releaseRetry?.()
+    await waitFor(() => expect(screen.getByText('model-3')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '查询' })).toBeEnabled()
   })
 
   it('failed_next_page_does_not_render_previous_rows_under_new_page', async () => {

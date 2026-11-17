@@ -39,7 +39,7 @@ pub fn schema_version(conn: &rusqlite::Connection) -> Result<i64, DbError> {
 pub fn active_profile(conn: &rusqlite::Connection) -> Result<Option<AuthProfileRow>, DbError> {
     let sql = format!(
         "SELECT {} FROM auth_profiles \
-         WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1",
+         WHERE is_active = 1 ORDER BY updated_at DESC, id DESC LIMIT 1",
         sql::AUTH_PROFILE_COLUMNS
     );
     Ok(conn
@@ -120,17 +120,24 @@ pub fn deactivate_profiles(conn: &rusqlite::Connection) -> Result<(), DbError> {
 ///
 /// `id DESC` 是必须的第二排序键：`fetched_at` 只到秒，同一秒内写入的多条快照
 /// 否则"最新"不确定。
+/// 读取"最新一条成功快照"。
+///
+/// `profile_id` 不为 `None` 时只看当前档案（换号后不能把上一个账号的额度当成
+/// 当前账号的）；历史行的 `profile_id` 可能为 NULL，严格过滤后自然被排除。
+/// `id DESC` 是必须的第二排序键：`fetched_at` 只到秒，同一秒内写入的多条快照
+/// 否则"最新"不确定。
 pub fn latest_quota_snapshot(
     conn: &rusqlite::Connection,
     quota_type: &str,
+    profile_id: Option<i64>,
 ) -> Result<Option<QuotaSnapshotRow>, DbError> {
-    let sql = format!(
-        "SELECT {} FROM quota_snapshots \
-         WHERE quota_type = ?1 AND status = 'ok' ORDER BY fetched_at DESC, id DESC LIMIT 1",
-        sql::QUOTA_SNAPSHOT_COLUMNS
-    );
+    let sql = sql::latest_quota_snapshot();
     Ok(conn
-        .query_row(&sql, params![quota_type], QuotaSnapshotRow::from_row)
+        .query_row(
+            &sql,
+            params![quota_type, profile_id],
+            QuotaSnapshotRow::from_row,
+        )
         .optional()?)
 }
 
@@ -544,7 +551,7 @@ mod tests {
             "不得全表扫描：{plan}"
         );
 
-        let latest = latest_quota_snapshot(&conn, "global")
+        let latest = latest_quota_snapshot(&conn, "global", None)
             .expect("读取应成功")
             .expect("应存在快照");
         assert_eq!(latest.monthly_quota, Some(1.0), "同秒内应按 id 取最新一条");

@@ -103,6 +103,20 @@ impl Settings {
         }
     }
 
+    /// 非破坏性读取磁盘上的设置：缺失/损坏/校验失败都返回 `None`。
+    ///
+    /// 供运行期保存使用：以磁盘为基线合并 patch，保留用户手改的字段
+    /// （旧实现直接序列化内存，会把运行期手改静默覆盖掉）。
+    pub fn read_existing(data_dir: &Path) -> Option<Self> {
+        if !settings_path(data_dir).is_file() {
+            return None;
+        }
+        let mut settings = Self::load(data_dir).ok()?;
+        settings.normalize();
+        settings.validate().ok()?;
+        Some(settings)
+    }
+
     /// 把有问题的设置文件改名留档，并回退默认值。
     fn backup_and_default(data_dir: &Path, reason: &str) -> Self {
         let path = settings_path(data_dir);
@@ -211,13 +225,20 @@ pub fn is_loopback_bind(bind: &str) -> bool {
 /// 因此除本地 mock/自测外一律要求 https（见 docs/gateway-contract.md）。
 pub fn gateway_url_is_acceptable(url: &str) -> bool {
     let trimmed = url.trim();
-    if trimmed.starts_with("https://") {
-        return true;
-    }
-    let Some(rest) = trimmed.strip_prefix("http://") else {
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 凭据只走请求头：URL 里内嵌 userinfo 会被 reqwest 转成 Basic auth 并写进日志。
+    if authority.contains('@') {
+        return false;
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
     // 去掉端口（含 IPv6 的 `[::1]:8080` 形式）。
     let host = match authority.rsplit_once(':') {
         Some((head, port)) if port.chars().all(|c| c.is_ascii_digit()) => head,
@@ -225,6 +246,19 @@ pub fn gateway_url_is_acceptable(url: &str) -> bool {
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 日志用的网关地址脱敏：只保留 `scheme://host[:port]`，去掉 userinfo/path/query。
+pub fn redact_gateway_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return "<invalid>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}")
 }
 
 /// 用户主目录（Windows 优先 USERPROFILE，类 Unix 用 HOME）。
@@ -261,6 +295,11 @@ pub fn proxy_port_path(data_dir: &Path) -> PathBuf {
 pub fn write_proxy_port(data_dir: &Path, port: u16) -> Result<(), SettingsError> {
     ensure_dir(data_dir)?;
     atomic_write(&proxy_port_path(data_dir), port.to_string().as_bytes())
+}
+
+/// 删除 `proxy.port`（代理停止时调用：文件存在即代表"有代理在跑"）。
+pub fn remove_proxy_port(data_dir: &Path) {
+    let _ = fs::remove_file(proxy_port_path(data_dir));
 }
 
 /// 临时文件 + fsync + rename 的原子写。

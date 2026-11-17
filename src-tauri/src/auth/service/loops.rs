@@ -98,10 +98,37 @@ impl AuthService {
             )
         };
         let credentials = credentials?;
-        // 需要重新登录 / 正在等待浏览器登录时不做后台校验与续期：
-        // 后者会用旧身份的 token 发请求，结果可能在登录提交之后落地（身份守卫会丢弃，
-        // 但更好的做法是根本不去制造这次竞争）。
-        if matches!(phase, AuthPhase::ReauthRequired | AuthPhase::PendingLogin) {
+        // 等待浏览器登录期间不做后台校验与续期（旧身份的 token 没有意义）。
+        // 但 pending 必须有"无人轮询也能过期"的兜底：用户点「取消等待」或关闭登录页后
+        // 前端不再轮询，否则 pending 永久有效、后台循环永久停摆。
+        if phase == AuthPhase::PendingLogin {
+            let now = Utc::now();
+            let timed_out = {
+                let state = self.state.read().await;
+                state
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| pending.is_timed_out(now))
+            };
+            if timed_out {
+                self.commit_if_current(epoch, |state| {
+                    if state.phase != AuthPhase::PendingLogin {
+                        return;
+                    }
+                    state.pending = None;
+                    state.pre_login_phase = None;
+                    state.phase = AuthPhase::Error;
+                    state.last_error = Some(format!(
+                        "登录超时（{} 秒），请重试",
+                        auth::POLL_TIMEOUT_SECS
+                    ));
+                })
+                .await;
+            }
+            return None;
+        }
+        // 需要重新登录时不做无意义重试，等待用户操作。
+        if phase == AuthPhase::ReauthRequired {
             return None;
         }
 

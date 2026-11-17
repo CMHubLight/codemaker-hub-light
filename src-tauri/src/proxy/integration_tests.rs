@@ -221,6 +221,56 @@ async fn mock_responses(
         .into_response()
 }
 
+/// 直通 Chat 流式：内容帧之后额外发一帧 usage-only（模拟 include_usage 的响应）。
+async fn mock_usage_only_sse(
+    State(capture): State<Capture>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    capture.push(&uri, headers, &body);
+    let body = [
+        "data: {\"id\":\"chatcmpl-usage\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-usage\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":42,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\n",
+        "data: [DONE]\n\n",
+    ]
+    .concat();
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("SSE 响应应可构造")
+}
+
+/// 200 + in-band error 的 SSE（客户端可见错误，账务必须也可见）。
+async fn mock_inband_sse(
+    State(capture): State<Capture>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    capture.push(&uri, headers, &body);
+    let body = "data: {\"error\":{\"message\":\"quota exhausted\",\"type\":\"insufficient_quota\"}}\n\ndata: [DONE]\n\n";
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("SSE 响应应可构造")
+}
+
+/// 200 + in-band error 的 JSON（非流式）。
+async fn mock_inband_json(
+    State(capture): State<Capture>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    capture.push(&uri, headers, &body);
+    json_response(serde_json::json!({
+        "error": { "message": "quota exhausted", "type": "insufficient_quota" }
+    }))
+}
+
 async fn mock_slow_sse() -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     tokio::spawn(async move {
@@ -343,6 +393,15 @@ async fn start_upstream() -> (String, Capture, tokio::task::JoinHandle<()>) {
         .route(
             "/empty-broken/openai/v1/chat/completions",
             post(mock_empty_broken_sse),
+        )
+        .route(
+            "/usage-frame/openai/v1/chat/completions",
+            post(mock_usage_only_sse),
+        )
+        .route("/inband/openai/v1/chat/completions", post(mock_inband_sse))
+        .route(
+            "/inband-json/openai/v1/chat/completions",
+            post(mock_inband_json),
         )
         .with_state(capture.clone());
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -844,6 +903,138 @@ async fn passthrough_streaming_chat_requests_usage() {
     proxy.shutdown().await;
 }
 
+/// 本代理注入 `include_usage` 后上游多发的 usage-only 帧必须被吞掉：
+/// 客户端没有声明该字段，不能收到 `choices: []` 的额外帧。
+#[tokio::test]
+async fn passthrough_streaming_filters_injected_usage_frame() {
+    let (upstream, _capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_credentials(),
+        &format!("{upstream}/usage-frame"),
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("直通 SSE 转发应完成");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("SSE 正文应可读");
+    assert!(body.contains("Hello"));
+    assert!(body.contains("[DONE]"));
+    assert!(
+        !body.contains("\"usage\""),
+        "客户端未声明 include_usage 时不得收到 usage 帧：{body}"
+    );
+
+    wait_for_requests(&proxy.db, 1).await;
+    assert_eq!(
+        count(&proxy.db, "SELECT input_tokens FROM proxy_session_requests"),
+        90
+    );
+    assert_eq!(
+        count(
+            &proxy.db,
+            "SELECT output_tokens FROM proxy_session_requests"
+        ),
+        42
+    );
+
+    proxy.shutdown().await;
+}
+
+/// 200 + in-band error（流式翻译）：客户端看到 event: error，账务记 upstream_error。
+#[tokio::test]
+async fn translated_inband_stream_error_is_recorded_as_error() {
+    let (upstream, _capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_credentials(),
+        &format!("{upstream}/inband"),
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/messages", proxy.base_url))
+        .header("user-agent", "claude-cli/1.0")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("请求应完成");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("SSE 正文应可读");
+    assert!(
+        body.contains("event: error"),
+        "客户端必须看到错误帧：{body}"
+    );
+
+    wait_for_requests(&proxy.db, 1).await;
+    assert_eq!(
+        text(&proxy.db, "SELECT error_kind FROM proxy_session_requests").as_deref(),
+        Some("upstream_error"),
+        "in-band error 必须落 upstream_error"
+    );
+    assert_eq!(
+        text(&proxy.db, "SELECT status_kind FROM proxy_session_requests").as_deref(),
+        Some("error"),
+        "账务不能把 200 + error 记成 success"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// 200 + in-band error（非流式翻译）：错误体照常返回客户端，账务记失败。
+#[tokio::test]
+async fn translated_inband_json_error_is_recorded_as_error() {
+    let (upstream, _capture, _handle) = start_upstream().await;
+    let proxy = start_proxy(
+        provider_with_credentials(),
+        &format!("{upstream}/inband-json"),
+        ProxyPolicy::default(),
+    )
+    .await;
+
+    let response = http()
+        .post(format!("{}/v1/messages", proxy.base_url))
+        .header("user-agent", "claude-cli/1.0")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("请求应完成");
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("错误体应是 JSON");
+    assert_eq!(body["type"], "error");
+
+    wait_for_requests(&proxy.db, 1).await;
+    assert_eq!(
+        text(&proxy.db, "SELECT error_kind FROM proxy_session_requests").as_deref(),
+        Some("upstream_error")
+    );
+    assert_eq!(
+        text(&proxy.db, "SELECT status_kind FROM proxy_session_requests").as_deref(),
+        Some("error")
+    );
+
+    proxy.shutdown().await;
+}
+
+/// 客户端在 SSE 中途断开：记录 client_aborted，且不影响其它请求。
 #[tokio::test]
 async fn client_disconnect_records_abort() {
     let (upstream, _capture, _handle) = start_upstream().await;

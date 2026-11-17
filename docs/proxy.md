@@ -8,7 +8,7 @@
 
 - 不做重试、不做多上游负载均衡；
 - 不跟随上游重定向（`reqwest` 显式设为 `Policy::none()`）；
-- 除 `/v1/messages` 的翻译路由外，不改写请求体与响应体；
+- 除 `/v1/messages` 的翻译路由、以及直通 Chat 流式的 `stream_options` 注入外，不改写请求体；响应体只在直通 Chat 流式里吞掉代理自己"要来的" usage-only 帧；
 - token 只在内存里用于注入上游请求头，不落日志、不落库。
 
 ## 启动、绑定与端口回退
@@ -17,17 +17,17 @@
 
 | 项 | 行为 | 依据 |
 | --- | --- | --- |
-| 绑定地址 | 设置项 `proxy_bind`，默认 `127.0.0.1`；只接受 `127.0.0.1` / `localhost` / `::1`，其它值启动时直接报 `NonLoopback` | `proxy/server.rs`、`settings.rs` |
+| 绑定地址 | 设置项 `proxy_bind`，默认 `127.0.0.1`；只接受 `127.0.0.1` / `localhost` / `::1`，其它值直接报 `NonLoopback`；启动时归一（`localhost` → `127.0.0.1`） | `proxy/server.rs`、`settings.rs` |
 | 首选端口 | 设置项 `proxy_port`，默认 `15721`，校验要求 ≥ 1024 | `settings.rs` |
-| 回退区间 | 首选端口被占用时依次尝试 `首选+1 ..= 15800`（`PROXY_PORT_FALLBACK_END`） | `proxy/server.rs` |
+| 回退区间 | 首选端口被占用时从首选值开始依次尝试到 `15800`（`PROXY_PORT_FALLBACK_END`） | `proxy/server.rs` |
 | 最终兜底 | 区间内全失败则向系统要一个临时端口（`port = 0`） | `proxy/server.rs` |
 | 首选端口 > 15800 | 不再回退区间，只用首选端口，再退到系统分配 | `proxy/server.rs` |
-| 端口文件 | `~/.codemaker-hub-light/proxy.port`，内容是**实际**监听端口的纯文本，供外部 CLI 发现 | `settings::write_proxy_port` |
-| 停止 | 发 oneshot 触发 graceful shutdown，最多等 5 秒（`STOP_TIMEOUT`），幂等 | `proxy/server.rs` |
+| 端口文件 | `~/.codemaker-hub-light/proxy.port`，内容是**实际**监听端口的纯文本，供外部 CLI 发现；代理停止时删除 | `settings::{write,remove}_proxy_port` |
+| 停止 | 发 oneshot 触发 graceful shutdown，最多等 5 秒（`STOP_TIMEOUT`），超时 `abort` 并等待任务结束；幂等 | `proxy/server.rs` |
 
 `proxy.port` 与 `settings.json` 一样走「临时文件 + `fsync` + `rename`」的原子写；写失败只记 warn，不影响代理继续服务。
 
-代理启动成功后状态经 `proxy://status` 事件推给前端，字段为 `running` / `host` / `port` / `base_url` / `gateway_url` / `last_error` / `started_at` / `uptime_secs` / `request_count` / `error_count` / `port_file` / `health_url`。
+代理启动成功后状态经 `proxy://status` 事件推给前端，字段为 `running` / `host` / `port` / `base_url` / `gateway_url` / `last_error` / `started_at` / `uptime_secs` / `request_count` / `error_count` / `port_file` / `health_url`。`base_url` 对 IPv6 会加方括号（`http://[::1]:15721`）。重启失败时旧配置会尽力回滚，成功/失败都会广播状态。
 
 ## 路由表
 
@@ -87,13 +87,15 @@
 
 上游网关地址：优先用登录/校验返回的 `serverUrl`，但它必须通过与设置项**相同**的策略——`https://` 允许任意主机，`http://` 只允许本机回环；不合法时回退设置里的 `gateway_url` 并记一条 warn。代理每次转发都会重新校验，不只看协议前缀（否则登录响应里的明文地址会把 token 带去任意主机）。
 
-所有路由都强制 `accept-encoding: identity`：代理自身不启用解压（reqwest 无 gzip/brotli 特性），上游若压缩，客户端仍能正常解码，但代理侧的 usage/cost 解析会拿到压缩字节并静默记 0。日志里出现「上游忽略 accept-encoding: identity」即说明上游仍在压缩，属网关行为。翻译路由（`/v1/messages*`）在此之上再改一次：移除 `anthropic-version`、`anthropic-beta`、`x-api-key`、`content-length`，并强制 `content-type: application/json`、`accept: text/event-stream`（流式）或 `application/json`。
+所有路由都强制 `accept-encoding: identity`：代理自身不启用解压（reqwest 无 gzip/brotli 特性），上游若压缩，**直通路由**仍原样转发（客户端能解码，但代理侧 usage/cost 解析拿不到明文，会记 0 并留一条 warn）；**翻译路由**无法在不破坏正文的前提下处理压缩字节，检测到非 `identity` 的 `content-encoding` 会直接返回 502 `upstream_encoding_unsupported`（不再剥掉编码头把压缩字节当 JSON/SSE 解析）。翻译路由（`/v1/messages*`）在请求侧再改一次：移除 `anthropic-version`、`anthropic-beta`、`x-api-key`、`content-length`，并强制 `content-type: application/json`、`accept: text/event-stream`（流式）或 `application/json`。
 
 响应头只去 hop-by-hop，其余（含 `content-type`、`content-encoding`）原样透传；翻译路由会额外去掉 `content-length` 与 `content-encoding` 并重设 `content-type`。所有转发响应都会 `append` 一个 `x-hub-request-id`（用 `append` 而非 `insert`，上游若回显同名头则保留多值）。
 
-直通 Chat（`POST /v1/chat/completions`）的流式请求会额外补齐 `stream_options: {"include_usage": true}`：OpenAI Chat 语义下，`stream: true` 且未声明该字段时上游不会在末帧回 `usage`，代理只能把它记成 0 token。客户端已显式声明 `include_usage`（无论 true/false）时保持原值；`stream_options` 是非对象、或请求体不是合法 JSON 时不做改写（行为与旧版一致）。`/v1/responses` 不需要——usage 在 `response.completed` 事件里。
+直通 Chat（`POST /v1/chat/completions`）的流式请求会额外补齐 `stream_options: {"include_usage": true}`：OpenAI Chat 语义下，`stream: true` 且未声明该字段时上游不会在末帧回 `usage`，代理只能把它记成 0 token。客户端已显式声明 `include_usage`（无论 true/false）时保持原值；`stream_options` 是非对象、或请求体不是合法 JSON 时不做改写。因为这一帧是代理"要来的"、客户端并没有预期，代理会在直通 SSE 里**吞掉** `choices` 为空数组的 usage-only 帧（带正文/错误的帧照常转发）；客户端自己声明了 `include_usage` 时不做过滤。请求体超过 4 MiB 时跳过注入（避免二次解析持有 4 份 body 副本），这类请求可能记 0 并留 warn。`/v1/responses` 不需要——usage 在 `response.completed` 事件里。
 
 落库的请求头走白名单，绝不含凭据：`user-agent`、`content-type`、`accept`、`anthropic-version`、`anthropic-beta`、`openai-beta`、`x-client-request-id`、`x-claude-code-session-id`、`x-codemaker-session-id`、`x-session-id`、`x-opencode-session-id`、`downstream-client`、`x-stainless-*`。
+
+转发上游时不只剥静态 hop-by-hop 清单，还会按 `connection` 头点名的字段再剥一轮；`x-forwarded-for` / `x-forwarded-host` / `x-forwarded-proto` / `x-real-ip` / `forwarded` / `via` / `referer` 一律不转发（客户端可伪造它们污染网关侧日志/限流）。两个 HTTP 客户端（代理转发与认证）都显式 `no_proxy()`：凭据只发往用户配置的网关，不走系统代理。
 
 ## Anthropic Messages → OpenAI Chat 的翻译边界
 

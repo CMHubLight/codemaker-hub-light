@@ -1,6 +1,6 @@
 # 本地数据模型
 
-> 这篇讲本机 SQLite 的位置与连接参数、8 张表的用途与写入时机、4 个迁移版本与 5 个 SQL 文件的对应关系、索引服务的查询，以及保留期清理；读者是想直接查库或改存储层的人。
+> 这篇讲本机 SQLite 的位置与连接参数、8 张表的用途与写入时机、5 个迁移版本与 6 个 SQL 文件的对应关系、索引服务的查询，以及保留期清理；读者是想直接查库或改存储层的人。
 
 ## 数据库文件与连接
 
@@ -9,7 +9,7 @@
 | 数据库文件 | `<数据目录>/codemaker-hub-light.db`（`db::DB_FILE_NAME`） |
 | 数据目录 | `~/.codemaker-hub-light`（Windows 为 `%USERPROFILE%\.codemaker-hub-light`） |
 | 日志模式 | WAL（每个连接建立时执行 `PRAGMA journal_mode = WAL`） |
-| 其他 PRAGMA | `foreign_keys = ON`、`synchronous = NORMAL`、`busy_timeout = 5000` |
+| 其他 PRAGMA | `foreign_keys = ON`、`synchronous = NORMAL`、`busy_timeout = 5000`、`secure_delete = ON` |
 | 连接池 | r2d2 + r2d2_sqlite：`max_size = 8`、`min_idle = 1`、`connection_timeout = 5s` |
 
 PRAGMA 不在迁移脚本里设置：迁移在事务中执行，而 `PRAGMA journal_mode = WAL` 不允许在事务内切换。统一放在 `db::pool::CONNECTION_PRAGMAS`，由每条新连接初始化时执行。
@@ -105,7 +105,7 @@ model_prices
 
 每个版本一个事务，所以当前代码里 DDL 与版本行同时提交。仍然需要逐语句探测 + 可重试，是因为旧版本构建可能留下“结构已生效、版本行没写”的库（例如旧实现不是每版本一个事务），而迁移失败会让应用**每次启动都失败**：0003 曾经有两条 `ALTER TABLE` 却只探一条，如果在“`day_local` 已提交、`status_kind` 未提交”的窗口崩溃，重跑会撞 `duplicate column`。现在每个 step 各自探测：已存在的跳过，缺的补上。幂等语句（`CREATE ... IF NOT EXISTS`、带 `WHERE ... IS NULL` 的回填、去重 `DELETE`）不需要 `probe`。
 
-### 4 个版本与 5 个 SQL 文件
+### 5 个版本与 6 个 SQL 文件
 
 | 版本 | name | SQL 文件 | 步骤数 | 探测 |
 |---|---|---|---|---|
@@ -113,12 +113,15 @@ model_prices
 | 2 | `0002_auth_models` | `0002_auth_models.sql` | 1 | `auth_profiles.models_json` 列是否存在 |
 | 3 | `0003_request_day_status` | `0003_request_day_status.sql` + `0003_request_status_kind.sql` | 2 | 分别探测 `day_local`、`status_kind` 列 |
 | 4 | `0004_usage_perf` | `0004_usage_perf.sql` | 1 | 最后一条语句建出的 `ux_prc_request` 索引 |
+| 5 | `0005_backfill_repair` | `0005_backfill_repair.sql` | 1 | **无 probe**：幂等回填 `day_local` / `status_kind` 的 NULL 行 |
 
 版本 3 拆成两个可独立探测的步骤，就是上节说的“崩溃窗口”修复：任一列缺失只补那一列，两列都在就只补版本行。
 
 版本 4 是一个可整批重跑的批次：DDL 全部 `IF NOT EXISTS` / `IF EXISTS`，去重 `DELETE` 在无重复行时影响 0 行，因此用“最后建成的对象”作探测，命中即视为整批完成。
 
-相关测试覆盖了这些路径：`migrations_create_all_tables`、`migrations_are_idempotent`、`migrations_retry_after_partial_0002`、`migrations_reapply_when_column_missing`、`migrations_retry_after_partial_0003`、`migration_0003_partial_retry_heals_day_local_only`、`migration_0004_partial_retry_heals`、`migration_0003_backfills_legacy_rows`。
+版本 5 故意不设 probe：探测只能看到列是否存在，看不到列里是否还有 NULL 行。0003 的回填一旦在崩溃窗口里被跳过（列在、数据为 NULL、版本行缺失），任何基于“列存在”的探测都会永远跳过回填；版本 5 每次只执行 `UPDATE ... WHERE ... IS NULL`，重复运行零副作用。`day_local` 的回填口径与 0003 / `usage::local_day` 一致，用 `date(started_at,'localtime')`（非法时间戳退回 UTC 日期前缀）。
+
+相关测试覆盖了这些路径：`migrations_create_all_tables`、`migrations_are_idempotent`、`migrations_retry_after_partial_0002`、`migrations_reapply_when_column_missing`、`migrations_retry_after_partial_0003`、`migration_0003_partial_retry_heals_day_local_only`、`migration_0004_partial_retry_heals`、`migration_0003_backfills_legacy_rows`、`migration_0005_backfills_null_columns`、`migration_0005_rebackfills_when_version_row_missing`。
 
 ## 索引清单
 
@@ -135,9 +138,9 @@ model_prices
 | `ix_prc_model` | 0001 | 按模型汇总费用（预留） |
 | `ux_usage_daily_dim` | 0001 | `usage_daily` upsert 冲突目标：四维唯一 |
 | `ix_usage_daily_day` | 0001 | 日区间查询；0004 的覆盖索引以 `day` 打头，功能重叠但保留 |
-| `ix_quota_snapshots_latest` | 0001 | 设计给按 `profile_id` 查最新快照；真实查询不带 `profile_id`，0004 补了部分索引 |
+| `ix_quota_snapshots_latest` | 0001 | 设计给按 `profile_id` 查快照；真实查询同时带 `quota_type` 与当前 `profile_id`，0004 的部分索引以 `quota_type` 打头、再回表过滤 `profile_id`（每类最多保留 200 条） |
 | `ux_model_prices_model` | 0001 | 模型价格按 `model` 唯一 |
-| `ix_quota_snapshots_ok_latest` | 0004 | `latest_quota_snapshot`：`quota_type` + `status='ok'` 按 `fetched_at, id` 倒序 `LIMIT 1`（部分索引） |
+| `ix_quota_snapshots_ok_latest` | 0004 | `latest_quota_snapshot`：`quota_type` + `status='ok'` 按 `fetched_at, id` 倒序 `LIMIT 1`（部分索引；结果再按当前 `profile_id` 过滤） |
 | `ix_quota_snapshots_type_id` | 0004 | 维护按 `quota_type` 保留最近 N 条时定位 `id` 边界 |
 | `ix_psr_day_started_id` | 0004 | 请求列表 keyset：`ORDER BY day_local DESC, started_at DESC, id DESC` 的区间反向扫描 |
 | `ix_psr_status_day_started` | 0004 | 状态筛选：等值列 `status_kind` 打头，后接日区间与排序键 |

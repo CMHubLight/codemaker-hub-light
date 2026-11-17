@@ -69,10 +69,12 @@ export function formatTrendValue(trend: CostTrend, value: number): string {
   return trend.unit === 'cny' ? formatYuan(value) : `${formatPoints(value)} 积分`
 }
 
-/** 24h 的首尾都是同一时刻，轴标签补日期避免“21:00 → 21:00”。 */
-export function axisLabel(trend: CostTrend, point: CostTrend['points'][number]): string {
-  if (trend.range === '24h' && point.at.length >= 16) {
-    return `${point.at.slice(5, 10)} ${point.at.slice(11, 16)}`
-  }
+/**
+ * 轴标签直接用后端给的 `label`。
+ *
+ * 旧实现按字符位置截 `at` 拼 24h 标签，等于在前端另造一套时间口径（与 tooltip 的
+ * `formatDateTime` 不一致）；后端 `label` 已按云端/本机各自的时区生成（N-P3-33）。
+ */
+export function axisLabel(point: CostTrend['points'][number]): string {
   return point.label
 }

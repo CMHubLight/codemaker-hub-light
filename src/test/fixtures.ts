@@ -4,7 +4,10 @@ import type {
   AuthStatus,
   LoginSession,
   ProxyStatus,
-  QuotaInfo
+  QuotaInfo,
+  RecentRequest,
+  UsageSummary,
+  UsageTotals
 } from '../lib/types'
 
 /**
@@ -33,7 +36,8 @@ export const AUTH_PENDING: AuthStatus = {
   ...AUTH_UNAUTHENTICATED,
   state: 'pending',
   pending_poll_uuid: 'poll-uuid',
-  pending_login_started_at: '2026-10-26T08:00:00Z'
+  // 相对“现在”生成：等待超时按这个起点计算，写死历史时间会让登录页立刻判超时。
+  pending_login_started_at: new Date().toISOString()
 }
 
 export const LOGIN_SESSION: LoginSession = {
@@ -72,7 +76,7 @@ export const PROXY: ProxyStatus = {
 
 export const APP_INFO: AppInfo = {
   name: 'CodeMaker Hub Light',
-  version: '0.2.3',
+  version: '0.2.4',
   tauri_version: '2.9.0',
   platform: 'windows',
   data_dir: 'C:\\data',
@@ -110,4 +114,45 @@ export const QUOTA: QuotaInfo = {
 
 export function quotaFixture(overrides: Partial<QuotaInfo> = {}): QuotaInfo {
   return { ...QUOTA, ...overrides }
+}
+
+export const EMPTY_TOTALS: UsageTotals = {
+  requests: 0,
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  cache_write_tokens: 0,
+  total_tokens: 0,
+  cost_yuan: 0,
+  cache_hit_rate: null,
+  avg_latency_ms: null,
+  error_rate: null
+}
+
+/** 概览页汇总 fixture：后端只剩 today/recent（month/daily/models 已删除）。 */
+export const EMPTY_USAGE_SUMMARY: UsageSummary = {
+  today: { ...EMPTY_TOTALS },
+  recent: [],
+  generated_at: '2026-11-11T00:00:00Z'
+}
+
+export function usageSummaryFixture(overrides: Partial<UsageSummary> = {}): UsageSummary {
+  return { ...EMPTY_USAGE_SUMMARY, ...overrides }
+}
+
+export function recentRequestFixture(overrides: Partial<RecentRequest> = {}): RecentRequest {
+  return {
+    id: '1',
+    created_at: '2026-11-11T08:00:00Z',
+    model: 'claude-sonnet-4',
+    protocol: 'anthropic',
+    client: 'unknown',
+    status: 'success',
+    latency_ms: 120,
+    first_byte_ms: 45,
+    input_tokens: 10,
+    output_tokens: 5,
+    cost_yuan: 0.001,
+    ...overrides
+  }
 }

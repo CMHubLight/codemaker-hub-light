@@ -31,7 +31,7 @@ flowchart LR
     CLIENT["Claude Code / Codex / SDK"]
     GW["上游网关（需自行配置）"]
   end
-  WV -->|"Tauri IPC 19 个命令 + 6 个事件"| Main
+  WV -->|"Tauri IPC 20 个命令 + 6 个事件"| Main
   CLIENT -->|"HTTP 127.0.0.1:15721"| PROXY
   PROXY -->|"注入凭据后转发"| GW
   AUTH -->|"登录 / 校验 / 续期 / 额度"| GW
@@ -59,30 +59,31 @@ flowchart LR
 | `proxy` | HTTP 服务、路由、转发、协议翻译、用量解析 | `proxy/*` |
 | `db` | 连接池、迁移、仓储、维护清理 | `db/*` |
 | `usage` | 聚合、请求列表 | `usage/*` |
-| `commands` | 19 个 IPC 命令 | `commands/*` |
+| `commands` | 20 个 IPC 命令 | `commands/*` |
 | `tray` / `window` | 托盘图标与 tooltip、主窗口显示与"关闭即隐藏" | `tray/*`、`window.rs` |
 | `deep_link` | scheme 注册、回调监听、二次启动转发 | `deep_link.rs` |
 | `compat` | Windows/MSVC 旧工具链的 CRT 链接垫片 | `compat/msvc_crt.rs` |
 
 ## 4. 启动时序
 
-`lib.rs::run` 分两段：**建窗前**（失败只能弹窗退出）与 **setup 内**（失败写 `startup-error.log` 并弹窗）。
+`lib.rs::run` 分两段：**建窗前**（失败只能弹窗退出）与 **setup 内**（失败写 `startup-error.log` 并弹窗，然后 `exit(1)`）。主窗口在 `tauri.conf.json` 里是 `create: false`，由 setup 自己创建——否则 Tauri 会在我们的诊断代码之前建窗，WebView2 缺失时直接 panic。
 
 | 阶段 | 动作 | 失败后果 |
 |---|---|---|
-| 1 | 解析并创建数据目录 | 弹窗 + `startup-error.log`，进程退出 |
-| 2 | 初始化日志（`logs/hub-light.log`，按日滚动） | 降级到 stderr |
+| 1 | 解析并创建数据目录 | 弹窗 + `startup-error.log`，进程以非零码退出 |
+| 2 | 初始化日志（`logs/hub-light.log.<date>`，按日滚动、保留 30 份） | 降级到 stderr |
 | 3 | 安装 panic hook（`logs/panic.log`） | 继续 |
 | 4 | 注册插件：单实例 → 深链 → opener | 启动失败 |
-| 5 | `bootstrap::init_state`：加载设置 → 打开 DB 并跑迁移 → 组装 `AppState` | 弹窗 + 日志，退出 |
-| 6 | 安装托盘 | 视为致命：没有托盘时关闭窗口将无法恢复 |
-| 7 | 监听深链回调；scheme 注册丢到线程池（不阻塞） | 仅告警，可用手动粘贴兜底 |
-| 8 | 派生后台任务：凭据懒加载、代理启动、保留期清理（启动后一次 + 每 24h） | 记录错误并继续 |
-| 9 | 注册 19 个 IPC 命令，进入事件循环 | — |
+| 5 | `bootstrap::init_state`：加载设置 → 打开 DB 并跑迁移 → 组装 `AppState` | 弹窗 + 日志，`exit(1)` |
+| 6 | 用 `WebviewWindowBuilder::from_config` 创建主窗口（`label=main`） | 弹窗 + 日志，`exit(1)`（WebView2 缺失也走这里） |
+| 7 | 安装托盘 | 视为致命：没有托盘时关闭窗口将无法恢复 |
+| 8 | 监听深链回调；scheme 注册丢到线程池（不阻塞） | 仅告警，可用手动粘贴兜底 |
+| 9 | 派生后台任务：凭据懒加载、代理启动、保留期清理（启动后一次 + 每 24h） | 记录错误并继续 |
+| 10 | 注册 20 个 IPC 命令，进入事件循环 | — |
 
 每个阶段用 `bootstrap::PhaseTimer` 记一行 `phase` / `elapsed_ms`，启动慢时先看这几行日志。
 
-关闭窗口只 `hide`，托盘"退出"先置 `quitting=true` 再 `app.exit(0)`。二次启动由单实例插件接管：聚焦已有窗口、补发 `app://second-instance`、并把深链参数转发给首实例。
+关闭窗口只 `hide`；托盘"退出"先置 `quitting=true`、删除 `proxy.port`，异步停代理后 `app.exit(0)`。`RunEvent::Exit` 统一写 `exit.log`（`record_exit_if_running`）并冲刷日志写入器，因此"写了退出记录但随后被杀"不会再被误判成正常退出。二次启动由单实例插件接管：聚焦已有窗口、补发 `app://second-instance`、并把深链参数转发给首实例。
 
 ## 5. 三条数据流
 
@@ -98,8 +99,8 @@ flowchart LR
 2. **凭据不落明文**：token 只存在于 Rust 内存与 `auth.bin` 密文；前端、日志、数据库都不出现明文。
 3. **登录代次（epoch）**：注销递增代次，所有写入口持写锁校验，旧循环不能把凭据写回来。
 4. **代理入口只信回环**：只接受回环 Host；带 `Origin` 的请求一律 403（防浏览器页面读取 `/status` 与额度）。
-5. **数据库只加不改**：迁移只做加列/加索引/加事务，不改既有列语义；每步带结构探测，可重入。
-6. **本地日唯一**：请求列表与日聚合共用 `usage::local_day` 一个定义。
+5. **数据库只加不改**：迁移只做加列/加索引/加事务，不改既有列语义；结构探测能跳过的步骤可重入，数据回填类步骤（如 0005）做成幂等且不依赖探测。
+6. **本地日唯一**：请求列表、日聚合与迁移回填共用 `usage::local_day` / `date(started_at,'localtime')` 一个定义。
 
 ## 7. 目录结构
 

@@ -112,7 +112,7 @@ export function QuotaCard({
       ) : null}
 
       {errorText ? (
-        <p className={`inline-message inline-message--${stale ? 'warn' : 'error'}`} role="status">
+        <p className={`inline-message inline-message--${stale ? 'warn' : 'error'}`} role="alert">
           {errorText}
         </p>
       ) : !hasQuota ? (

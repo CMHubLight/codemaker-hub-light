@@ -89,6 +89,20 @@ pub async fn auth_start_login(
     })
 }
 
+/// 取消等待中的浏览器登录：清掉后端 pending 并恢复发起登录前的相位。
+///
+/// v0.2.3 之后后台 tick 在 `PendingLogin` 期间停机，只在前端「取消等待」会让
+/// pending 永久有效、后台续期/校验/额度全部停摆；因此取消必须是后端动作。
+#[tauri::command]
+pub async fn auth_cancel_login(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
+    let status = state.auth.cancel_login().await;
+    let _ = app.emit("auth://state", &status);
+    Ok(status)
+}
+
 /// 账号 + AuthKey 直登（不打开浏览器、不轮询）；成功后保存凭据并切换登录态。
 ///
 /// `auth_key` 只在本命令调用栈与 Rust 侧加密文件中出现：不写日志、不返回前端。
@@ -214,12 +228,13 @@ pub async fn quota_get(
 ) -> Result<Option<QuotaInfo>, String> {
     let force = force.unwrap_or(false);
     let gateway_url = state.settings.read().await.gateway_url.clone();
-    let quota = state
+    let (quota, updated) = state
         .auth
         .refresh_quota(&gateway_url, force)
         .await
         .map_err(|err| err.to_string())?;
-    if force {
+    // 只有数值真的变化才广播：后台每 5 分钟写库成功不再触发前端整页重取。
+    if force && updated {
         if let Some(quota) = &quota {
             let _ = app.emit("quota://updated", quota);
         }

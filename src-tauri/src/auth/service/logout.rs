@@ -38,6 +38,7 @@ impl AuthService {
         state.credentials = None;
         state.profile = None;
         state.pending = None;
+        state.pre_login_phase = None;
         state.models.clear();
         state.offline_grace = false;
         state.credentials_valid = false;

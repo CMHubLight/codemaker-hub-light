@@ -89,7 +89,7 @@ pub(super) async fn count_tokens(State(state): State<RoutesState>, request: Requ
 pub(super) async fn internal_quota(State(state): State<RoutesState>) -> Response {
     let quota = crate::db::blocking::run(&state.db, |db| {
         let conn = db.conn()?;
-        repo::latest_quota_snapshot(&conn, "global")
+        repo::latest_quota_snapshot(&conn, "global", None)
     })
     .await;
     match quota {

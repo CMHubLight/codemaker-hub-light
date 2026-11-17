@@ -117,6 +117,14 @@ pub const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "accept-encoding",
+    // 来源链头由代理重写（这里选择不转发）：客户端可伪造它们污染网关侧日志/限流。
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "forwarded",
+    "via",
+    "referer",
 ];
 
 /// hop-by-hop 头（请求与响应都要去）。
@@ -211,10 +219,19 @@ pub fn build_upstream_headers(
     incoming: &HeaderMap,
     credentials: &CredentialsSnapshot,
 ) -> HeaderMap {
+    // RFC 7230 §6.1：`Connection` 头点名的字段同样是 hop-by-hop，必须一并剥掉。
+    let connection_tokens: Vec<String> = incoming
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
     let mut headers = HeaderMap::new();
     for (name, value) in incoming.iter() {
         let name_str = name.as_str();
-        if is_stripped_request_header(name_str) {
+        if is_stripped_request_header(name_str) || connection_tokens.iter().any(|t| t == name_str) {
             continue;
         }
         headers.append(name.clone(), value.clone());

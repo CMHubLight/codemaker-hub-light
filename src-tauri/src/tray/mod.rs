@@ -101,10 +101,18 @@ fn quit(app: &AppHandle) {
             .quitting
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    // 先留正常退出记录再退出：托盘退出是应用内唯一能解释「应用消失」的路径，
-    // 留下 exit.log 后，下一次启动就不会把它误报成"未正常退出"。
-    if let Some(state) = app.try_state::<crate::state::AppState>() {
-        crate::shutdown::record_exit(state.data_dir(), "tray-quit");
-    }
-    app.exit(0);
+    // 优雅停机：删端口文件 → 停代理（最多 5s）→ 退出。
+    // `exit.log` 不在这里写：交给 `RunEvent::Exit` 统一记录并冲刷日志，
+    // 否则"写了 exit.log 但随后卡住被强杀"会被误判成正常退出。
+    let Some(state) = app.try_state::<crate::state::AppState>() else {
+        app.exit(0);
+        return;
+    };
+    crate::settings::remove_proxy_port(state.data_dir());
+    let proxy = state.proxy.clone();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        proxy.stop().await;
+        handle.exit(0);
+    });
 }

@@ -6,7 +6,7 @@
 
 use crate::proxy::{
     forward::ApiFormat,
-    sse_frames::{self, SSE_PARSE_LIMIT},
+    sse_frames::{self, SseBuffer, SSE_PARSE_LIMIT},
     usage_parser::{self, CostInfo, CostSource, TokenUsage},
 };
 
@@ -17,14 +17,17 @@ pub struct TeeOutcome {
     pub cost: CostInfo,
     /// 缓冲超过解析上限后停止解析（字节仍已透传）。
     pub parse_overflow: bool,
+    /// 上游在流里用 `{"error":…}` 表示失败（HTTP 仍是 200）。
+    pub upstream_error: bool,
 }
 
 /// 增量 SSE 观察器。
 pub struct SseTee {
     format: ApiFormat,
     credit_to_yuan: f64,
-    buffer: Vec<u8>,
+    buffer: SseBuffer,
     parse_overflow: bool,
+    upstream_error: bool,
     usage: TokenUsage,
     cost: CostInfo,
 }
@@ -34,54 +37,50 @@ impl SseTee {
         Self {
             format,
             credit_to_yuan,
-            buffer: Vec::new(),
+            buffer: SseBuffer::new(),
             parse_overflow: false,
+            upstream_error: false,
             usage: TokenUsage::default(),
             cost: CostInfo::none(),
         }
     }
 
     /// 记录一个已转发的字节块并解析其中完整 SSE 帧。
-    ///
-    /// 帧直接从缓冲切片里解析（不再 `to_vec`），整块处理完只 compact 一次。
     pub fn push(&mut self, chunk: &[u8]) {
         if self.parse_overflow {
             return;
         }
-        let mut buffer = std::mem::take(&mut self.buffer);
-        buffer.extend_from_slice(chunk);
-
-        let mut consumed = 0;
-        while let Some((end, next)) = sse_frames::find_frame_end(&buffer[consumed..]) {
-            let (end, next) = (consumed + end, consumed + next);
-            if let Some(data) = sse_frames::frame_data(&buffer[consumed..end]) {
+        self.buffer.push(chunk);
+        while let Some(frame) = self.buffer.next_frame() {
+            if let Some(data) = sse_frames::frame_data(&frame) {
                 self.observe_data(data.as_ref());
             }
-            consumed = next;
         }
-        if consumed > 0 {
-            buffer.drain(..consumed);
-        }
-
-        if buffer.len() > SSE_PARSE_LIMIT {
+        if self.buffer.len() > SSE_PARSE_LIMIT {
             self.parse_overflow = true;
-            buffer.clear();
+            self.buffer.clear();
         }
-        self.buffer = buffer;
+    }
+
+    /// 上游是否在 200 流里返回过错误帧。
+    pub fn took_upstream_error(&self) -> bool {
+        self.upstream_error
     }
 
     /// 结束：处理没有末尾空行的最后一帧，并返回观测结果。
     pub fn finish(mut self) -> TeeOutcome {
-        if !self.parse_overflow && !self.buffer.is_empty() {
-            let rest = std::mem::take(&mut self.buffer);
-            if let Some(data) = sse_frames::frame_data(&rest) {
-                self.observe_data(data.as_ref());
+        if !self.parse_overflow {
+            if let Some(rest) = self.buffer.take_rest() {
+                if let Some(data) = sse_frames::frame_data(&rest) {
+                    self.observe_data(data.as_ref());
+                }
             }
         }
         TeeOutcome {
             usage: self.usage,
             cost: self.cost,
             parse_overflow: self.parse_overflow,
+            upstream_error: self.upstream_error,
         }
     }
 
@@ -93,6 +92,10 @@ impl SseTee {
             // 非 JSON（心跳等）不影响 usage。
             return;
         };
+        // 上游用 200 + in-band error 表示失败：客户端看得到，账务也必须看得到。
+        if payload.get("error").is_some() {
+            self.upstream_error = true;
+        }
         if let Some(usage) = usage_parser::parse_usage(self.format, &payload) {
             self.usage.merge(usage);
         }

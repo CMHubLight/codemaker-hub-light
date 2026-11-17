@@ -135,6 +135,9 @@ impl AuthGateway {
             // 不跟随重定向：X-Access-Token 是自定义头，reqwest 跨主机重定向只剥离
             // authorization/cookie 等标准头，token 会跟着跳到 Location 主机。
             .redirect(reqwest::redirect::Policy::none())
+            // 明确不用环境里的 HTTP(S)_PROXY：token 只应发往用户配置的网关，
+            // 不能被系统代理（或 http 回环网关时的中间人）接管。
+            .no_proxy()
             .user_agent(concat!("codemaker-hub-light/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| {

@@ -34,6 +34,10 @@ OpenAI SDK  ─┘     (injects account credentials, records usage)
 - A reachable **compatible gateway** (see [gateway contract](docs/gateway-contract.md))
 - To build from source: Node.js ≥ 20.19, pnpm, Rust stable (MSVC), Visual Studio Build Tools + Windows SDK, WebView2 Runtime
 
+## Download
+
+Prebuilt Windows installers are attached to [GitHub Releases](https://github.com/CMHubLight/codemaker-hub-light/releases/latest) (`CodeMaker-Hub-Light_<version>_x64-setup.exe`, NSIS, per-user install). Releases are currently **unsigned** — verify the SHA-256 published with the release, or build from the matching tag source zip.
+
 ## Build and run
 
 ```powershell
@@ -47,7 +51,7 @@ Artifacts:
 
 ```text
 src-tauri/target/release/codemaker-hub-light.exe
-src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.3_x64-setup.exe
+src-tauri/target/release/bundle/nsis/CodeMaker Hub Light_0.2.4_x64-setup.exe
 ```
 
 > Do **not** run `cargo build --release` on its own: Tauri needs the `custom-protocol` feature to embed the frontend. See [development notes](docs/development.md).
@@ -149,6 +153,7 @@ Release installers are intended to be signed through SignPath Foundation: **free
 | `v0.2.1` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
 | `v0.2.2` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
 | `v0.2.3` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
+| `v0.2.4` | **Unsigned** — verify with the SHA-256 in the release notes, or build from the tag |
 | Next releases | Signed by SignPath Foundation after manual approval |
 
 The certificate is issued to SignPath Foundation, so Windows shows `SignPath Foundation` as the publisher. Verify a download with `Get-AuthenticodeSignature` or `signtool verify /pa`, or compare the SHA-256 published with each release.

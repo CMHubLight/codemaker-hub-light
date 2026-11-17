@@ -78,7 +78,8 @@ pub(crate) fn init_state(
     // 1) 设置：解析/校验失败时备份原文件并回退默认值，不让手改坏的文件卡死启动。
     let loaded_settings = settings::Settings::load_or_recover(data_dir);
     tracing::info!(
-        gateway = %loaded_settings.gateway_url,
+        // 日志可能被外发排障：URL 只打 scheme://host，去掉 userinfo/path/query。
+        gateway = %settings::redact_gateway_url(&loaded_settings.gateway_url),
         proxy_bind = %loaded_settings.proxy_bind,
         proxy_port = loaded_settings.proxy_port,
         record_body = loaded_settings.record_body,

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
 import { useCommand } from '../lib/async'
 import { useTauriEvent } from '../lib/events'
 import type { AuthStatus, LoginSession } from '../lib/types'
@@ -9,6 +10,25 @@ const DEFAULT_POLL_INTERVAL_MS = 2000
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000
 /** 连续轮询命令失败达到该次数才判定登录失败（与后端 MAX_CONSECUTIVE_NETWORK_ERRORS 一致）。 */
 const MAX_POLL_FAILURES = 3
+
+/**
+ * 等待登录已过去多久。
+ *
+ * 优先用后端 `pending_login_started_at`：应用重启后再进登录页时本地没有发起时刻，
+ * 只有后端字段能判定超时（N-P3-30）。两者都没有时返回 null，不误杀登录。
+ */
+export function loginElapsedMs(
+  backendStartedAt: string | null,
+  localStartedAt: number | null,
+  now = Date.now()
+): number | null {
+  if (backendStartedAt) {
+    const parsed = Date.parse(backendStartedAt)
+    if (!Number.isNaN(parsed)) return Math.max(0, now - parsed)
+  }
+  if (localStartedAt != null) return Math.max(0, now - localStartedAt)
+  return null
+}
 
 interface LoginProps {
   /** 浏览器预览（无 Tauri 后端）时展示“跳过登录”入口。 */
@@ -52,14 +72,17 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
   const [manualBusy, setManualBusy] = useState(false)
 
   const startedAt = useRef<number | null>(null)
+  /** 后端 pending 的发起时刻（RFC3339）：应用重启后本地 startedAt 为空，超时只能靠它。 */
+  const pendingStartedAt = useRef<string | null>(initialStatus?.pending_login_started_at ?? null)
   const pollFailures = useRef(0)
   const finished = useRef(false)
   const pollNowRef = useRef<(() => void) | null>(null)
-  // 登录相关的三条命令各自一个 runner：最新调用获胜 + 卸载后结果作废 + 错误归一。
+  // 登录相关的命令各自一个 runner：最新调用获胜 + 卸载后结果作废 + 错误归一。
   const { run: runPollStatus } = useCommand<AuthStatus>('auth_poll_status')
   const { run: runStartLogin } = useCommand<LoginSession>('auth_start_login')
   const { run: runSubmitDeepLink } = useCommand<AuthStatus>('auth_submit_deep_link')
   const { run: runAuthKeyLogin } = useCommand<AuthStatus>('auth_login_with_auth_key')
+  const { run: runCancelLogin } = useCommand<AuthStatus>('auth_cancel_login')
 
   // AuthKey 直登（账号 + AuthKey，不打开浏览器/不轮询）。
   const [authKeyUser, setAuthKeyUser] = useState('')
@@ -67,6 +90,8 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
   const [authKeyVisible, setAuthKeyVisible] = useState(false)
   const [authKeyBusy, setAuthKeyBusy] = useState(false)
   const [authKeyError, setAuthKeyError] = useState<string | null>(null)
+  /** 「取消等待」要等后端清掉 pending，按钮需要自己的在飞态。 */
+  const [cancelBusy, setCancelBusy] = useState(false)
 
   const finishLogin = useCallback(async () => {
     if (finished.current) return
@@ -79,6 +104,8 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
 
   /** AuthKey 直登：本地先校验非空，再交给 Rust 侧完成 token 交换与凭据落盘。 */
   async function submitAuthKeyLogin() {
+    // 两条登录入口不能同时收尾：按钮已禁用，Enter 提交/重复点击也要挡住。
+    if (authKeyBusy || phase === 'waiting' || phase === 'starting') return
     const user = authKeyUser.trim()
     const key = authKeyValue.trim()
     if (!user || !key) {
@@ -114,10 +141,10 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
       return
     }
     if (status.state === 'pending') {
-      setPhase((current) => (current === 'waiting' ? current : 'waiting'))
-      if (status.message && !status.message.startsWith('等待浏览器')) {
-        setNotice(status.message)
-      }
+      // 相位做显式分支：只有用户正在发起/等待时才接受 pending。
+      // 取消等待后迟到的 pending 广播不能把页面又拽回等待态（N-P3-30）。
+      setPhase((current) => (current === 'starting' || current === 'waiting' ? 'waiting' : current))
+      pendingStartedAt.current = status.pending_login_started_at ?? pendingStartedAt.current
     }
   })
 
@@ -166,9 +193,11 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
       inFlight = true
 
       try {
-        const started = startedAt.current
+        // 超时以后端 pending 起点为准：应用重启后再进登录页时本地 startedAt 为空，
+        // 只靠本地时刻会永远等下去（N-P3-30）。
         const timeoutMs = (session?.timeout_secs ?? DEFAULT_TIMEOUT_MS / 1000) * 1000
-        if (started != null && Date.now() - started > timeoutMs) {
+        const elapsed = loginElapsedMs(pendingStartedAt.current, startedAt.current)
+        if (elapsed != null && elapsed > timeoutMs) {
           stop()
           setPhase('error')
           setMessage('登录超时，请重试；若浏览器或网络策略拦截了回调，可改用其它网络后重试。')
@@ -197,6 +226,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
 
         const status = outcome.data
         pollFailures.current = 0
+        pendingStartedAt.current = status.pending_login_started_at ?? pendingStartedAt.current
 
         if (status.state === 'authenticated') {
           stop()
@@ -216,9 +246,8 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
           return
         }
 
-        if (status.message && !status.message.startsWith('等待浏览器')) {
-          setNotice(status.message)
-        }
+        // pending 的说明由等待态的固定文案承担：不再用中文前缀判断哪些 message
+        // 值得展示（后端文案一改就失效，N-P3-30）。
         const intervalMs = (session?.poll_interval_secs ?? DEFAULT_POLL_INTERVAL_MS / 1000) * 1000
         schedule(intervalMs)
       } finally {
@@ -253,6 +282,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
   async function startLogin() {
     finished.current = false
     pollFailures.current = 0
+    pendingStartedAt.current = null
     setPhase('starting')
     setMessage(null)
     setNotice(null)
@@ -282,12 +312,44 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
     )
   }
 
-  function cancelWaiting() {
-    startedAt.current = null
-    setSession(null)
-    setNotice(null)
-    setMessage(null)
-    setPhase('idle')
+  async function cancelWaiting() {
+    if (cancelBusy) return
+    setCancelBusy(true)
+    try {
+      // 取消必须通知后端：只改本地 state 会让 pending 永不过期、后台 tick 无限停摆（N-P2-8）。
+      const outcome = await runCancelLogin()
+      if (outcome.status === 'stale') return
+      if (outcome.status === 'error') {
+        setNotice(`取消等待失败：${outcome.error.raw}；请重试。`)
+        return
+      }
+      startedAt.current = null
+      pendingStartedAt.current = null
+      setSession(null)
+      setNotice(null)
+      setMessage(null)
+      const status = outcome.data
+      if (status.state === 'authenticated') {
+        // 后端恢复了发起登录前的登录态：直接进应用，不要把人留在登录页。
+        await finishLogin()
+        return
+      }
+      if (status.state === 'error' || status.state === 'reauth_required') {
+        setPhase('error')
+        setMessage(status.message ?? '已取消等待，但登录状态需要重新确认。')
+        return
+      }
+      setPhase('idle')
+    } finally {
+      setCancelBusy(false)
+    }
+  }
+
+  /** AuthKey 输入框回车直接提交：键盘用户不必再去找「AuthKey 登录」按钮（N-P3-34）。 */
+  function submitAuthKeyOnEnter(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    void submitAuthKeyLogin()
   }
 
   async function submitManualCallback() {
@@ -332,7 +394,8 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
     }
   }
 
-  const busy = phase === 'starting' || phase === 'waiting'
+  // AuthKey 登录在飞时主「登录」按钮也必须禁用：两条流程会竞争同一个登录代次（N-P2-4）。
+  const busy = phase === 'starting' || phase === 'waiting' || authKeyBusy
   const title =
     phase === 'waiting' ? '等待浏览器完成登录' : phase === 'error' ? '登录未完成' : '登录以继续'
 
@@ -394,17 +457,24 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
             onClick={() => void startLogin()}
             disabled={busy}
           >
-            {phase === 'starting'
-              ? '正在唤起浏览器…'
-              : phase === 'error'
-                ? '重新登录'
-                : phase === 'waiting'
-                  ? '等待中…'
-                  : '登录'}
+            {authKeyBusy
+              ? 'AuthKey 登录中…'
+              : phase === 'starting'
+                ? '正在唤起浏览器…'
+                : phase === 'error'
+                  ? '重新登录'
+                  : phase === 'waiting'
+                    ? '等待中…'
+                    : '登录'}
           </button>
           {phase === 'waiting' ? (
-            <button type="button" className="btn btn--ghost btn--block" onClick={cancelWaiting}>
-              取消等待
+            <button
+              type="button"
+              className="btn btn--ghost btn--block"
+              onClick={() => void cancelWaiting()}
+              disabled={cancelBusy}
+            >
+              {cancelBusy ? '正在取消…' : '取消等待'}
             </button>
           ) : null}
         </div>
@@ -422,6 +492,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
                 type="text"
                 value={authKeyUser}
                 onChange={(event) => setAuthKeyUser(event.target.value)}
+                onKeyDown={submitAuthKeyOnEnter}
                 placeholder="账号名"
                 autoComplete="username"
                 spellCheck={false}
@@ -434,6 +505,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
                 type={authKeyVisible ? 'text' : 'password'}
                 value={authKeyValue}
                 onChange={(event) => setAuthKeyValue(event.target.value)}
+                onKeyDown={submitAuthKeyOnEnter}
                 placeholder="AuthKey"
                 autoComplete="off"
                 spellCheck={false}
@@ -443,6 +515,7 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
                 type="button"
                 className="btn btn--ghost btn--sm"
                 onClick={() => setAuthKeyVisible((visible) => !visible)}
+                aria-pressed={authKeyVisible}
               >
                 {authKeyVisible ? '隐藏' : '显示'}
               </button>
@@ -479,7 +552,11 @@ export function Login({ previewMode, initialStatus = null, onAuthenticated, onPr
             提交后前端会立即清除输入框，解析与保存只在 Rust 侧完成。
           </p>
           <div className="login-url-row">
+            <label className="visually-hidden" htmlFor="manual-callback-url">
+              手动粘贴的回调链接
+            </label>
             <input
+              id="manual-callback-url"
               className="login-url-input"
               type="text"
               value={manualUrl}

@@ -3,8 +3,8 @@
 use chrono::{SecondsFormat, Utc};
 
 use crate::{
-    db::repo::{RequestRow, UsageDayRow, UsageDimRow, UsageTotalsRow},
-    usage::{DailyUsage, ModelUsage, RecentRequest, UsageSummary, UsageTotals},
+    db::repo::{RequestRow, UsageTotalsRow},
+    usage::{RecentRequest, UsageSummary, UsageTotals},
 };
 
 /// 统一保留 4 位小数（UI 展示精度）。
@@ -16,11 +16,17 @@ pub fn round4(value: f64) -> f64 {
 }
 
 /// 比率（0..=1），分母为 0 时返回 None（前端据此显示“—”而非 0）。
+///
+/// 分子理论上不应超过分母，但异常/历史数据（重试重复计数、手工修库、聚合口径
+/// 不一致）可能给出 >100% 或负数；统一 clamp 到 0..=1，避免 UI 出现 "120%"
+/// 命中率或负比率。
 pub fn ratio(numerator: i64, denominator: i64) -> Option<f64> {
     if denominator <= 0 {
         return None;
     }
-    Some(round4(numerator as f64 / denominator as f64))
+    Some(round4(
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0),
+    ))
 }
 
 /// 总量行 → 前端 `UsageTotals`。
@@ -50,44 +56,10 @@ pub fn totals_from_row(row: &UsageTotalsRow) -> UsageTotals {
     }
 }
 
-/// 按日聚合行 → 前端趋势点。
-pub fn daily_from_rows(rows: Vec<UsageDayRow>) -> Vec<DailyUsage> {
-    rows.into_iter()
-        .map(|row| DailyUsage {
-            date: row.day,
-            requests: row.totals.request_count,
-            tokens: row.totals.input_tokens
-                + row.totals.output_tokens
-                + row.totals.cache_read_tokens
-                + row.totals.cache_write_tokens,
-            cost_yuan: round4(row.totals.cost_yuan),
-        })
-        .collect()
-}
-
-/// 维度聚合行 → 前端模型分布。
-pub fn models_from_rows(rows: Vec<UsageDimRow>) -> Vec<ModelUsage> {
-    rows.into_iter()
-        .map(|row| ModelUsage {
-            model: if row.key.is_empty() {
-                "unknown".to_string()
-            } else {
-                row.key
-            },
-            requests: row.totals.request_count,
-            tokens: row.totals.input_tokens
-                + row.totals.output_tokens
-                + row.totals.cache_read_tokens
-                + row.totals.cache_write_tokens,
-            cost_yuan: round4(row.totals.cost_yuan),
-        })
-        .collect()
-}
-
 /// 请求状态的**唯一定义**：落库列 `status_kind`、界面标签、筛选条件都用它。
 ///
 /// 返回 `success | error | cancelled | unknown`。改这里的判定必须同步
-/// `migrations/0003_request_day_status.sql` 里的历史回填 CASE。
+/// `migrations/0003_request_status_kind.sql` 里的历史回填 CASE（0005 的回填复用同一 CASE）。
 pub fn status_kind(error_kind: Option<&str>, status_code: Option<i64>) -> &'static str {
     match error_kind {
         Some(kind)
@@ -136,18 +108,9 @@ pub fn recent_from_rows(rows: &[RequestRow]) -> Vec<RecentRequest> {
 }
 
 /// 组装概览汇总。
-pub fn build_summary(
-    today: UsageTotals,
-    month: UsageTotals,
-    daily: Vec<DailyUsage>,
-    models: Vec<ModelUsage>,
-    recent: Vec<RecentRequest>,
-) -> UsageSummary {
+pub fn build_summary(today: UsageTotals, recent: Vec<RecentRequest>) -> UsageSummary {
     UsageSummary {
         today,
-        month,
-        daily,
-        models,
         recent,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     }
@@ -210,6 +173,19 @@ mod tests {
         assert_eq!(totals.cache_hit_rate, None);
         assert_eq!(totals.error_rate, None);
         assert_eq!(totals.avg_latency_ms, None);
+    }
+
+    /// 比率必须落在 0..=1：分子超过分母（异常数据）clamp 到 1，负数 clamp 到 0；
+    /// 分母 <= 0 仍是 None（"无数据"不能用 0 表示）。
+    #[test]
+    fn ratio_is_clamped_to_unit_interval() {
+        assert_eq!(ratio(1, 2), Some(0.5));
+        assert_eq!(ratio(0, 5), Some(0.0));
+        assert_eq!(ratio(3, 2), Some(1.0), "超过 100% 的比率应 clamp 到 1");
+        assert_eq!(ratio(-1, 2), Some(0.0), "负比率应 clamp 到 0");
+        assert_eq!(ratio(i64::MAX, 1), Some(1.0));
+        assert_eq!(ratio(0, 0), None, "分母为 0 表示无数据");
+        assert_eq!(ratio(1, -2), None, "分母为负同样表示无数据");
     }
 
     #[test]

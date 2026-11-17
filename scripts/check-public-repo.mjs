@@ -14,11 +14,13 @@
  * 退出码：0 通过；1 有失败项。
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const ROOT = process.env.CHECK_REPO_ROOT
+  ? resolve(process.env.CHECK_REPO_ROOT)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SELF = 'scripts/check-public-repo.mjs'
 
 const failures = []
@@ -36,12 +38,15 @@ function read(relPath) {
   return readFileSync(join(ROOT, relPath), 'utf8')
 }
 
-/** 读取 Markdown 中 ```text name=xxx 形式的清单块。 */
+/** 读取 Markdown 中 ```text name=xxx 形式的清单块；同名重复直接失败。 */
 function namedBlocks(markdown) {
   const blocks = new Map()
   const fence = /```[a-zA-Z]*[ \t]+name=([a-z0-9-]+)[ \t]*\r?\n([\s\S]*?)```/g
   let match
   while ((match = fence.exec(markdown)) !== null) {
+    if (blocks.has(match[1])) {
+      fail('文档/代码', `清单块 name=${match[1]} 重复定义（后一个会静默覆盖前一个）`)
+    }
     const items = match[2]
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -70,12 +75,22 @@ function compareSet(scope, docLabel, docItems, codeLabel, codeItems) {
 // 仓库反而把它保护的词公开了。维护者本地可设 REDACTION_TERMS_FILE 指向一份
 // gitignored 词表（每行一个词，# 开头为注释）做更严格的扫描；CI 只跑通用规则。
 const GENERIC_TERMS = [
-  ['本机绝对路径', /C:\\Users\\/i],
+  // 盘符 + 常见开发/用户目录（真实本机路径）；不要匹配文档里的 `C:\data` 这类夹具。
+  [
+    '本机绝对路径',
+    /[A-Za-z]:\\(?:Users|Documents|Desktop|Downloads|Code|dev|repo|projects|src)\\/i
+  ],
+  ['UNC 路径', /\\\\[A-Za-z0-9._-]+\\[A-Za-z0-9$._-]+/],
+  ['类 Unix 用户主目录', /\/home\/[a-z_][a-z0-9_-]*\//i],
   ['企业/内网域名', /\.(?:internal|intra|corp)\b/i],
   ['公司/事业部字样', /事业部|事业群/],
   ['个人邮箱域名', /@(?:qq|163|126|gmail|outlook)\.com/i],
-  ['API 凭据形状', /\b(?:sk-[A-Za-z0-9]{20,}|(?:ghp|gho|ghs)_[A-Za-z0-9]{20,})\b/],
-  ['私钥块', /-----BEGIN [A-Z ]*PRIVATE KEY-----/]
+  [
+    'API 凭据形状',
+    /\b(?:sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|(?:ghp|gho|ghs)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b/
+  ],
+  ['私钥块', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['JWT 形状', /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/]
 ]
 
 function escapeRegExp(text) {
@@ -85,7 +100,12 @@ function escapeRegExp(text) {
 /** 读取本地词表（可选，不随仓库分发）。 */
 function localTerms() {
   const file = process.env.REDACTION_TERMS_FILE
-  if (!file || !existsSync(file)) return []
+  if (!file) return []
+  if (!existsSync(file)) {
+    // 显式指定了词表却读不到：静默放过会让"门禁绿"被误读成"已脱敏"。
+    fail('敏感信息', `REDACTION_TERMS_FILE 指向的文件不存在：${file}`)
+    return []
+  }
   return readFileSync(file, 'utf8')
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -97,8 +117,8 @@ const FORBIDDEN = [
   ...localTerms().map((term) => ['本地词表', new RegExp(escapeRegExp(term), 'i')])
 ]
 
-/** 允许出现关键字的文件：本脚本自身（它必须写出这些规则）。 */
-const SCAN_EXEMPT = new Set([SELF])
+/** 允许出现关键字的文件：本脚本自身与其负向测试（必须写出坏样本）。 */
+const SCAN_EXEMPT = new Set([SELF, 'scripts/check-public-repo.test.mjs'])
 
 // ---------------------------------------------------------------- 主流程
 
@@ -106,9 +126,20 @@ const files = trackedFiles()
 const tracked = new Set(files)
 
 // 1. 敏感信息
+const ARCHIVE_EXTENSIONS = ['.zip', '.7z', '.rar', '.tar', '.gz', '.tgz']
+const BINARY_EXTENSIONS = [
+  '.ico', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.exe', '.dll', '.so', '.dylib',
+  '.woff', '.woff2', '.ttf', '.pdf'
+]
+const MAX_SCAN_BYTES = 5 * 1024 * 1024
 for (const relPath of files) {
   if (SCAN_EXEMPT.has(relPath)) continue
-  if (relPath.endsWith('.ico') || relPath.endsWith('.png') || relPath.endsWith('.lock')) continue
+  if (ARCHIVE_EXTENSIONS.some((ext) => relPath.toLowerCase().endsWith(ext))) {
+    fail('敏感信息', `${relPath} 是归档文件：必须先解包审查再入库，门禁无法扫描其内容`)
+    continue
+  }
+  if (BINARY_EXTENSIONS.some((ext) => relPath.toLowerCase().endsWith(ext))) continue
+  if (statSync(join(ROOT, relPath)).size > MAX_SCAN_BYTES) continue
   let text
   try {
     text = read(relPath)
@@ -159,10 +190,23 @@ for (const relPath of markdownFiles) {
 }
 
 // 4. 文档与代码一致
+const EXPECTED_SOURCES = [
+  'src-tauri/src/lib.rs',
+  'src-tauri/src/settings.rs',
+  'src-tauri/src/proxy/routes/mod.rs',
+  'src/lib/events.ts'
+]
+for (const relPath of EXPECTED_SOURCES) {
+  // 重构移动/重命名这些文件时必须同步更新本脚本：否则对账会静默停用。
+  if (!tracked.has(relPath)) {
+    fail('文档/代码', `对账源文件缺失：${relPath}（如已重命名，请同步 scripts/check-public-repo.mjs）`)
+  }
+}
+
 const doc = (relPath) => (tracked.has(relPath) ? namedBlocks(read(relPath)) : new Map())
 
 const ipcDoc = doc('docs/ipc-api.md')
-if (tracked.has('src-tauri/src/lib.rs')) {
+if (tracked.has('src-tauri/src/lib.rs') && tracked.has('src/lib/events.ts')) {
   const lib = read('src-tauri/src/lib.rs')
   const handler = lib.slice(lib.indexOf('generate_handler!['), lib.indexOf('])', lib.indexOf('generate_handler![')))
   const commands = [...handler.matchAll(/commands::\w+::(\w+)/g)].map((m) => m[1])
@@ -193,6 +237,38 @@ if (tracked.has('src-tauri/src/proxy/routes/mod.rs')) {
   const routes = read('src-tauri/src/proxy/routes/mod.rs')
   const paths = [...routes.matchAll(/\.route\("([^"]+)"/g)].map((m) => m[1])
   compareSet('文档/代码', 'docs/proxy.md name=proxy-routes', proxyDoc.get('proxy-routes'), 'routes/mod.rs', paths)
+}
+
+// 4b. 定量断言：版本号三处一致、文档里的命令数量与代码一致。
+const readJson = (relPath) => JSON.parse(read(relPath))
+const versionFiles = [
+  ['package.json', () => readJson('package.json').version],
+  ['src-tauri/Cargo.toml', () => read('src-tauri/Cargo.toml').match(/^version = "([^"]+)"/m)?.[1]],
+  ['src-tauri/tauri.conf.json', () => readJson('src-tauri/tauri.conf.json').version]
+]
+if (versionFiles.every(([relPath]) => tracked.has(relPath))) {
+  const versions = versionFiles.map(([relPath, readVersion]) => [relPath, readVersion()])
+  const distinctVersions = new Set(versions.map(([, version]) => version))
+  if (distinctVersions.size !== 1 || versions.some(([, version]) => !version)) {
+    fail('版本', `版本号不一致：${versions.map(([file, version]) => `${file}=${version ?? '<缺失>'}`).join(', ')}`)
+  }
+}
+
+if (tracked.has('src-tauri/src/lib.rs')) {
+  const lib = read('src-tauri/src/lib.rs')
+  const commandCount = (lib.slice(lib.indexOf('generate_handler![')).match(/commands::\w+::\w+/g) ?? []).length
+  for (const [relPath, pattern] of [
+    ['docs/ipc-api.md', /(\d+) 个 Tauri 命令/],
+    ['docs/README.md', /(\d+) 个命令、6 个事件/]
+  ]) {
+    if (!tracked.has(relPath)) continue
+    const match = read(relPath).match(pattern)
+    if (!match) {
+      fail('版本/计数', `${relPath} 缺少命令数量断言（应写「${commandCount} 个命令」）`)
+    } else if (Number(match[1]) !== commandCount) {
+      fail('版本/计数', `${relPath} 写 ${match[1]} 个命令，代码实际 ${commandCount} 个`)
+    }
+  }
 }
 
 // ---------------------------------------------------------------- 输出

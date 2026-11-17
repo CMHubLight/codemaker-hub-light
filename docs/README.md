@@ -20,7 +20,7 @@
 | [用量统计](usage.md) | token 与费用口径、账号级 vs 本机级、聚合、保留期、分页 | 对数字有疑问的人 |
 | [设置项](settings.md) | `settings.json` 每个键、默认值、校验、生效方式 | 使用者与维护者 |
 | [数据模型](data-model.md) | 表、索引、迁移机制、维护清理 | 想直接查库的人 |
-| [IPC 接口](ipc-api.md) | 19 个命令、6 个事件、参数与返回 | 改前端或写自动化的人 |
+| [IPC 接口](ipc-api.md) | 20 个命令、6 个事件、参数与返回 | 改前端或写自动化的人 |
 | [开发与构建](development.md) | 环境、命令、门禁、CI、打包坑、手工验收 | 贡献者 |
 | [排障手册](troubleshooting.md) | 症状 → 原因 → 动作 | 使用者与值班排查 |
 | [代码签名政策](code-signing-policy.md) | 签名提供方、验签方法、团队角色、隐私与系统改动声明 | 下载安装包的用户、上游审核方 |
@@ -57,7 +57,7 @@
 | [data-model.md](data-model.md) | `db-tables` | `src-tauri/migrations/*.sql` |
 | [proxy.md](proxy.md) | `proxy-routes` | `src-tauri/src/proxy/routes/mod.rs` |
 
-同一个脚本还会扫描敏感信息（内网地址、公司/部门名、个人账号、本机绝对路径、来源说明用语）并校验 Markdown 相对链接。
+同一个脚本还会扫描敏感信息（本机绝对路径/UNC/`/home`、企业与内网域名、个人邮箱域名、凭据形状、组织字样、归档文件）并校验 Markdown 相对链接；同名清单块重复、对账源文件缺失、显式指定但读不到的 `REDACTION_TERMS_FILE` 都会直接失败。负向用例在 `scripts/check-public-repo.test.mjs`（`pnpm test:scripts`）。
 
 ## 修改文档的规矩
 

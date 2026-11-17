@@ -116,6 +116,8 @@ pub(super) async fn forward_handler(
     // 单趟解析：翻译路由同时产出 upstream body / model / stream / token 估算；
     // 透传路由一次解析拿到 model + stream。
     let translation = route.translation;
+    // 直通 Chat 补 include_usage 后，生产者需要吞掉多出来的 usage-only 帧。
+    let mut drop_usage_frames = false;
     let (upstream_body, model, client_stream_requested, estimated_input_tokens) = match translation
     {
         Some(_) => match translate::anthropic_to_openai_request(&body) {
@@ -150,13 +152,21 @@ pub(super) async fn forward_handler(
             let envelope = forward::parse_envelope(&body);
             // OpenAI Chat 流式必须显式请求 usage，否则上游不回末帧 usage、本机账务
             // 恒记 0。翻译路由在请求构造时已补，这里补上直通路由；其余路由不动。
-            let body = if envelope.stream && route.api_format == ApiFormat::OpenAiChat {
-                forward::with_stream_usage(&body)
-                    .map(Bytes::from)
-                    .unwrap_or(body)
-            } else {
-                body
-            };
+            // 超过 4 MiB 的请求不做二次解析/重序列化（避免同时持有 4 份 body 副本），
+            // 这类请求仍可能记 0，由生产者的「usage 全 0」warn 暴露。
+            let mut rewritten = None;
+            if envelope.stream && route.api_format == ApiFormat::OpenAiChat {
+                if body.len() <= 4 * 1024 * 1024 {
+                    rewritten = forward::with_stream_usage(&body);
+                } else {
+                    warn!(
+                        bytes = body.len(),
+                        "请求体超过 4 MiB，跳过 stream_options 注入（本次 usage 可能为 0）"
+                    );
+                }
+            }
+            drop_usage_frames = rewritten.is_some();
+            let body = rewritten.map(Bytes::from).unwrap_or(body);
             (body, envelope.model, envelope.stream, 0)
         }
     };
@@ -184,7 +194,10 @@ pub(super) async fn forward_handler(
     {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
-            let status = if err.is_timeout() {
+            // 连接失败（DNS/拒绝/连接超时）按 502 记；只有响应阶段超时才记 504。
+            let status = if err.is_connect() {
+                StatusCode::BAD_GATEWAY
+            } else if err.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
                 StatusCode::BAD_GATEWAY
@@ -288,6 +301,47 @@ pub(super) async fn forward_handler(
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_sse = content_type.contains("text/event-stream");
+    // 翻译路由必须读原始字节：若上游无视 identity 仍压缩，剥掉 content-encoding 会把
+    // 压缩字节当成 JSON/SSE 解析（客户端拿到损坏正文）。这里直接失败并留一条账，
+    // 让"网关忽略 identity"从静默损坏变成可定位的 502。
+    if translation.is_some() {
+        let encoding = upstream_response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("identity");
+        if !encoding.eq_ignore_ascii_case("identity") && !is_sse {
+            state.info.note_error();
+            warn!(encoding, upstream = %upstream, "翻译路由收到压缩响应，拒绝解码并返回 502");
+            let context = base.into_context(
+                model,
+                request_bytes,
+                request_body_recorded,
+                upstream.clone(),
+                is_sse,
+            );
+            record_completion(
+                &state,
+                context,
+                RequestCompletion {
+                    body_truncated: request_body_truncated,
+                    ..RequestCompletion::failure(
+                        StatusCode::BAD_GATEWAY.as_u16() as i64,
+                        started.elapsed().as_millis() as i64,
+                        ErrorKind::UpstreamError,
+                        Utc::now(),
+                    )
+                },
+            )
+            .await;
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                route.api_format,
+                "upstream_encoding_unsupported",
+                "上游返回了压缩响应，代理无法翻译；请让网关对本机代理返回 identity 编码",
+            );
+        }
+    }
     if translation.is_some() {
         response_headers.remove(header::CONTENT_LENGTH);
         response_headers.remove(header::CONTENT_ENCODING);
@@ -302,6 +356,10 @@ pub(super) async fn forward_handler(
         );
     }
     let status_code = status.as_u16() as i64;
+    // 过滤 usage 帧会改变正文长度：保留上游 content-length 会让客户端读到截断的 body。
+    if drop_usage_frames {
+        response_headers.remove(header::CONTENT_LENGTH);
+    }
     let content_length_hint = upstream_response.content_length();
     let translation_model = model.clone().unwrap_or_default();
     let context = base.into_context(
@@ -316,6 +374,7 @@ pub(super) async fn forward_handler(
         policy,
         status_code,
         is_sse,
+        drop_usage_frames,
         translation,
         tee_format: route.usage_format(),
         estimated_input_tokens,

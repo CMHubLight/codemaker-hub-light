@@ -155,10 +155,8 @@ fn build_anthropic_message(value: &Value, request_model: &str) -> Value {
     let upstream_message = choice.and_then(|choice| choice.get("message"));
     let mut content = Vec::new();
 
-    if let Some(text) = upstream_message
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
+    if let Some(text) =
+        super::content_text(upstream_message.and_then(|message| message.get("content")))
     {
         content.push(json!({ "type": "text", "text": text }));
     }

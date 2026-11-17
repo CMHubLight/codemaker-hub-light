@@ -1,5 +1,6 @@
 import { Panel, PanelHeader } from '../../components/Panel'
 import { StatusPill } from '../../components/StatusPill'
+import type { PillStatus } from '../../components/StatusPill'
 import { formatDateTime } from '../../lib/format'
 import { formatUptime } from '../../lib/labels'
 import type { ProxyStatus } from '../../lib/types'
@@ -11,12 +12,17 @@ interface ProxyPanelProps {
   restartMessage: SaveState | null
   /** 已保存的配置端口：只和它比较才能判断后端是否发生端口回退。 */
   savedPort: number | null
+  /** 已保存新端口/网关但代理尚未重启：此时的端口差异是预期行为，不是回退。 */
+  restartPending: boolean
   /** 当前表单里的有效端口（未保存的编辑也会立即反映在展示地址上）。 */
   configuredPort: number
   configuredBind: string
   configuredGateway: string | null
   onRestart: () => void
+  /** 读取代理状态失败时重试。 */
+  onRetry: () => void
   restarting: boolean
+  /** 代理状态本身是否正在读取（与设置表单的加载态分开）。 */
   loading: boolean
 }
 
@@ -26,16 +32,20 @@ export function ProxyPanel({
   error,
   restartMessage,
   savedPort,
+  restartPending,
   configuredPort,
   configuredBind,
   configuredGateway,
   onRestart,
+  onRetry,
   restarting,
   loading
 }: ProxyPanelProps) {
   const baseUrl = proxy?.running ? proxy.base_url : `http://127.0.0.1:${configuredPort}`
-  // 注意：后端在“未运行”时返回的是默认端口（15721），回退提示只应在运行态比较。
-  const fallbackActive = proxy?.running === true && savedPort != null && proxy.port !== savedPort
+  // 注意：后端在“未运行”时返回的是默认端口（15721），回退提示只应在运行态比较；
+  // 且保存了未重启的新端口时（restartPending）差异是应用要求的中间态（N-P2-3）。
+  const fallbackActive =
+    proxy?.running === true && !restartPending && savedPort != null && proxy.port !== savedPort
   const listenAddress = proxy?.running
     ? `${proxy.host}:${proxy.port}`
     : `${configuredBind}:${configuredPort}`
@@ -43,25 +53,26 @@ export function ProxyPanel({
     ? proxy.gateway_url
     : (configuredGateway ?? proxy?.gateway_url ?? '—')
   const healthUrl = proxy?.running ? proxy.health_url : `${baseUrl}/health`
+  // `proxy == null` 既可能是“首次读取中”也可能是“读取失败”：用 loading/error 分开判，
+  // 失败时给明确状态与重试入口，而不是永远显示“读取中”（旧 P2-5）。
+  const status: { status: PillStatus; label: string } =
+    proxy == null
+      ? error
+        ? { status: 'error', label: '读取失败' }
+        : loading
+          ? { status: 'idle', label: '读取中' }
+          : { status: 'idle', label: '未知' }
+      : proxy.running
+        ? { status: 'ok', label: '运行中' }
+        : proxy.last_error
+          ? { status: 'error', label: '启动失败' }
+          : { status: 'warn', label: '未运行' }
 
   return (
     <Panel>
       <PanelHeader title="本地代理" meta="仅监听回环地址，拒绝浏览器页面直接调用">
         <div className="panel-actions">
-          <StatusPill
-            status={
-              proxy == null ? 'idle' : proxy.running ? 'ok' : proxy.last_error ? 'error' : 'warn'
-            }
-            label={
-              proxy == null
-                ? '读取中'
-                : proxy.running
-                  ? '运行中'
-                  : proxy.last_error
-                    ? '启动失败'
-                    : '未运行'
-            }
-          />
+          <StatusPill status={status.status} label={status.label} />
           <button
             type="button"
             className="btn btn--ghost btn--sm"
@@ -72,6 +83,17 @@ export function ProxyPanel({
           </button>
         </div>
       </PanelHeader>
+
+      {error ? (
+        <div className="inline-message-row">
+          <p className="inline-message inline-message--error" role="alert">
+            读取代理状态失败：{error}
+          </p>
+          <button type="button" className="btn btn--ghost btn--sm" onClick={onRetry}>
+            重试
+          </button>
+        </div>
+      ) : null}
 
       <dl className="kv">
         <div>
@@ -115,11 +137,6 @@ export function ProxyPanel({
       {fallbackActive ? (
         <p className="inline-message inline-message--warn" role="status">
           端口回退：配置端口 {savedPort} 不可用，代理实际监听 {proxy.port}。
-        </p>
-      ) : null}
-      {error ? (
-        <p className="inline-message inline-message--error" role="alert">
-          读取代理状态失败：{error}
         </p>
       ) : null}
       {proxy?.last_error ? (

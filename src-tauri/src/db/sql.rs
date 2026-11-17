@@ -136,6 +136,22 @@ impl<'a> Default for RequestQuery<'a> {
     }
 }
 
+/// 转义 LIKE 模式里的通配符（`\`、`%`、`_`），配合 SQL 的 `ESCAPE '\'` 使用。
+///
+/// 模型名里 `_` 很常见（`claude_3_5`、`gpt_4o` 之类），不转义会被当成"任意单字符"，
+/// 搜 `_` 反而匹配到任意字符；`%` 同理会把关键字放大成通配。转义字符自身必须最先
+/// 处理，否则会把补进去的反斜杠再转义一次。
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// 构造 `WHERE` 子句与按位对应的参数。
 fn where_clause(query: &RequestQuery<'_>, cursor: Option<&Cursor>) -> (String, Vec<Value>) {
     let mut sql = String::from(" WHERE r.day_local >= ? AND r.day_local <= ?");
@@ -144,8 +160,8 @@ fn where_clause(query: &RequestQuery<'_>, cursor: Option<&Cursor>) -> (String, V
         Value::Text(query.to_day.to_string()),
     ];
     if let Some(model) = query.model_like {
-        sql.push_str(" AND r.model LIKE ?");
-        params.push(Value::Text(format!("%{model}%")));
+        sql.push_str(" AND r.model LIKE ? ESCAPE '\\'");
+        params.push(Value::Text(format!("%{}%", escape_like(model))));
     }
     if let Some(api_format) = query.api_format {
         sql.push_str(" AND r.api_format = ?");
@@ -216,6 +232,19 @@ pub fn usage_by_dimension(dimension: UsageDimension) -> String {
     format!(
         "SELECT {column} AS key, {TOTALS_AGG} FROM usage_daily WHERE day >= ? AND day <= ? \
          GROUP BY {column} ORDER BY cost_yuan DESC, request_count DESC"
+    )
+}
+
+/// 最近一次成功（`status = 'ok'`）的额度快照。
+///
+/// 与 `ix_quota_snapshots_ok_latest`（部分索引 `(quota_type, fetched_at DESC, id DESC)
+/// WHERE status = 'ok'`）精确对应：等值列打头、排序键随后，`LIMIT 1` 直接取索引
+/// 首行。`profile_id` 不在索引里（历史行可能为 NULL），只做行内过滤。
+pub fn latest_quota_snapshot() -> String {
+    format!(
+        "SELECT {QUOTA_SNAPSHOT_COLUMNS} FROM quota_snapshots \
+         WHERE quota_type = ?1 AND status = 'ok' AND (?2 IS NULL OR profile_id = ?2) \
+         ORDER BY fetched_at DESC, id DESC LIMIT 1"
     )
 }
 
@@ -301,5 +330,58 @@ mod tests {
         });
         assert!(!sql.contains("< (?, ?, ?)"), "总数不应受游标影响");
         assert_eq!(params.len(), 2);
+    }
+
+    /// 模型关键字里的通配符必须转义：`_` 不能被当成"任意单字符"、`%` 不能放大
+    /// 成通配，反斜杠自身也要先转义（否则会吃掉后面的转义）。
+    #[test]
+    fn model_like_escapes_wildcards() {
+        let (sql, params) = count_requests(&RequestQuery {
+            model_like: Some(r"claude_3.5%\x"),
+            ..query()
+        });
+        assert!(
+            sql.contains("r.model LIKE ? ESCAPE '\\'"),
+            "必须声明 ESCAPE 字符：{sql}"
+        );
+        assert_eq!(
+            params[2],
+            Value::Text(r"%claude\_3.5\%\\x%".to_string()),
+            "`_`/`%`/`\\` 都要转义，且只加一层反斜杠"
+        );
+    }
+
+    /// 端到端：`_` 只匹配字面下划线，不能匹配任意字符。
+    #[test]
+    fn model_like_underscore_matches_literally() {
+        use crate::db::{run_migrations, Db};
+        let db = Db::open_in_memory().expect("内存库应可打开");
+        run_migrations(&db).expect("迁移应成功");
+        let conn = db.conn().expect("应能取连接");
+        for model in ["claude_3", "claudeX3"] {
+            conn.execute(
+                "INSERT INTO proxy_session_requests \
+                   (method, request_path, api_format, model, status_code, started_at, \
+                    day_local, status_kind) \
+                 VALUES ('POST', '/v1/messages', 'anthropic', ?1, 200, \
+                         '2026-10-20T01:00:00Z', '2026-10-20', 'success')",
+                [model],
+            )
+            .expect("插入请求行应成功");
+        }
+
+        let rows = crate::db::repo::list_requests(
+            &conn,
+            &RequestQuery {
+                from_day: "2026-10-20",
+                to_day: "2026-10-20",
+                model_like: Some("claude_3"),
+                ..Default::default()
+            },
+        )
+        .expect("列表查询应成功");
+
+        assert_eq!(rows.len(), 1, "`_` 不得匹配任意字符：{rows:?}");
+        assert_eq!(rows[0].model.as_deref(), Some("claude_3"));
     }
 }

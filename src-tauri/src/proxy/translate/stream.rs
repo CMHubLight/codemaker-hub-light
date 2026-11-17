@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::proxy::{
     forward::ApiFormat,
-    sse_frames::{self, SSE_FAIL_LIMIT},
+    sse_frames::{self, SseBuffer, SSE_FAIL_LIMIT},
     usage_parser::{self, TokenUsage},
 };
 
@@ -22,14 +22,18 @@ use super::{
 
 /// 增量 OpenAI Chat SSE → Anthropic Messages SSE 状态机。
 pub struct StreamTranslator {
-    buffer: Vec<u8>,
+    buffer: SseBuffer,
     started: bool,
     finished: bool,
+    /// 上游在 200 流里返回过 `{"error":…}`，调用方据此把记账标成 upstream_error。
+    upstream_error: bool,
     message_id: String,
     model: String,
     estimated_input_tokens: u64,
     next_index: u64,
     text_index: Option<u64>,
+    /// 无 `index` 的并行工具按出现顺序分配槽位，避免全部挤到 0 拼坏参数。
+    next_tool_slot: u64,
     // 先按 OpenAI index 聚合工具参数，结束时按顺序输出，避免并行工具造成
     // Anthropic content block 交错开始/停止。
     tool_blocks: HashMap<u64, ToolBlock>,
@@ -47,54 +51,55 @@ struct ToolBlock {
 impl StreamTranslator {
     pub fn new(estimated_input_tokens: u64) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: SseBuffer::new(),
             started: false,
             finished: false,
+            upstream_error: false,
             message_id: format!("msg_{}", uuid::Uuid::new_v4()),
             model: "unknown".to_string(),
             estimated_input_tokens,
             next_index: 0,
             text_index: None,
+            next_tool_slot: 0,
             tool_blocks: HashMap::new(),
             finish_reason: None,
             usage: TokenUsage::default(),
         }
     }
 
+    /// 上游是否在 200 流里返回过错误帧（含翻译层主动发出的 `event: error`）。
+    pub fn took_upstream_error(&self) -> bool {
+        self.upstream_error
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.finished {
             return Vec::new();
         }
-        let mut buffer = std::mem::take(&mut self.buffer);
-        buffer.extend_from_slice(chunk);
+        self.buffer.push(chunk);
 
         let mut out = String::new();
-        let mut consumed = 0;
-        while let Some((end, next)) = sse_frames::find_frame_end(&buffer[consumed..]) {
-            let (end, next) = (consumed + end, consumed + next);
-            if let Some(data) = sse_frames::frame_data(&buffer[consumed..end]) {
+        while let Some(frame) = self.buffer.next_frame() {
+            if let Some(data) = sse_frames::frame_data(&frame) {
                 self.handle_data(data.as_ref(), &mut out);
             }
-            consumed = next;
-        }
-        if consumed > 0 {
-            buffer.drain(..consumed);
         }
 
-        if buffer.len() > SSE_FAIL_LIMIT {
-            buffer.clear();
+        if self.buffer.len() > SSE_FAIL_LIMIT {
+            self.buffer.clear();
+            self.upstream_error = true;
             self.error_event(&mut out, "api_error", "上游流式响应帧过大");
         }
-        self.buffer = buffer;
         out.into_bytes()
     }
 
     pub fn finish(&mut self, failed: bool) -> Vec<u8> {
         let mut out = String::new();
-        if !failed && !self.finished && !self.buffer.is_empty() {
-            let rest = std::mem::take(&mut self.buffer);
-            if let Some(data) = sse_frames::frame_data(&rest) {
-                self.handle_data(data.as_ref(), &mut out);
+        if !failed && !self.finished {
+            if let Some(rest) = self.buffer.take_rest() {
+                if let Some(data) = sse_frames::frame_data(&rest) {
+                    self.handle_data(data.as_ref(), &mut out);
+                }
             }
         }
         if !self.finished {
@@ -137,8 +142,8 @@ impl StreamTranslator {
         let Some(delta) = choice.get("delta") else {
             return;
         };
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            self.text_delta(text, out);
+        if let Some(text) = super::content_text(delta.get("content")) {
+            self.text_delta(&text, out);
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tool_call in tool_calls {
@@ -216,7 +221,30 @@ impl StreamTranslator {
     }
 
     fn tool_delta(&mut self, tool_call: &Value, out: &mut String) {
-        let openai_index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let openai_index = match tool_call.get("index").and_then(Value::as_u64) {
+            Some(index) => {
+                self.next_tool_slot = self.next_tool_slot.max(index + 1);
+                index
+            }
+            None => {
+                // 没有 index 的并行工具：优先按 id 归并到已有块，否则按出现顺序
+                // 分配一个新槽位；全部落 0 会把两个工具的参数拼成非法 JSON。
+                let by_id = tool_call.get("id").and_then(Value::as_str).and_then(|id| {
+                    self.tool_blocks
+                        .iter()
+                        .find(|(_, block)| block.id == id)
+                        .map(|(index, _)| *index)
+                });
+                match by_id {
+                    Some(index) => index,
+                    None => {
+                        let index = self.next_tool_slot;
+                        self.next_tool_slot += 1;
+                        index
+                    }
+                }
+            }
+        };
         let function = tool_call
             .get("function")
             .cloned()
@@ -351,6 +379,7 @@ impl StreamTranslator {
 
     fn error_event(&mut self, out: &mut String, error_type: &str, message: &str) {
         self.finished = true;
+        self.upstream_error = true;
         push_event(
             out,
             "error",
@@ -363,6 +392,7 @@ impl StreamTranslator {
 
     fn error_event_value(&mut self, out: &mut String, error: &Value) {
         self.finished = true;
+        self.upstream_error = true;
         push_event(out, "error", &json!({ "type": "error", "error": error }));
     }
 }
