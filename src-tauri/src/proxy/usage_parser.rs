@@ -257,6 +257,29 @@ mod tests {
         // docs/gateway-contract.md 的两组样例。
         assert!((credit_to_yuan(2.843_328, 0.01) - 0.028_433_28).abs() < 1e-9);
         assert!((credit_to_yuan(0.811_536, 0.01) - 0.008_115_36).abs() < 1e-9);
+        assert_eq!(credit_to_yuan(-1.0, 0.01), 0.0, "负费用按 0 处理");
+    }
+
+    /// Responses 的 `aigw` 可能嵌在 `/response/aigw` 或 `/response/usage/aigw`。
+    #[test]
+    fn extracts_response_nested_aigw() {
+        for payload in [
+            json!({ "response": { "aigw": { "cost": { "total_credit": "1.5" }, "trace_id": "t-1" } } }),
+            json!({ "response": { "usage": { "aigw": { "cost": { "total_credit": 1.5 }, "trace_id": "t-1" } } } }),
+        ] {
+            assert_eq!(extract_total_credit(&payload), Some(1.5));
+            assert_eq!(extract_trace_id(&payload).as_deref(), Some("t-1"));
+        }
+    }
+
+    #[test]
+    fn negative_tokens_are_clamped_to_zero() {
+        let payload = json!({
+            "usage": { "prompt_tokens": -5, "completion_tokens": 3 }
+        });
+        let usage = parse_usage(ApiFormat::OpenAiChat, &payload).expect("应解析出 usage");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 3);
     }
 
     #[test]

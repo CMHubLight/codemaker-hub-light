@@ -59,7 +59,7 @@ pub fn totals_from_row(row: &UsageTotalsRow) -> UsageTotals {
 /// 请求状态的**唯一定义**：落库列 `status_kind`、界面标签、筛选条件都用它。
 ///
 /// 返回 `success | error | cancelled | unknown`。改这里的判定必须同步
-/// `migrations/0003_request_day_status.sql` 里的历史回填 CASE。
+/// `migrations/0003_request_status_kind.sql` 里的历史回填 CASE（0005 的回填复用同一 CASE）。
 pub fn status_kind(error_kind: Option<&str>, status_code: Option<i64>) -> &'static str {
     match error_kind {
         Some(kind)
