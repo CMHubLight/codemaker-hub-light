@@ -395,7 +395,7 @@ fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, StoreError>
     let header = [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION];
     let ciphertext = cipher(key)?
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::from(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad: &header,
@@ -427,7 +427,7 @@ fn decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Credentials, StoreError> 
 
     let plaintext = cipher(key)?
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::try_from(nonce).map_err(|_| StoreError::DecryptFailed)?,
             Payload {
                 msg: ciphertext,
                 aad: header,
