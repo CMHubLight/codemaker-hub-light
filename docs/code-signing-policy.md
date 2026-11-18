@@ -13,12 +13,13 @@
 | `v0.2.2`（2026-11-11） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | `v0.2.3`（2026-11-16） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | `v0.2.4`（2026-11-17） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
+| `v0.2.5`（2026-11-17） | **未签名** | Release 页已附 SHA-256；源码 tag 可复现构建 |
 | 后续版本 | 计划由 SignPath Foundation 签名 | 申请与接入材料已就绪，等待审批 |
 
-在签名生效前，请用以下任意方式核对 `v0.2.4` 安装包（历史 `v0.1.0`、`v0.1.1`、`v0.2.0`、`v0.2.1`、`v0.2.2`、`v0.2.3` 同理）：
+在签名生效前，请用以下任意方式核对 `v0.2.5` 安装包（历史 `v0.1.0`、`v0.1.1`、`v0.2.0`、`v0.2.1`、`v0.2.2`、`v0.2.3`、`v0.2.4` 同理）：
 
-1. 对照 [Release 说明](https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.4) 里的 SHA-256；
-2. 从 tag `v0.2.4` 的源码按 [开发与构建](development.md) 自行构建并比对；
+1. 对照 [Release 说明](https://github.com/CMHubLight/codemaker-hub-light/releases/tag/v0.2.5) 里的 SHA-256；
+2. 从 tag `v0.2.5` 的源码按 [开发与构建](development.md) 自行构建并比对；
 3. 打开文件属性 → 数字签名：当前应为**无签名**，不应出现任何签名者。
 
 ## 2. 签名由谁提供
@@ -129,14 +130,14 @@ This program will not transfer any information to other networked systems unless
 
 ```powershell
 # 1) 查看签名状态与签名者
-Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.4_x64-setup.exe |
+Get-AuthenticodeSignature .\CodeMaker-Hub-Light_0.2.5_x64-setup.exe |
   Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
 
 # 2) 用 signtool 严格校验（需要 Windows SDK）
-signtool verify /pa /v CodeMaker-Hub-Light_0.2.4_x64-setup.exe
+signtool verify /pa /v CodeMaker-Hub-Light_0.2.5_x64-setup.exe
 
 # 3) 对照 Release 说明里的 SHA-256
-Get-FileHash .\CodeMaker-Hub-Light_0.2.4_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\CodeMaker-Hub-Light_0.2.5_x64-setup.exe -Algorithm SHA256
 ```
 
 期望结果（签名生效后）：`Status = Valid`，签名者证书主体含 `SignPath Foundation`，且带可信时间戳。未签名时 `Status = NotSigned`。
@@ -147,7 +148,7 @@ Get-FileHash .\CodeMaker-Hub-Light_0.2.4_x64-setup.exe -Algorithm SHA256
 |---|---|---|
 | OSI 许可证 | ✅ | GPL-3.0-only |
 | 无专有组件 | ✅ | 全部自研，依赖均为开源 |
-| 项目已发布 | ✅ | `v0.1.0`、`v0.1.1`、`v0.2.0`、`v0.2.1`、`v0.2.2`、`v0.2.3`、`v0.2.4` Release 与 tag |
+| 项目已发布 | ✅ | `v0.1.0`、`v0.1.1`、`v0.2.0`、`v0.2.1`、`v0.2.2`、`v0.2.3`、`v0.2.4`、`v0.2.5` Release 与 tag |
 | 有文档 | ✅ | `docs/` 12 个 tracked 文件（11 篇主题文档 + 索引）+ 根目录 README |
 | 代码签名政策页 | ✅ | 本文 + README 的 Code signing policy 段 |
 | 隐私政策 | ✅ | 本文第 7 节 |
@@ -173,7 +174,7 @@ Get-FileHash .\CodeMaker-Hub-Light_0.2.4_x64-setup.exe -Algorithm SHA256
 | Maintainer | [@CMHubLight](https://github.com/CMHubLight) |
 | Project type | Open-source Windows desktop application (Tauri 2 + Rust + React 19) |
 | Description (EN) | A Windows desktop app that signs in to a user-configured compatible gateway, exposes a local HTTP proxy (127.0.0.1) for Claude Code, Codex and OpenAI/Anthropic-compatible clients, and records per-request token and cost usage locally. No telemetry, no bundled service endpoints. |
-| Latest release | `v0.2.4`（安装包当前未签名） |
+| Latest release | `v0.2.5`（安装包当前未签名） |
 | Build system | GitHub Actions，GitHub 托管 `windows-latest`，`.github/workflows/release-sign.yml` |
 | Code signing policy | <https://github.com/CMHubLight/codemaker-hub-light/blob/main/docs/code-signing-policy.md> |
 | Roles | 单人维护：Author / Reviewer / Approver 均为 @CMHubLight（需先开启 MFA） |
